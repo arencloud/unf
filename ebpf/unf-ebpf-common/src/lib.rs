@@ -315,14 +315,38 @@ pub const fn service_backend_is_eligible(flags: u8) -> bool {
     flags & SERVICE_BACKEND_FLAG_READY != 0 && flags & SERVICE_BACKEND_FLAG_TERMINATING == 0
 }
 
-/// A service translation survives desired-state revision changes and expires
-/// only by protocol lifetime or an incompatible fixed-layout value.
+/// Compares every immutable translation field while allowing activity to advance.
+#[must_use]
+pub fn service_connection_same_owner(
+    left: &ServiceConnectionValue,
+    right: &ServiceConnectionValue,
+) -> bool {
+    left.service_revision == right.service_revision
+        && left.client_address == right.client_address
+        && left.frontend_address == right.frontend_address
+        && left.backend_address == right.backend_address
+        && left.translated_source_address == right.translated_source_address
+        && left.service_id == right.service_id
+        && left.backend_id == right.backend_id
+        && left.client_port == right.client_port
+        && left.frontend_port == right.frontend_port
+        && left.backend_port == right.backend_port
+        && left.schema_version == right.schema_version
+        && left.protocol == right.protocol
+        && left.address_family == right.address_family
+        && left.flags == right.flags
+        && left.reserved == right.reserved
+}
+
+/// A translation survives desired-state revision changes and expires by protocol
+/// lifetime or invalid layout. The maximum timestamp denotes claimed retirement.
 #[must_use]
 pub const fn service_connection_is_active(state: &ServiceConnectionValue, now_ns: u64) -> bool {
     let Some(timeout_ns) = connection_timeout_ns(state.protocol) else {
         return false;
     };
-    state.schema_version == SERVICE_MAP_ABI_VERSION
+    state.last_seen_ns != u64::MAX
+        && state.schema_version == SERVICE_MAP_ABI_VERSION
         && matches!(state.address_family, 4 | 6)
         && state.service_revision != 0
         && state.service_id.get() != 0
@@ -2261,6 +2285,9 @@ mod tests {
         ));
 
         let mut invalid = tcp;
+        invalid.last_seen_ns = u64::MAX;
+        assert!(!service_connection_is_active(&invalid, 11));
+        invalid = tcp;
         invalid.schema_version = SERVICE_MAP_ABI_VERSION + 1;
         assert!(!service_connection_is_active(&invalid, 11));
         invalid = tcp;
@@ -2309,6 +2336,36 @@ mod tests {
         invalid.flags = SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT;
         invalid.reserved[2] = SERVICE_EVENT_FRONTEND_LOAD_BALANCER_LOCAL;
         assert!(!service_connection_is_active(&invalid, 11));
+    }
+
+    #[test]
+    fn service_connection_owner_excludes_only_activity_timestamp() {
+        let original = service_connection(6);
+        let mut touched = original;
+        touched.last_seen_ns += 1;
+        assert!(service_connection_same_owner(&original, &touched));
+        let mutations: [fn(&mut ServiceConnectionValue); 15] = [
+            |v| v.service_revision += 1,
+            |v| v.client_address[0] ^= 1,
+            |v| v.frontend_address[0] ^= 1,
+            |v| v.backend_address[0] ^= 1,
+            |v| v.translated_source_address[0] ^= 1,
+            |v| v.service_id = ServiceId::new(v.service_id.get() + 1),
+            |v| v.backend_id = BackendId::new(v.backend_id.get() + 1),
+            |v| v.client_port[0] ^= 1,
+            |v| v.frontend_port[0] ^= 1,
+            |v| v.backend_port[0] ^= 1,
+            |v| v.schema_version += 1,
+            |v| v.protocol ^= 1,
+            |v| v.address_family ^= 1,
+            |v| v.flags ^= 1,
+            |v| v.reserved[3] ^= 1,
+        ];
+        for mutate in mutations {
+            let mut changed = original;
+            mutate(&mut changed);
+            assert!(!service_connection_same_owner(&original, &changed));
+        }
     }
 
     #[test]

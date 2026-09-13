@@ -608,6 +608,15 @@ The insertion path does not reclaim that expired slot. Ownership-safe,
 regression-backed reclamation is next; live owners must not be overwritten.
 Temporary observers were removed; Kind and Phase 9 status remain unchanged.
 
+ADR 0313 implements claimed expired-slot reclamation and ownership-checked
+paired cleanup, with timestamp-only hot touches and an explicit encrypted-DSR
+conversion. The old kernel regression fails; the repaired IPv4/IPv6 TCP/UDP,
+successor-preservation and concurrent-touch cases pass. Local results are 748
+workspace tests, strict Clippy, nine Service transaction kernel tests, 19
+self-contained agent kernel tests and the separately configured live WireGuard
+probe. Exact-image cl02 deployment/log/continuity qualification is next, before
+Kind. Phase 9 and the S1–S5 measured stabilization program remain open.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.

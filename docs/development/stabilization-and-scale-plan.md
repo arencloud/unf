@@ -24,6 +24,12 @@ read-only key lookup agree. Add ownership-safe expiry reclamation regressions
 before another runtime build; preserve live mappings and successor pairs.
 This is a concrete S1 reliability finding, not completed scale optimization.
 
+ADR 0313 implements claimed expiry and owner-checked paired cleanup. The
+regression-backed candidate passes local kernel, encrypted-DSR, concurrent-touch
+and workspace checks. Publish its newly built BPF object with exact runtime
+provenance, then qualify cl02/logs/continuity before updating Kind. LRU capacity
+eviction and active tuple collisions remain explicit load-envelope boundaries.
+
 S2 profiling lead, not an attributed CPU result: `policy_snapshot` calls
 `dataplane_policy_state` for every authenticated pull; the latter clones the
 full cached tuple even on a matching revision and the endpoint returns the

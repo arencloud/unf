@@ -1,5 +1,9 @@
 #![no_std]
 #![no_main]
+// The pinned BPF nightly does not expose AtomicU64 CAS on this target. The
+// actual program must pass each qualified kernel's compare-exchange verifier.
+#![feature(core_intrinsics)]
+#![allow(internal_features)]
 
 use aya_ebpf::bindings::{
     BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_FIB_LOOKUP_OUTPUT,
@@ -14,6 +18,7 @@ use aya_ebpf::macros::{classifier, map};
 use aya_ebpf::maps::lpm_trie::Key as LpmKey;
 use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramArray, RingBuf};
 use aya_ebpf::programs::TcContext;
+use core::intrinsics::{AtomicOrdering, atomic_cxchg};
 use unf_common::{BackendId, IdentityId, PolicyId, PolicyReason, RuleId, ServiceId, Verdict};
 use unf_ebpf_common::{
     AddressFamily, ConnectionKey, ConnectionState, Direction, EGRESS_ADMISSION_ACTIVE,
@@ -475,6 +480,11 @@ static SERVICE_AFFINITY: LruHashMap<ServiceConnectionKey, ServiceAffinityValue> 
 /// classifier stack. BPF execution is non-preemptible on one CPU.
 #[map]
 static SERVICE_CONNECTION_SCRATCH: PerCpuArray<ServiceConnectionValue> =
+    PerCpuArray::with_max_entries(1, 0);
+
+/// One cold-path incumbent copy per CPU; never pinned or part of recovery ABI.
+#[map]
+static SERVICE_RECLAIM_SCRATCH: PerCpuArray<ServiceConnectionValue> =
     PerCpuArray::with_max_entries(1, 0);
 
 #[map]
@@ -1118,11 +1128,7 @@ fn secure_dsr_service_translation<const IPV6: bool>(
         return false;
     }
     let forward = service_forward_key(value);
-    value.flags = (value.flags & !SERVICE_CONNECTION_FLAG_DSR)
-        | SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT;
-    if !service_connection_is_active(value, value.last_seen_ns) || !store_service_pair(value, &forward)
-    {
-        remove_service_pair(value, &forward);
+    if !promote_service_dsr_to_nat(value, &forward) {
         return false;
     }
     let translation = ServiceTranslation {
@@ -2470,29 +2476,177 @@ fn service_peer_key(
     }
 }
 
-#[inline(always)]
-fn remove_service_pair(value: &ServiceConnectionValue, current: &ServiceConnectionKey) {
-    let _ = SERVICE_CONNECTIONS.remove(current);
-    if value.flags & SERVICE_CONNECTION_FLAG_DSR == 0 {
-        let _ = SERVICE_CONNECTIONS.remove(&service_peer_key(value, current));
+// A timestamp claim coordinates retirement and the explicit DSR transition
+// for the same observed owner. No full-map scan or persistent map is added.
+const SERVICE_RETIRING_TIMESTAMP: u64 = u64::MAX;
+
+/// The sole explicit owner-field transition: an authenticated Required DSR
+/// decision needs reversible NAT. Fence touches while publishing its reverse
+/// owner, then expose the new flags by releasing the timestamp claim.
+#[inline(never)]
+fn promote_service_dsr_to_nat(value: &mut ServiceConnectionValue, forward: &ServiceConnectionKey) -> bool {
+    let old_flags = value.flags;
+    value.flags = (old_flags & !SERVICE_CONNECTION_FLAG_DSR) | SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT;
+    let valid = service_connection_is_active(value, value.last_seen_ns);
+    value.flags = old_flags;
+    if !valid {
+        return false;
+    }
+    let Some(pointer) = SERVICE_CONNECTIONS.get_ptr_mut(forward) else { return false; };
+    // SAFETY: claim the aligned timestamp of the exact old DSR owner. Existing
+    // map-value storage remains accessible for the invocation across helpers.
+    #[allow(unsafe_code)]
+    let previous = unsafe {
+        let previous = (*pointer).last_seen_ns;
+        if previous == SERVICE_RETIRING_TIMESTAMP
+            || !unf_ebpf_common::service_connection_same_owner(&*pointer, value)
+            || atomic_cxchg::<u64, { AtomicOrdering::Acquire }, { AtomicOrdering::Relaxed }>(
+                pointer.cast(), previous, SERVICE_RETIRING_TIMESTAMP).0 != previous {
+            return false;
+        }
+        previous
+    };
+    value.flags = (old_flags & !SERVICE_CONNECTION_FLAG_DSR) | SERVICE_CONNECTION_FLAG_ENCRYPTED_NAT;
+    value.last_seen_ns = core::cmp::max(previous, value.last_seen_ns);
+    let reverse = service_reverse_key(value);
+    if !insert_service_slot(value, &reverse) && !touch_service_slot(value, &reverse) {
+        // SAFETY: restore only this claim, never replace a different timestamp.
+        #[allow(unsafe_code)]
+        unsafe {
+            atomic_cxchg::<u64, { AtomicOrdering::Release }, { AtomicOrdering::Relaxed }>(
+                pointer.cast(), SERVICE_RETIRING_TIMESTAMP, previous);
+        }
+        value.flags = old_flags;
+        return false;
+    }
+    // SAFETY: the timestamp claim excludes ordinary touches and retirement.
+    // No other tuple field changes; release publishes flags after the peer row.
+    #[allow(unsafe_code)]
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*pointer).flags), value.flags);
+        atomic_cxchg::<u64, { AtomicOrdering::Release }, { AtomicOrdering::Relaxed }>(
+            pointer.cast(), SERVICE_RETIRING_TIMESTAMP, value.last_seen_ns).0 == SERVICE_RETIRING_TIMESTAMP
     }
 }
 
 #[inline(always)]
+fn remove_owned_service_slot(value: &ServiceConnectionValue, key: &ServiceConnectionKey) -> bool {
+    let Some(pointer) = SERVICE_CONNECTIONS.get_ptr_mut(key) else {
+        return false;
+    };
+    // SAFETY: the map retains the value for this invocation. The timestamp is
+    // the aligned first u64. Immutable tuple fields are never changed by touch.
+    #[allow(unsafe_code)]
+    unsafe {
+        if value.last_seen_ns == SERVICE_RETIRING_TIMESTAMP
+            || (*pointer).last_seen_ns != value.last_seen_ns
+            || !unf_ebpf_common::service_connection_same_owner(&*pointer, value) {
+            return false;
+        }
+        if atomic_cxchg::<u64, { AtomicOrdering::Relaxed }, { AtomicOrdering::Relaxed }>(
+            pointer.cast(), value.last_seen_ns, SERVICE_RETIRING_TIMESTAMP).0 != value.last_seen_ns {
+            return false;
+        }
+    }
+    SERVICE_CONNECTIONS.remove(key).is_ok()
+}
+
+#[inline(never)]
+fn remove_service_pair(value: &ServiceConnectionValue, current: &ServiceConnectionKey) {
+    remove_owned_service_slot(value, current);
+    if value.flags & SERVICE_CONNECTION_FLAG_DSR == 0 {
+        remove_owned_service_slot(value, &service_peer_key(value, current));
+    }
+}
+
+#[inline(never)]
+fn touch_service_slot(value: &ServiceConnectionValue, key: &ServiceConnectionKey) -> bool {
+    let Some(pointer) = SERVICE_CONNECTIONS.get_ptr_mut(key) else {
+        return SERVICE_CONNECTIONS.insert(key, value, BPF_NOEXIST as u64).is_ok();
+    };
+    // SAFETY: map storage lives for this invocation; only the aligned timestamp
+    // is mutated. CAS refuses retirement and coalesces concurrent activity.
+    #[allow(unsafe_code)]
+    unsafe {
+        let previous = (*pointer).last_seen_ns;
+        if previous == SERVICE_RETIRING_TIMESTAMP
+            || !unf_ebpf_common::service_connection_same_owner(&*pointer, value) {
+            return false;
+        }
+        let actual = atomic_cxchg::<u64, { AtomicOrdering::Relaxed }, { AtomicOrdering::Relaxed }>(
+            pointer.cast(), previous, core::cmp::max(previous, value.last_seen_ns)).0;
+        // A competing monotonic touch is already sufficient activity. Do not
+        // turn ordinary same-flow CPU contention into packet loss; retirement
+        // remains distinguishable and must never be resurrected.
+        actual >= previous && actual != SERVICE_RETIRING_TIMESTAMP
+    }
+}
+
+#[inline(never)]
 fn store_service_pair(value: &ServiceConnectionValue, current: &ServiceConnectionKey) -> bool {
     if value.flags & SERVICE_CONNECTION_FLAG_DSR != 0 {
         return current.role == SERVICE_CONNECTION_ROLE_FORWARD
-            && SERVICE_CONNECTIONS.insert(current, value, 0).is_ok();
+            && touch_service_slot(value, current);
     }
     let peer = service_peer_key(value, current);
-    if SERVICE_CONNECTIONS.insert(&peer, value, 0).is_err() {
+    touch_service_slot(value, &peer) && touch_service_slot(value, current)
+}
+
+#[inline(always)]
+fn insert_service_slot(value: &ServiceConnectionValue, key: &ServiceConnectionKey) -> bool {
+    if SERVICE_CONNECTIONS.insert(key, value, BPF_NOEXIST as u64).is_ok() {
+        return true;
+    }
+    // SAFETY: copy the incumbent before any map update. A failed insert is not
+    // by itself permission to delete an occupied key.
+    #[allow(unsafe_code)]
+    let Some(stored) = (unsafe { SERVICE_CONNECTIONS.get(key) }) else {
+        return false;
+    };
+    let Some(scratch) = SERVICE_RECLAIM_SCRATCH.get_ptr_mut(0) else {
+        return false;
+    };
+    // SAFETY: this invocation owns the CPU-local slot. Copy before calling any
+    // helper that can mutate SERVICE_CONNECTIONS, without a 104-byte stack copy.
+    #[allow(unsafe_code)]
+    let incumbent = unsafe { scratch.write(*stored); &*scratch };
+    let Some(timeout) = unf_ebpf_common::connection_timeout_ns(incumbent.protocol) else {
+        return false;
+    };
+    if incumbent.schema_version != unf_ebpf_common::SERVICE_MAP_ABI_VERSION
+        || incumbent.last_seen_ns == SERVICE_RETIRING_TIMESTAMP
+        || value.last_seen_ns.saturating_sub(incumbent.last_seen_ns) <= timeout {
         return false;
     }
-    if SERVICE_CONNECTIONS.insert(current, value, 0).is_err() {
-        let _ = SERVICE_CONNECTIONS.remove(&peer);
+    let tuple_matches = if key.role == SERVICE_CONNECTION_ROLE_FORWARD {
+        key.source_address == incumbent.client_address
+            && key.destination_address == incumbent.frontend_address
+            && key.source_port == incumbent.client_port
+            && key.destination_port == incumbent.frontend_port
+    } else if key.role == SERVICE_CONNECTION_ROLE_REVERSE
+        && incumbent.flags & SERVICE_CONNECTION_FLAG_DSR == 0 {
+        let translated = incumbent.flags & SERVICE_CONNECTION_FLAG_NODE_PORT_CLUSTER != 0;
+        let destination_matches = if translated {
+                key.destination_address == incumbent.translated_source_address
+                    && key.destination_port == node_port_snat_port(incumbent)
+            } else {
+                key.destination_address == incumbent.client_address
+                    && key.destination_port == incumbent.client_port
+            };
+        key.source_address == incumbent.backend_address
+            && destination_matches
+            && key.source_port == incumbent.backend_port
+    } else {
+        return false;
+    };
+    if !tuple_matches || key.protocol != incumbent.protocol
+        || key.address_family != incumbent.address_family || key.reserved != 0
+        || !remove_owned_service_slot(incumbent, key) {
         return false;
     }
-    true
+    // Leave the old partner for its own owner-checked lazy expiry. Reclaim
+    // only this exact expired slot, then attempt one exclusive insertion.
+    SERVICE_CONNECTIONS.insert(key, value, BPF_NOEXIST as u64).is_ok()
 }
 
 #[inline(never)]
@@ -2504,10 +2658,15 @@ fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
         // SAFETY: this CPU owns the key scratch value for the invocation.
         #[allow(unsafe_code)]
         let forward = unsafe { &mut *forward_ptr };
-        *forward = service_forward_key(value);
-        return SERVICE_CONNECTIONS
-            .insert(&*forward, value, BPF_NOEXIST as u64)
-            .is_ok();
+        forward.source_address = value.client_address;
+        forward.destination_address = value.frontend_address;
+        forward.source_port = value.client_port;
+        forward.destination_port = value.frontend_port;
+        forward.protocol = value.protocol;
+        forward.address_family = value.address_family;
+        forward.role = SERVICE_CONNECTION_ROLE_FORWARD;
+        forward.reserved = 0;
+        return insert_service_slot(value, &*forward);
     }
     let Some(reverse_ptr) = SERVICE_AFFINITY_KEY_SCRATCH.get_ptr_mut(0) else {
         return false;
@@ -2532,14 +2691,11 @@ fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
     reverse.address_family = value.address_family;
     reverse.role = SERVICE_CONNECTION_ROLE_REVERSE;
     reverse.reserved = 0;
-    if SERVICE_CONNECTIONS
-        .insert(&*reverse, value, BPF_NOEXIST as u64)
-        .is_err()
-    {
+    if !insert_service_slot(value, &*reverse) {
         return false;
     }
     let Some(forward_ptr) = SERVICE_KEY_SCRATCH.get_ptr_mut(0) else {
-        let _ = SERVICE_CONNECTIONS.remove(&*reverse);
+        remove_owned_service_slot(value, &*reverse);
         return false;
     };
     // SAFETY: this CPU owns both key scratch values for the invocation.
@@ -2553,11 +2709,8 @@ fn insert_new_service_pair(value: &ServiceConnectionValue) -> bool {
     forward.address_family = value.address_family;
     forward.role = SERVICE_CONNECTION_ROLE_FORWARD;
     forward.reserved = 0;
-    if SERVICE_CONNECTIONS
-        .insert(&*forward, value, BPF_NOEXIST as u64)
-        .is_err()
-    {
-        let _ = SERVICE_CONNECTIONS.remove(&*reverse);
+    if !insert_service_slot(value, &*forward) {
+        remove_owned_service_slot(value, &*reverse);
         return false;
     }
     true
@@ -2689,7 +2842,8 @@ fn refresh_service_connection(
     };
     value.last_seen_ns = now_ns;
     if !store_service_pair(value, key) {
-        remove_service_pair(value, key);
+        // A competing touch/retirement or different peer owner cannot authorize
+        // deleting either entry. Retain it for an independently validated retry.
         return None;
     }
     Some(translation)

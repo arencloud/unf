@@ -48,4 +48,8 @@ test_binary=$(cargo test -p unf-agent --no-run --message-format=json \
     | tail -n 1)
 [[ -n ${test_binary} && -x ${test_binary} ]]
 
-sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" --ignored
+# The wire-engine test needs two independently configured endpoint roles;
+# running it without that fixture is an observer error, not a packet failure.
+sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" --ignored \
+    --skip tests::privileged_dual_stack_path_probe_wire_engine_is_duplex_and_mark_routed
+bash "${project_root}/hack/verify-encryption-path-executor-live.sh"

@@ -46,4 +46,8 @@ sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
 
 sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
     --ignored --exact \
+    tests::privileged_service_expired_reverse_tuple_preserves_successor
+
+sudo -n env UNF_EBPF_OBJECT="${object}" "${test_binary}" \
+    --ignored --exact \
     tests::privileged_selection_packets_enforce_local_and_topology_fallback_dual_stack

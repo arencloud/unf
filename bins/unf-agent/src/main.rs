@@ -27140,6 +27140,234 @@ mod tests {
     #[test]
     #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
     #[allow(clippy::too_many_lines)]
+    fn privileged_service_expired_reverse_tuple_preserves_successor() {
+        let object = std::env::var_os("UNF_EBPF_OBJECT").expect("UNF_EBPF_OBJECT is set");
+        let mut ebpf = EbpfLoader::new().load_file(object).unwrap();
+        load_dataplane_tail_programs(&mut ebpf).unwrap();
+        let program: &mut SchedClassifier = ebpf
+            .program_mut("unf_observe_ingress")
+            .unwrap()
+            .try_into()
+            .unwrap();
+        program
+            .load()
+            .expect("kernel verifier accepts Service program");
+        let directory = tempdir().unwrap();
+        let mut synchronizer =
+            test_service_synchronizer(&mut ebpf, directory.path().join("service.json"));
+        let state = test_agent_state();
+        let backend4 = Ipv4Addr::new(10, 42, 0, 20);
+        let backend6 = "fd00:42::20".parse::<Ipv6Addr>().unwrap();
+        activate_service_snapshot(
+            &mut synchronizer,
+            &dual_stack_service_snapshot(1, backend4, backend6, true),
+            None,
+            false,
+            &state,
+        )
+        .unwrap();
+        for (family, protocol, frontend_port, backend_port) in [
+            (4_u8, 6_u8, 80_u16, 8080_u16),
+            (6, 6, 80, 8080),
+            (4, 17, 53, 5353),
+            (6, 17, 53, 5353),
+        ] {
+            let client4 = Ipv4Addr::new(10, 42, 0, 5);
+            let service4 = Ipv4Addr::new(10, 96, 0, 10);
+            let client6 = "fd00:42::5".parse::<Ipv6Addr>().unwrap();
+            let service6 = "fd00:96::10".parse::<Ipv6Addr>().unwrap();
+            let packet = if family == 4 {
+                ipv4_packet(protocol, client4, service4, 40_050, frontend_port)
+            } else {
+                ipv6_packet(protocol, client6, service6, 40_050, frontend_port)
+            };
+            assert_eq!(run_tc(&mut ebpf, "unf_observe_ingress", &packet).0, 3);
+            let (forward, original) = synchronizer
+                .connections
+                .iter()
+                .map(Result::unwrap)
+                .find(|(key, _)| {
+                    key[36] == protocol
+                        && key[37] == family
+                        && key[38] == SERVICE_CONNECTION_ROLE_FORWARD
+                })
+                .unwrap();
+            let mut reverse = [0_u8; 40];
+            reverse[..16].copy_from_slice(&original[48..64]);
+            reverse[16..32].copy_from_slice(&original[16..32]);
+            reverse[32..34].copy_from_slice(&original[92..94]);
+            reverse[34..36].copy_from_slice(&original[88..90]);
+            reverse[36..40].copy_from_slice(&[
+                protocol,
+                family,
+                unf_ebpf_common::SERVICE_CONNECTION_ROLE_REVERSE,
+                0,
+            ]);
+            synchronizer.connections.remove(&forward).unwrap();
+            let mut incumbent = original;
+            let address_end = if family == 4 { 35 } else { 47 };
+            incumbent[address_end] = 99;
+            let mut old_forward = forward;
+            old_forward[16..32].copy_from_slice(&incumbent[32..48]);
+            synchronizer
+                .connections
+                .insert(reverse, incumbent, 0)
+                .unwrap();
+            synchronizer
+                .connections
+                .insert(old_forward, incumbent, 0)
+                .unwrap();
+            assert_eq!(
+                run_tc(&mut ebpf, "unf_observe_ingress", &packet).0,
+                2,
+                "a live reverse owner must never be overwritten"
+            );
+            assert_eq!(
+                synchronizer.connections.get(&reverse, 0).unwrap(),
+                incumbent
+            );
+            synchronizer
+                .connections
+                .insert(forward, original, 0)
+                .unwrap();
+            assert_eq!(
+                run_tc(&mut ebpf, "unf_observe_ingress", &packet).0,
+                2,
+                "refresh cannot overwrite a different live reverse owner"
+            );
+            assert_eq!(
+                synchronizer.connections.get(&reverse, 0).unwrap(),
+                incumbent
+            );
+            synchronizer.connections.remove(&forward).unwrap();
+            let mut claimed = incumbent;
+            claimed[..8].copy_from_slice(&u64::MAX.to_ne_bytes());
+            synchronizer
+                .connections
+                .insert(reverse, claimed, 0)
+                .unwrap();
+            assert_eq!(
+                run_tc(&mut ebpf, "unf_observe_ingress", &packet).0,
+                2,
+                "a competing retirement claim cannot be overwritten"
+            );
+            assert_eq!(synchronizer.connections.get(&reverse, 0).unwrap(), claimed);
+            incumbent[..8].copy_from_slice(
+                &(monotonic_time_ns().unwrap()
+                    - unf_ebpf_common::connection_timeout_ns(protocol).unwrap()
+                    - 1)
+                .to_ne_bytes(),
+            );
+            synchronizer
+                .connections
+                .insert(reverse, incumbent, 0)
+                .unwrap();
+            synchronizer
+                .connections
+                .insert(old_forward, incumbent, 0)
+                .unwrap();
+            if protocol == 17 {
+                synchronizer.connections.remove(&old_forward).unwrap();
+            }
+            assert_eq!(
+                run_tc(&mut ebpf, "unf_observe_ingress", &packet).0,
+                3,
+                "an expired reverse owner must not strand a fresh connection"
+            );
+            let successor = synchronizer.connections.get(&reverse, 0).unwrap();
+            assert_eq!(&successor[32..48], &original[32..48]);
+            // Recreate a delayed old forward row independently of reclamation.
+            // Looking it up must not erase the newer reverse owner.
+            synchronizer
+                .connections
+                .insert(old_forward, incumbent, 0)
+                .unwrap();
+            let old_packet = if family == 4 {
+                ipv4_packet(
+                    protocol,
+                    client4,
+                    Ipv4Addr::new(10, 96, 0, 99),
+                    40_050,
+                    frontend_port,
+                )
+            } else {
+                ipv6_packet(
+                    protocol,
+                    client6,
+                    "fd00:96::63".parse().unwrap(),
+                    40_050,
+                    frontend_port,
+                )
+            };
+            run_tc(&mut ebpf, "unf_observe_ingress", &old_packet);
+            assert_eq!(
+                synchronizer.connections.get(&reverse, 0).unwrap(),
+                successor,
+                "old paired cleanup must preserve the successor"
+            );
+            let reply = if family == 4 {
+                ipv4_packet(protocol, backend4, client4, backend_port, 40_050)
+            } else {
+                ipv6_packet(protocol, backend6, client6, backend_port, 40_050)
+            };
+            let (action, translated) = run_tc(&mut ebpf, "unf_observe_ingress", &reply);
+            assert_eq!(action, 3);
+            if family == 4 {
+                assert_ipv4_packet(
+                    &translated,
+                    protocol,
+                    service4,
+                    client4,
+                    frontend_port,
+                    40_050,
+                );
+            } else {
+                assert_ipv6_packet(
+                    &translated,
+                    protocol,
+                    service6,
+                    client6,
+                    frontend_port,
+                    40_050,
+                );
+            }
+            // Real simultaneous test-run calls share the same kernel maps;
+            // ordinary timestamp contention must not turn a live flow into drops.
+            let program: &SchedClassifier = ebpf
+                .program("unf_observe_ingress")
+                .unwrap()
+                .try_into()
+                .unwrap();
+            let barrier = std::sync::Barrier::new(4);
+            let barrier = &barrier;
+            std::thread::scope(|scope| {
+                for index in 0..4 {
+                    let probe = if index % 2 == 0 { &packet } else { &reply };
+                    scope.spawn(move || {
+                        barrier.wait();
+                        for _ in 0..64 {
+                            let result = program
+                                .test_run(TestRunOptions {
+                                    data_in: Some(probe),
+                                    ..Default::default()
+                                })
+                                .unwrap();
+                            assert_eq!(
+                                result.return_value, 3,
+                                "concurrent live-owner touch must succeed"
+                            );
+                        }
+                    });
+                }
+            });
+            let retained = synchronizer.connections.get(&reverse, 0).unwrap();
+            assert_eq!(&retained[8..], &successor[8..]);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    #[allow(clippy::too_many_lines)]
     fn privileged_node_port_cluster_and_local_packets_translate_dual_stack_and_survive_churn() {
         const TC_ACT_SHOT: u32 = 2;
         const TC_ACT_PIPE: u32 = 3;
