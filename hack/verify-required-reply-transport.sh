@@ -91,7 +91,9 @@ forward_pid=$!
 controller_port=
 for _ in $(seq 1 30); do
     kill -0 "$forward_pid"
-    controller_port=$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 9962$/\1/p' "$directory/controller-forward.log")
+    if [[ -f $directory/controller-forward.log ]]; then
+        controller_port=$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 9962$/\1/p' "$directory/controller-forward.log")
+    fi
     [[ -z $controller_port ]] || break
     sleep 1
 done
