@@ -31,7 +31,7 @@ Required path authoritative; it never becomes a Native fallback.
 |---|---|---|
 | L1 exact address ownership | Verified locally — ADR 0325 | Shared validated placement preserves dual-stack IP/UID/identity/Node ownership; ambiguous ownership and capacity fail before expansion; no policy-pair enumeration in the placement-only API; 758 workspace tests pass |
 | L2 replayable locality certificate | Verified locally — ADR 0326 | Versioned, canonical, Node/revision-bound certificate; independent placement replay; negative replica, move, UID reuse, stale-cut, malformed-wire and address-substitution tests; 770 workspace tests pass; no packet-path change |
-| L3 consuming integration | In progress — L3a verified locally, ADR 0327 | Explicit wire/map compatibility and restart migration; authenticated distribution; exact local attachment/route readback; banked publication and packet-policy-first consumption; status/explanation without claiming observed delivery from placement alone |
+| L3 consuming integration | In progress — ownership prerequisites and isolated target-device lifetime verified on both platforms, ADRs 0339–0346 | Explicit wire/map compatibility and restart migration; authenticated distribution; exact local attachment/route readback; banked publication and packet-policy-first consumption; status/explanation without claiming observed delivery from placement alone |
 | L4 cl02 validation | Pending | Same-Node and mixed local/remote replicas; IPv4/IPv6 TCP/UDP; PodIP, Service and translated ports; policy isolation and replies; positive remote ciphertext and zero remote Required plaintext; move/replacement/recovery; full fixture cleanup |
 | L5 matching Kind validation | Pending | Same immutable runtime and L4 matrix after cl02; retained state preserved; observer failures and losses remain failures |
 | Q complete Phase 9 lifecycle | Pending | Full current-runtime cl02 lifecycle then independent matching Kind, including staged Required baseline, rotation, failure/recovery, composition, history and cleanup; update release pins and platform status only with complete evidence |
@@ -101,6 +101,10 @@ added; a corrected-image cl02 rerun must precede matching Kind again.
 ADR 0345 records that complete cl02 rerun on `40def8e`, including explicit
 private RPF/return-route evidence, exact statistics and final convergence.
 Matching revised-image Kind remains required.
+ADR 0346 verifies that identical-image Kind rerun, including private 0/2 RPF
+settings with valid return routes, exact attempt/denial statistics and cleanup.
+The tested target-device reference mechanism passes both platforms; it is not
+yet the authenticated/banked UNF locality consumer or a source/peer lifetime proof.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

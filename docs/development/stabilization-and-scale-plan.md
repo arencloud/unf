@@ -66,6 +66,13 @@ then identical-image Kind. All 790 local tests pass. Live binaries stay
 `450de80`; this is an attachment snapshot prerequisite, not locality admission.
 Kind's post-test rotated-log review spans 129,848,221 bytes, retaining the
 per-packet INFO resource finding for S3.
+ADRs 0343–0346 investigate and qualify an isolated target-device reference
+delivery mechanism on cl02 before identical-image Kind. Eight positive UDP
+payloads and four exact denied attempts cover rename/down/recovery and device
+index reuse. Setup/observer/initial Kind IPv4 failures remain recorded. This
+does not activate UNF locality or close S1–S5. Kind's final retained CRI review
+spans 160,765,444 bytes; log amplification remains a measured-volume finding,
+not a measured CPU, memory or throughput result.
 
 Repair evidence is retained chronologically in the ADRs:
 

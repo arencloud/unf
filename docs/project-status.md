@@ -625,6 +625,10 @@ the corrected image must pass cl02 before matching Kind. ADR 0344 retains
 the failure and separates observed Node RPF settings from unproven causality.
 The revised `40def8e` device-lifetime fixture passes the complete cl02 rerun
 with exact statistics and final convergence; matching Kind is next (ADR 0345).
+ADR 0346 verifies the identical revised image on retained Kind, with exact
+device-lifetime statistics, valid return routes under private-interface RPF=2,
+cleanup and full convergence. The target-device primitive is verified on both
+platforms; authenticated/banked locality consumption and S1–S5 remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
