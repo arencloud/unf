@@ -561,8 +561,11 @@ explicit legacy journal/request compatibility and kernel alias fencing. All 778
 workspace tests and strict Clippy pass; no live runtime or encryption behavior
 is changed. ADR 0328's creation-only alias seal fixes the observed cl02
 new-veth alias gap. The complete isolated cl02 CNI/kernel gate passes all eleven
-negative checks and cleanup, with 779 workspace tests passing. Matching-image
-Kind is next; no Required locality or full platform row is closed by this gate.
+negative checks and cleanup, with 779 workspace tests passing. ADR 0329 verifies
+the identical isolated image on retained Kind and reviews current/rotated logs.
+Neither live CNI installation is changed; interrupted-creation recovery and
+the locality consumer remain open. No Required locality or full platform row
+is closed by this gate.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 

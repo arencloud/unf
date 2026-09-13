@@ -37,6 +37,11 @@ ADRs 0325–0326 complete the local exact-address placement/certificate slices:
 one record per address, independent replay and streamed digest serialization.
 The live packet path is unchanged. Kernel consumption and platform locality
 tests remain open in the [locality closure plan](phase9-required-locality-plan.md).
+ADRs 0327–0329 add versioned CNI Pod-incarnation ownership and qualify the
+isolated production CNI/kernel lifecycle on cl02 before identical-image Kind.
+The actual kernel gate catches and repairs missing aliases at initial veth
+creation; all 779 workspace tests pass. Live fleets remain unchanged, and
+interrupted-creation recovery plus consuming locality integration remain open.
 
 Repair evidence is retained chronologically in the ADRs:
 

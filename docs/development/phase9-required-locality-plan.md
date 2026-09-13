@@ -45,8 +45,9 @@ pending. Existing unbound attachments are never silently upgraded into locality
 authority. This prerequisite does not close L3.
 ADR 0328 verifies the isolated production CNI/kernel ownership qualifier on
 cl02 after a creation-only alias seal repair. The full workspace passes 779
-tests. Matching-image retained Kind is next; interrupted-creation recovery and
-the actual locality consumer are still pending.
+tests. ADR 0329 verifies the identical isolated image on retained Kind. Both
+live CNI installations remain unchanged; interrupted-creation recovery, live
+rollout and the actual locality consumer are still pending.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

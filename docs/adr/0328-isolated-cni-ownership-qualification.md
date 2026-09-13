@@ -2,7 +2,7 @@
 
 Date: 2026-09-13
 
-Status: isolated cl02 kernel gate verified; matching Kind execution pending
+Status: isolated cl02 kernel gate verified; matching Kind verified in ADR 0329
 
 `hack/verify-cni-workload-ownership.sh` invokes the production CNI orchestration
 through its existing disposable-journal adapter. Each invocation reopens the
