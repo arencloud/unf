@@ -552,7 +552,10 @@ retained Kind with explicit initial egress revision, ciphertext and cleanup.
 Both fleets now run immutable `67c2772`; the Required reply slice is verified.
 ADR 0325 starts the [Required locality closure plan](development/phase9-required-locality-plan.md)
 with exact, ambiguity-rejecting workload-address placement and local regressions.
-It introduces no plaintext exception or live image change.
+ADR 0326 adds a versioned, independently replayed exact-address locality
+certificate with 770 passing workspace tests. Neither slice introduces a
+plaintext exception or live image change; kernel attachment/route proof and
+the banked consuming boundary are next.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 

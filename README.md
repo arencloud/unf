@@ -747,6 +747,9 @@ Required reply gate on cl02, then matching-image retained Kind: 12 Required
 requests, 12 Native controls, eight reverse denials, ciphertext and exact
 cleanup. Required locality/replicas and full lifecycle requalification remain
 open (ADRs 0318, 0320–0324).
+Exact-address placement and replayable locality certificates now pass local
+regressions; kernel/dataplane integration remains pending
+([locality tracking](docs/development/phase9-required-locality-plan.md)).
 The [stabilization and scale plan](docs/development/stabilization-and-scale-plan.md)
 tracks operator/reachability findings, log volume, feature interactions and
 resource-versus-load measurements. Bounded qualification does not mean

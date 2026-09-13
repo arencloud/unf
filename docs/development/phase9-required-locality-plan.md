@@ -30,11 +30,27 @@ Required path authoritative; it never becomes a Native fallback.
 | Slice | State | Exit requirement |
 |---|---|---|
 | L1 exact address ownership | Verified locally — ADR 0325 | Shared validated placement preserves dual-stack IP/UID/identity/Node ownership; ambiguous ownership and capacity fail before expansion; no policy-pair enumeration in the placement-only API; 758 workspace tests pass |
-| L2 replayable locality certificate | Pending | Versioned, canonical, Node/revision-bound certificate; independent placement replay; negative replica, move, UID reuse, stale-cut, malformed-wire and address-substitution tests |
+| L2 replayable locality certificate | Verified locally — ADR 0326 | Versioned, canonical, Node/revision-bound certificate; independent placement replay; negative replica, move, UID reuse, stale-cut, malformed-wire and address-substitution tests; 770 workspace tests pass; no packet-path change |
 | L3 consuming integration | Pending | Explicit wire/map compatibility and restart migration; authenticated distribution; exact local attachment/route readback; banked publication and packet-policy-first consumption; status/explanation without claiming observed delivery from placement alone |
 | L4 cl02 validation | Pending | Same-Node and mixed local/remote replicas; IPv4/IPv6 TCP/UDP; PodIP, Service and translated ports; policy isolation and replies; positive remote ciphertext and zero remote Required plaintext; move/replacement/recovery; full fixture cleanup |
 | L5 matching Kind validation | Pending | Same immutable runtime and L4 matrix after cl02; retained state preserved; observer failures and losses remain failures |
 | Q complete Phase 9 lifecycle | Pending | Full current-runtime cl02 lifecycle then independent matching Kind, including staged Required baseline, rotation, failure/recovery, composition, history and cleanup; update release pins and platform status only with complete evidence |
+
+### L3 consuming-boundary checklist
+
+- Bind both local address owners to independently read-back workload attachment
+  and route ownership. Reject host/physical ingress masquerading as a workload,
+  foreign interfaces, replaced workload UIDs and reused interface indices.
+- Bind the locality digest, identity epoch and active generation into versioned
+  distribution/map authority. Preserve recovery of existing schema-2 transport
+  generations; never reset state or silently reinterpret old Native records.
+- Verify the actual post-Service backend and local delivery path. A local CIDR
+  alone, stale attachment snapshot or changed route toward an underlay interface
+  must not permit plaintext. Keep policy isolation, stateful replies and egress
+  ownership checks ahead of locality handling, including NAT/DSR composition.
+- Distinguish placement eligibility, kernel admission and observed delivery in
+  status/explanation. Add cold-start, deletion/reassignment, attachment/route
+  drift and restart regressions before any live locality activation.
 
 During each platform validation, inspect controller, every agent and installer
 logs before/during/after the run. Include previous containers after any restart.

@@ -33,6 +33,10 @@ Next: finish Required locality/replica coverage and full current
 runtime lifecycle qualification, cl02 before Kind. Empty-Namespace no-op
 continuity does not establish arbitrary policy/Service update atomicity. Active
 tuple collisions and LRU capacity behavior remain load-envelope boundaries.
+ADRs 0325–0326 complete the local exact-address placement/certificate slices:
+one record per address, independent replay and streamed digest serialization.
+The live packet path is unchanged. Kernel consumption and platform locality
+tests remain open in the [locality closure plan](phase9-required-locality-plan.md).
 
 Repair evidence is retained chronologically in the ADRs:
 
