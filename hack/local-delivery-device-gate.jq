@@ -11,7 +11,8 @@ def device_action_matches($index; $device; $packets; $overlimits; $bindings):
   and .stats.packets == $packets and .stats.overlimits == $overlimits
   and (.stats.bytes | type == "number" and . >= 0 and floor == .)
   and (if $packets > 0 then .stats.bytes > 0 else .stats.bytes == 0 end)
-  and .bind == $bindings and .ref == ($bindings + 1) and .not_in_hw == true;
+  and .bind == $bindings and .ref == ($bindings + 1)
+  and .skip_hw == true and .skip_sw != true and .in_hw != true;
 
 def device_lifetime_verified:
   try (

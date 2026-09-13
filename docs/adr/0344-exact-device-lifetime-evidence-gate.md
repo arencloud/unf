@@ -41,3 +41,11 @@ flags. The kernel explicitly rejects the mismatch. Both action creations now
 also specify `skip_hw`, as supported by the pinned tc command's action syntax.
 The failed fixture is retained and cleaned up; no denial/continuity evidence
 is inferred from this setup failure. The complete cl02 rerun remains required.
+
+The `7b897da` rerun completes all payload and lifecycle operations, then correctly
+fails its strict statistics gate: explicitly software-only actions serialize
+`skip_hw: true`, not the pilot's opportunistic `not_in_hw` field. Every retained
+packet/overlimit count matches the intended sequence, but the failed run remains
+failed. The observer now requires explicit `skip_hw` and rejects contradictory
+`skip_sw`/`in_hw` flags. Its positive and 112 mutation checks pass locally.
+A new complete cl02 run is required; this is not a hardware-evidence waiver.
