@@ -320,9 +320,22 @@ wait_for_controller() {
     return 1
 }
 
+assert_phase9_candidate_health() {
+    [[ ${release_phase} == 9.9 ]] || return 0
+    if ! "${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent -o json |
+        jq -L "${project_root}/hack" -e --arg image "${agent_image}" '
+            include "phase9-rollout-guard";
+            phase9_candidate_staging_healthy($image)
+        ' >/dev/null; then
+        echo "Phase 9 candidate restarted/terminated or staging observation failed; stopping Node transitions" >&2
+        return 1
+    fi
+}
+
 wait_for_agent_replacement() {
     local node=$1 old_uid=$2 pod_json=
     for _ in $(seq 1 300); do
+        assert_phase9_candidate_health
         pod_json=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent -o json 2>/dev/null || true)
         if jq -e --arg node "${node}" --arg uid "${old_uid}" --arg image "${agent_image}" \
             --arg phase "${release_phase}" '
@@ -347,6 +360,7 @@ wait_for_agent_replacement() {
 assert_phase9_agent_staging() {
     local node=$1 version= status=
     for _ in $(seq 1 120); do
+        assert_phase9_candidate_health
         version=$(agent_raw "${node}" /v1/version 2>/dev/null || true)
         status=$(agent_raw "${node}" /v1/status 2>/dev/null || true)
         if assert_version "${version}" unf-agent 2>/dev/null \
@@ -544,6 +558,7 @@ assert_host_service_path() {
 
 transition_agent() {
     local node=$1 pod current_image old_uid pod_revision desired_revision
+    assert_phase9_candidate_health
     pod=$(agent_pod_on_node "${node}")
     [[ -n ${pod} ]]
     current_image=$("${kc[@]}" -n unf-system get pod "${pod}" -o jsonpath='{.spec.containers[0].image}')
@@ -715,6 +730,7 @@ done
 [[ $("${kc[@]}" get network.operator.openshift.io cluster -o jsonpath='{.spec.deployKubeProxy}') == false ]]
 
 stage=evidence
+assert_phase9_candidate_health
 mkdir -p "$(dirname "${artifact}")"
 artifact_tmp="${artifact}.tmp.$$"
 if [[ ${release_phase} == 6.9 || ${release_phase} == 7.10 || ${release_phase} == 8.11 || ${release_phase} == 9.9 ]]; then
