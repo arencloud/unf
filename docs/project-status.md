@@ -537,6 +537,16 @@ release gate.
 
 ### Phase 9 resume history
 
+Current checkpoint (2026-09-13, ADRs 0298–0303): exact predecessor-receipt
+recovery and wholly Native key-readiness isolation are implemented with local
+regressions. The former candidate failed cl02 Native traffic; the latter's
+first image failed embedded-revision preflight. Build environment shadowing and
+conditional deployment-check masking are repaired. Rebuilt cl02 qualification
+must pass before updating retained Kind, whose original mixed-cursor state is
+preserved. Neither Phase 9 platform row is reverified. Required locality,
+replica/reply, continuity and full lifecycle gates remain open, followed by the
+separate S1–S5 stabilization and measured-load program.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.

@@ -33,3 +33,20 @@ staged deployment and Native adoption/packet gate on cl02 before Kind.
 
 This is qualification hardening, not completion of Phase 9 or evidence of
 heavy-load stability, lower CPU/memory use, or a supported scaling envelope.
+
+Rebuild source: `54f55112e37bb91c35e46683b4bf32533bd4294d`. The corrected
+builder layer's compiler environment matches this hash, and both final images
+report it through their version APIs when run locally, read-only, unprivileged,
+without cluster credentials or BPF access (controller offline; agent without a
+controller or interfaces). These checks are provenance checks, not platform
+feature qualification. The full Phase 9 OpenShift local gate also passes.
+
+| Component | Immutable Quay manifest SHA-256 |
+|---|---|
+| controller | `82a0196b9ce4bbb2ea890bf34adee7ae762418946a11365a29427b7996fd57fa` |
+| agent | `b5713aa56fed25cb1a21c65c8ca8a8a30e0de73cf85d245a5e10eb28b730eb2c` |
+
+The development tag is `s1-provenance-54f5511`. Test tools are unchanged.
+Release pins retain `openshift-first` and pending Kind evidence. Build, push
+and local version observations remain in ignored
+`.artifacts/s1-provenance-54f5511-*`.

@@ -179,8 +179,12 @@ Phase 9's historical closure on `cb59e90` (ADR 0292) was reopened by S1's
 locality/isolated-return findings (ADR 0293). ADR 0294 implements explicit Native
 coverage, with 24 allowed cases and eight reverse denials passing on cl02
 (ADR 0296). Matching-image Kind exposed a mixed-cursor receipt recovery gap
-(ADR 0297); ADR 0298 implements its regression-backed repair. Qualify that
-candidate on cl02 first, recover retained Kind state, then test fresh Kind. Required
+(ADR 0297); ADR 0298 implements its regression-backed repair. Its cl02 Native
+traffic gate failed (ADR 0299), exposing unnecessary Native/key-readiness
+coupling. ADR 0300 implements key-independent wholly Native publication, and
+ADR 0301 fences traffic on exact fixture adoption. The first candidate failed
+embedded-revision preflight; ADR 0303 repairs build and deployment provenance.
+Qualify rebuilt images on cl02 first, recover retained Kind state, then test fresh Kind. Required
 locality/replica and return-path coverage still need separate work. Earlier
 passing runs, failed attempts, intermittent migration timeout and startup exits
 remain in the record.
@@ -188,8 +192,9 @@ remain in the record.
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
 commit/push and evidence record for every step. Four of the six initially
-unhealthy cl02 operators recovered (ADR 0296); Insights and network remain
-unhealthy. S1 investigates continuity and the remaining failures, then establishes
+unhealthy cl02 operators temporarily recovered (ADR 0296), but failures recurred
+during later rollouts (ADR 0299). Do not treat a transient recovery as stable
+platform health. S1 investigates continuity and the remaining failures, then establishes
 resource and feature-limit baselines. S2–S5 profile and qualify heavy-load
 behavior. Continue testing cl02 before Kind; no unlimited-scale or
 production-readiness claim follows from Phase 9 closure.
