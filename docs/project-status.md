@@ -557,6 +557,12 @@ two-receipt/mixed-cursor frontier advances to a fresh Native generation with
 three receipts while all old agent Pod UIDs and zero restart counts remain
 unchanged. Matching-image agents and Native traffic qualification remain next.
 
+The subsequent serial agent upgrade and adoption-fenced Native gate also pass
+on retained Kind (`54f5511`, qualifier `0d246b0`): 24 allows, eight denials,
+cleanup and three-agent convergence. ADR 0305 records the evidence hash. This
+closes the matching-runtime Native recovery slice, not full Phase 9 or scale
+qualification; controlled continuity and Required coverage are next.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.
