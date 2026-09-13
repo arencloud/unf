@@ -10000,6 +10000,15 @@ fn reconcile_encryption_generation_fact(
         ));
     }
     let fact_revision = fact.checkpoint.transaction.transaction_revision;
+    // Keep only fixed-width publications and the authenticated recipient. The
+    // ledger owns the potentially large checkpoint after integrity validation.
+    let admission_receipt = admitted.then(|| {
+        (
+            fact.recipient.clone(),
+            fact.checkpoint.transaction.desired.published,
+            fact.checkpoint.transaction.prior,
+        )
+    });
     let admission_already_recovered = admitted && {
         let producer = mutex_lock(&state.encryption_generations);
         producer.active().is_some_and(|active| {
@@ -10029,6 +10038,9 @@ fn reconcile_encryption_generation_fact(
         if outcome == EncryptionGenerationFactOutcome::Unchanged && admission_already_recovered {
             return Ok(());
         }
+        if let Some((recipient, published, prior)) = admission_receipt {
+            recover_authenticated_encryption_receipt(state, &recipient, published, prior)?;
+        }
         let candidate = mutex_lock(&state.encryption_admitted_generation_facts)
             .candidate()
             .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
@@ -10056,6 +10068,36 @@ fn reconcile_encryption_generation_fact(
             membership_revision = membership_revision.get(),
             "published complete encryption generation from authenticated Node facts"
         );
+    }
+    Ok(())
+}
+
+// Call only after accepting a current Pod/Node's independently verified durable
+// admission into the ledger. Prepared, rejected and equivocating facts cannot
+// recover receipts. This restores backpressure, not local kernel authority.
+fn recover_authenticated_encryption_receipt(
+    state: &ControllerState,
+    recipient: &EncryptionGenerationRecipient,
+    published: unf_encryption::FastPathPublishedGeneration,
+    prior: Option<unf_encryption::FastPathPublishedGeneration>,
+) -> Result<(), ApiError> {
+    let mut producer = mutex_lock(&state.encryption_generations);
+    let expected = producer
+        .desired_for(recipient)
+        .map(|checkpoint| checkpoint.transaction.desired.published);
+    if let Some(expected) =
+        expected.filter(|expected| published == *expected || prior == Some(*expected))
+    {
+        // An exact successor admission proves this Node admitted its predecessor,
+        // even while other Nodes still lag. Never synthesize a complete newer cut.
+        if producer
+            .acknowledge(recipient, expected)
+            .map_err(|error| ApiError::service_unavailable(error.to_string()))?
+        {
+            state
+                .encryption_generations_dirty
+                .store(true, Ordering::Release);
+        }
     }
     Ok(())
 }
@@ -18112,6 +18154,274 @@ mod tests {
             .unwrap()
             .insert("unexpected".to_owned(), serde_json::json!(true));
         assert!(decode_encryption_generation_producer(&unknown.to_string()).is_err());
+    }
+
+    fn receipt_test_checkpoint(
+        generation: u64,
+        bank: u8,
+        prior: Option<unf_encryption::FastPathPublishedGeneration>,
+    ) -> unf_encryption::FastPathMapCheckpoint {
+        let compiled = unf_encryption::compile_encryption_fast_path(
+            unf_encryption::FastPathCompileContext {
+                generation: Revision::new(generation),
+                policy_revision: Revision::new(7),
+                service_revision: Revision::new(8),
+                egress_revision: Revision::new(9),
+                bank,
+                now_unix_ms: 1,
+                now_monotonic_ns: 1,
+            },
+            &[],
+            &[],
+        )
+        .unwrap();
+        unf_encryption::FastPathMapCheckpoint::begin(Revision::new(generation), &compiled, prior)
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // Keep the complete crash/replay sequence visible.
+    fn admitted_generation_recovers_partial_frontier_from_mixed_cursors() {
+        let state = new_state(true);
+        let agents = ["worker-a", "worker-b", "worker-c"].map(authenticated_egress_agent);
+        for agent in &agents {
+            install_authenticated_agent(&state, agent);
+            write_lock(&state.nodes).insert(
+                agent.node_name.clone(),
+                TopologyNode {
+                    name: agent.node_name.clone(),
+                    ready: true,
+                    labels: BTreeMap::new(),
+                },
+            );
+        }
+        let (membership, members) = encryption_generation_membership(&state).unwrap();
+        let first = receipt_test_checkpoint(11, 0, None);
+        let next = receipt_test_checkpoint(12, 1, Some(first.transaction.desired.published));
+        let facts = |checkpoint: &unf_encryption::FastPathMapCheckpoint| {
+            members
+                .iter()
+                .map(|member| {
+                    EncryptionGenerationFact::issue(membership, member.clone(), checkpoint.clone())
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let first_facts = facts(&first);
+        let next_facts = facts(&next);
+        for (agent, fact) in agents.iter().zip(&first_facts) {
+            reconcile_encryption_generation_fact(&state, agent, fact.clone(), false).unwrap();
+        }
+        {
+            let mut producer = mutex_lock(&state.encryption_generations);
+            for member in &members[..2] {
+                producer
+                    .acknowledge(member, first.transaction.desired.published)
+                    .unwrap();
+            }
+            // A restart restores only two predecessor receipts; two Nodes have
+            // already durably admitted the successor, but one Node has not.
+            *producer =
+                EncryptionGenerationProducer::restore(producer.checkpoint().unwrap()).unwrap();
+        }
+        for (agent, fact) in agents.iter().zip(&next_facts) {
+            reconcile_encryption_generation_fact(&state, agent, fact.clone(), false).unwrap();
+        }
+        assert!(!mutex_lock(&state.encryption_generations).is_fully_acknowledged());
+        for index in 0..3 {
+            let fact = if index == 0 {
+                &first_facts[index]
+            } else {
+                &next_facts[index]
+            };
+            reconcile_encryption_generation_fact(&state, &agents[index], fact.clone(), true)
+                .unwrap();
+        }
+        {
+            let producer = mutex_lock(&state.encryption_generations);
+            assert_eq!(producer.active().unwrap().revision, Revision::new(11));
+            assert!(
+                producer.is_fully_acknowledged(),
+                "exact successor admission must recover the missing predecessor receipt"
+            );
+        }
+        reconcile_encryption_generation_fact(&state, &agents[0], next_facts[0].clone(), false)
+            .unwrap();
+        assert_eq!(
+            mutex_lock(&state.encryption_generations)
+                .active()
+                .unwrap()
+                .revision,
+            Revision::new(12)
+        );
+        let request = EncryptionGenerationRequest {
+            schema_version: unf_encryption::ENCRYPTION_GENERATION_REQUEST_SCHEMA_VERSION,
+            node_name: agents[0].node_name.clone(),
+            current: Some(unf_encryption::EncryptionGenerationCursor {
+                controller_epoch: 1,
+                recipient: members[0].clone(),
+                published: first.transaction.desired.published,
+            }),
+            nonce: [17; 32],
+        };
+        assert!(
+            encryption_generation_for(&state, &agents[0], &request)
+                .unwrap()
+                .is_some()
+        );
+        for index in 1..3 {
+            reconcile_encryption_generation_fact(
+                &state,
+                &agents[index],
+                next_facts[index].clone(),
+                true,
+            )
+            .unwrap();
+        }
+        assert!(
+            !mutex_lock(&state.encryption_generations).is_fully_acknowledged(),
+            "recovery must not invent successor admission for the lagging Node"
+        );
+        reconcile_encryption_generation_fact(&state, &agents[0], next_facts[0].clone(), true)
+            .unwrap();
+        assert!(mutex_lock(&state.encryption_generations).is_fully_acknowledged());
+        state
+            .encryption_generations_dirty
+            .store(false, Ordering::Release);
+        for (agent, fact) in agents.iter().zip(next_facts) {
+            reconcile_encryption_generation_fact(&state, agent, fact, true).unwrap();
+        }
+        assert!(!state.encryption_generations_dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One shared fixture for the receipt rejection matrix.
+    fn admitted_generation_receipt_recovery_rejects_unproven_adoption() {
+        for case in [
+            "prepared",
+            "membership",
+            "pod",
+            "node",
+            "corrupt",
+            "unrelated",
+            "skipped",
+            "equivocation",
+            "regression",
+            "current",
+        ] {
+            let state = new_state(true);
+            let agents = ["worker-a", "worker-b"].map(authenticated_egress_agent);
+            for agent in &agents {
+                install_authenticated_agent(&state, agent);
+                write_lock(&state.nodes).insert(
+                    agent.node_name.clone(),
+                    TopologyNode {
+                        name: agent.node_name.clone(),
+                        ready: true,
+                        labels: BTreeMap::new(),
+                    },
+                );
+            }
+            let (membership, members) = encryption_generation_membership(&state).unwrap();
+            let first = receipt_test_checkpoint(11, 0, None);
+            for (agent, member) in agents.iter().zip(&members) {
+                let fact =
+                    EncryptionGenerationFact::issue(membership, member.clone(), first.clone())
+                        .unwrap();
+                reconcile_encryption_generation_fact(&state, agent, fact, false).unwrap();
+            }
+            let before = mutex_lock(&state.encryption_generations)
+                .checkpoint()
+                .unwrap();
+            state
+                .encryption_generations_dirty
+                .store(false, Ordering::Release);
+            let mut prior = first.transaction.desired.published;
+            if matches!(case, "unrelated" | "equivocation" | "regression") {
+                prior.state_digest.0[0] ^= 1;
+            } else if case == "skipped" {
+                prior.generation = Revision::new(10);
+            }
+            let next = receipt_test_checkpoint(12, 1, Some(prior));
+            let mut fact = EncryptionGenerationFact::issue(
+                if case == "membership" {
+                    Revision::new(membership.get() + 1)
+                } else {
+                    membership
+                },
+                members[0].clone(),
+                if case == "current" {
+                    first.clone()
+                } else {
+                    next
+                },
+            )
+            .unwrap();
+            let mut agent = agents[0].clone();
+            match case {
+                "pod" => agent.pod_uid = "replaced-pod".to_owned(),
+                "node" => {
+                    let mut recipient = members[0].clone();
+                    recipient.node_uid = "replaced-node".to_owned();
+                    fact = EncryptionGenerationFact::issue(membership, recipient, fact.checkpoint)
+                        .unwrap();
+                }
+                "corrupt" => {
+                    fact.checkpoint
+                        .transaction
+                        .prior
+                        .as_mut()
+                        .unwrap()
+                        .state_digest
+                        .0[0] ^= 1;
+                }
+                "equivocation" | "regression" => {
+                    let seed = if case == "regression" {
+                        EncryptionGenerationFact::issue(
+                            membership,
+                            members[0].clone(),
+                            receipt_test_checkpoint(13, 1, Some(prior)),
+                        )
+                        .unwrap()
+                    } else {
+                        fact.clone()
+                    };
+                    reconcile_encryption_generation_fact(&state, &agent, seed, true).unwrap();
+                    fact = EncryptionGenerationFact::issue(
+                        membership,
+                        members[0].clone(),
+                        receipt_test_checkpoint(12, 1, Some(first.transaction.desired.published)),
+                    )
+                    .unwrap();
+                }
+                _ => {}
+            }
+            let result =
+                reconcile_encryption_generation_fact(&state, &agent, fact, case != "prepared");
+            assert_eq!(
+                result.is_ok(),
+                matches!(case, "prepared" | "unrelated" | "skipped" | "current"),
+                "{case}"
+            );
+            let after = mutex_lock(&state.encryption_generations)
+                .checkpoint()
+                .unwrap();
+            if case == "current" {
+                assert_eq!(after.active, before.active);
+                assert_eq!(after.acknowledgements.len(), 1);
+                assert_eq!(after.acknowledgements[0].recipient, members[0]);
+                assert!(!mutex_lock(&state.encryption_generations).is_fully_acknowledged());
+                let restored = EncryptionGenerationProducer::restore(after.clone()).unwrap();
+                assert_eq!(restored.checkpoint().unwrap(), after);
+                assert!(state.encryption_generations_dirty.load(Ordering::Acquire));
+            } else {
+                assert_eq!(after, before, "{case} must not create any receipt");
+                assert!(
+                    !state.encryption_generations_dirty.load(Ordering::Acquire),
+                    "{case}"
+                );
+            }
+        }
     }
 
     #[test]
