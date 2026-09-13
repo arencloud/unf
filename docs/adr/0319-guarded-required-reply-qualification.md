@@ -48,6 +48,8 @@ loss. A tokenless, no-host-mount capture on the explicit underlay interface
 requires WireGuard frames, zero selected-client plaintext, positive Native
 plaintext, clean explicit stop and zero reported kernel capture loss. Existing
 capture negative tests cover premature expiry, crash and unavailable statistics.
+The reused capture helper reports an explicit post-traffic stop for this gate,
+not an injected link fault; no link fault is performed by this bounded slice.
 The fixture Namespace must then be positively absent and every agent back on a
 converged Native generation before evidence can say `passed`.
 

@@ -70,7 +70,8 @@ EOF
 
 required_reply_capture_finish() {
     local lifecycle wireguard required native capture_sha
-    lifecycle=$(phase9_capture_finish "$directory/capture")
+    lifecycle=$(phase9_capture_finish "$directory/capture" |
+      jq -ce 'del(.explicitStopAfterFault) + {explicitStopAfterTraffic:true}')
     wireguard=$(tcpdump -nn -r "$directory/capture/received.pcap" 'udp and (port 51820 or port 51821)' 2> "$directory/capture/decode-wg.log" | wc -l)
     required=$(tcpdump -nn -r "$directory/capture/received.pcap" "$required_filter" 2> "$directory/capture/decode-required.log" | wc -l)
     native=$(tcpdump -nn -r "$directory/capture/received.pcap" "$native_filter" 2> "$directory/capture/decode-native.log" | wc -l)

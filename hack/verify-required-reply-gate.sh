@@ -30,4 +30,5 @@ jq -L "$root/hack" -ne '
     (good|.snapshot.epochs[0].contract.plans[0].disposition="native")]|length==8 and all(.[];valid|not))
 ' >/dev/null
 bash "$root/hack/verify-phase9-capture.sh"
+rg -Fq 'del(.explicitStopAfterFault) + {explicitStopAfterTraffic:true}' "$root/hack/required-reply-capture.sh"
 echo 'Required reply gate rejects incomplete/stale/foreign cuts and unbound reply provenance'
