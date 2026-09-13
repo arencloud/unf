@@ -5,6 +5,11 @@ S1's missing transport coverage findings (ADR 0293). ADR 0294 implements the
 Native repair; live requalification and Required coverage remain pending.
 S1–S5 are not yet verified.
 
+ADR 0300 now implements key-independent publication for wholly Native models,
+after ADR 0299's cl02 failure. Its local regressions pass; a new immutable
+runtime must pass cl02 before retained Kind is updated. Do not treat the
+earlier `571379d` Native pass as qualification of this implementation.
+
 Commit and push each completed step before the next. Platform feature tests run
 on OpenShift cl02 first, then isolated Kind; local checks precede deployment.
 Both platform results must name the same immutable runtime images. Credentials

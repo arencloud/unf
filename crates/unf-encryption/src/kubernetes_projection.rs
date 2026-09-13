@@ -48,6 +48,15 @@ pub struct KubernetesEncryptionProjectionInput {
     pub policy_observations: Vec<EncryptionPolicyObservation>,
 }
 
+/// Placement and policy truth without any cryptographic transport coordinate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesNativeProjectionInput {
+    pub cluster_id: String,
+    pub nodes: Vec<KubernetesEncryptionNodeSnapshot>,
+    pub workloads: Vec<KubernetesEncryptionWorkloadSnapshot>,
+    pub policy_observations: Vec<EncryptionPolicyObservation>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KubernetesEncryptionProjection {
     pub nodes: Vec<EncryptionNode>,
@@ -66,12 +75,59 @@ pub fn project_kubernetes_encryption(
     mut input: KubernetesEncryptionProjectionInput,
 ) -> Result<KubernetesEncryptionProjection, KubernetesEncryptionProjectionError> {
     validate_shape(&input)?;
-    input
+    let mut projection = project_placement(
+        &input.cluster_id,
+        &mut input.nodes,
+        &mut input.workloads,
+        &input.policy_observations,
+    )?;
+    let nodes_by_name = projection
         .nodes
-        .sort_by(|left, right| left.name.cmp(&right.name));
-    input
-        .workloads
-        .sort_by(|left, right| left.workload_uid.cmp(&right.workload_uid));
+        .iter()
+        .map(|node| (node.name.as_str(), node))
+        .collect();
+    projection.paths = demanded_paths(
+        &input,
+        &nodes_by_name,
+        &projection.endpoints,
+        &projection.policies,
+    )?;
+    Ok(projection)
+}
+
+/// Projects validated Native placement without inventing an epoch or generating
+/// unused `WireGuard` paths. The caller must separately enforce a Native model.
+///
+/// # Errors
+///
+/// Rejects the same invalid membership, IPAM, workload and policy truth as the
+/// keyed projector. No key or cryptographic capability is admitted here.
+pub fn project_kubernetes_native(
+    mut input: KubernetesNativeProjectionInput,
+) -> Result<KubernetesEncryptionProjection, KubernetesEncryptionProjectionError> {
+    validate_nodes(&input.cluster_id, &input.nodes)?;
+    project_placement(
+        &input.cluster_id,
+        &mut input.nodes,
+        &mut input.workloads,
+        &input.policy_observations,
+    )
+}
+
+fn project_placement(
+    cluster_id: &str,
+    node_snapshots: &mut [KubernetesEncryptionNodeSnapshot],
+    workloads: &mut [KubernetesEncryptionWorkloadSnapshot],
+    observations: &[EncryptionPolicyObservation],
+) -> Result<KubernetesEncryptionProjection, KubernetesEncryptionProjectionError> {
+    node_snapshots.sort_by(|left, right| left.name.cmp(&right.name));
+    workloads.sort_by(|left, right| left.workload_uid.cmp(&right.workload_uid));
+    if workloads
+        .windows(2)
+        .any(|pair| pair[0].workload_uid == pair[1].workload_uid)
+    {
+        return Err(KubernetesEncryptionProjectionError::InvalidWorkload);
+    }
     let capabilities = BTreeSet::from([
         EncryptionCapability::KernelWireGuard,
         EncryptionCapability::DualStackUnderlay,
@@ -79,15 +135,14 @@ pub fn project_kubernetes_encryption(
         EncryptionCapability::TwoEpochRotation,
         EncryptionCapability::EncryptedPathChallenge,
     ]);
-    let nodes = input
-        .nodes
+    let nodes = node_snapshots
         .iter()
         .cloned()
         .map(|mut node| {
             node.pod_cidrs.sort_unstable();
             node.underlay_addresses.sort_unstable();
             EncryptionNode {
-                cluster_id: input.cluster_id.clone(),
+                cluster_id: cluster_id.to_owned(),
                 name: node.name,
                 uid: node.uid,
                 pod_cidrs: node.pod_cidrs,
@@ -101,8 +156,7 @@ pub fn project_kubernetes_encryption(
         .map(|node| (node.name.as_str(), node))
         .collect::<BTreeMap<_, _>>();
     let mut endpoints = Vec::new();
-    for workload in input
-        .workloads
+    for workload in workloads
         .iter()
         .filter(|workload| !workload.host_network)
         .cloned()
@@ -140,23 +194,19 @@ pub fn project_kubernetes_encryption(
     }
     let pairs = demanded_identity_pairs(&endpoints);
     let policies = if pairs.is_empty() {
-        if !input.policy_observations.is_empty() {
+        if !observations.is_empty() {
             return Err(KubernetesEncryptionProjectionError::InvalidPolicy);
         }
         Vec::new()
     } else {
-        project_encryption_policy_facts(
-            pairs.iter().copied(),
-            input.policy_observations.iter().copied(),
-        )
-        .map_err(|_| KubernetesEncryptionProjectionError::InvalidPolicy)?
+        project_encryption_policy_facts(pairs.iter().copied(), observations.iter().copied())
+            .map_err(|_| KubernetesEncryptionProjectionError::InvalidPolicy)?
     };
-    let paths = demanded_paths(&input, &nodes_by_name, &endpoints, &policies)?;
     Ok(KubernetesEncryptionProjection {
         nodes,
         endpoints,
         policies,
-        paths,
+        paths: Vec::new(),
     })
 }
 
@@ -175,10 +225,20 @@ fn validate_shape(
     {
         return Err(KubernetesEncryptionProjectionError::InvalidInput);
     }
+    validate_nodes(&input.cluster_id, &input.nodes)
+}
+
+fn validate_nodes(
+    cluster_id: &str,
+    nodes: &[KubernetesEncryptionNodeSnapshot],
+) -> Result<(), KubernetesEncryptionProjectionError> {
+    if cluster_id.is_empty() || nodes.is_empty() {
+        return Err(KubernetesEncryptionProjectionError::InvalidInput);
+    }
     let mut names = BTreeSet::new();
     let mut uids = BTreeSet::new();
     let mut prefixes = Vec::new();
-    for node in &input.nodes {
+    for node in nodes {
         if !node.ready
             || !node.managed
             || node.name.is_empty()

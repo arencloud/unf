@@ -56,6 +56,94 @@ pub struct FleetDrainingEpochInput {
     pub paths: Vec<EncryptionPathFact>,
 }
 
+/// A fully Native causal cut has no cryptographic input or authority. This is
+/// not a fallback for a keyed cut with unavailable or expired keys.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeFleetPlanProductionInput {
+    pub membership_revision: Revision,
+    pub generation: Revision,
+    pub policy_revision: Revision,
+    pub service_revision: Revision,
+    pub egress_revision: Revision,
+    pub listen_port: u16,
+    pub persistent_keepalive_seconds: u16,
+    pub model: EncryptionModel,
+    pub placement: crate::KubernetesNativeProjectionInput,
+}
+
+/// Publishes explicit Native decisions independently of key lifecycle readiness.
+///
+/// # Errors
+///
+/// Rejects Required baseline or any intent, noncanonical model, invalid placement
+/// or membership, incomplete causal revisions and capacity overflow. No partial
+/// cut, synthetic epoch or cryptographic path is produced.
+pub fn produce_native_fleet_plan_cut(
+    input: NativeFleetPlanProductionInput,
+) -> Result<NodeLocalPlanFleetCut, FleetPlanProductionError> {
+    let normalized = EncryptionModel::normalize(
+        input.model.cluster_id.clone(),
+        input.model.baseline,
+        input.model.intents.clone(),
+    )
+    .map_err(|_| FleetPlanProductionError::InvalidNativeModel)?;
+    if normalized != input.model
+        || input.model.baseline != crate::EncryptionBaseline::Native
+        || !input.model.intents.is_empty()
+        || input.placement.cluster_id != input.model.cluster_id
+    {
+        return Err(FleetPlanProductionError::InvalidNativeModel);
+    }
+    if input.membership_revision == Revision::INITIAL
+        || input.placement.nodes.len() > crate::MAX_ENCRYPTION_PLAN_MEMBERS
+    {
+        return Err(FleetPlanProductionError::InvalidMembership);
+    }
+    let projection = crate::project_kubernetes_native(input.placement)?;
+    let members = projection
+        .nodes
+        .iter()
+        .map(|node| EncryptionGenerationRecipient {
+            node_name: node.name.clone(),
+            node_uid: node.uid.clone(),
+        })
+        .collect::<Vec<_>>();
+    let plans = projection
+        .nodes
+        .iter()
+        .zip(&members)
+        .map(|(node, recipient)| {
+            let decisions = native_decisions(
+                &input.model,
+                &projection.endpoints,
+                &projection.policies,
+                node,
+                crate::MAX_FAST_PATH_DECISIONS,
+            )?;
+            NodeLocalPlanSnapshot::issue(NodeLocalPlanSnapshotFields {
+                membership_revision: input.membership_revision,
+                generation: input.generation,
+                recipient: recipient.clone(),
+                mode: if decisions.is_empty() {
+                    NodeLocalPlanMode::Dormant
+                } else {
+                    NodeLocalPlanMode::Active
+                },
+                policy_revision: input.policy_revision,
+                service_revision: input.service_revision,
+                egress_revision: input.egress_revision,
+                listen_port: input.listen_port,
+                persistent_keepalive_seconds: input.persistent_keepalive_seconds,
+                epochs: Vec::new(),
+                decisions,
+            })
+            .map_err(FleetPlanProductionError::from)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    NodeLocalPlanFleetCut::issue(input.membership_revision, input.generation, members, plans)
+        .map_err(FleetPlanProductionError::InvalidFleetCut)
+}
+
 /// Produces one atomic all-member plan cut from a single causal input.
 ///
 /// # Errors
@@ -297,8 +385,9 @@ fn produce_node_plan(
         })
         .collect::<Vec<_>>();
     decisions.extend(native_decisions(
-        input,
-        facts,
+        &input.model,
+        &facts.endpoints,
+        &facts.policies,
         &node,
         crate::MAX_FAST_PATH_DECISIONS.saturating_sub(decisions.len()),
     )?);
@@ -361,23 +450,22 @@ fn produce_node_plan(
 }
 
 fn native_decisions(
-    input: &FleetPlanProductionInput,
-    facts: &EncryptionContractFacts,
+    model: &EncryptionModel,
+    endpoints: &[EncryptionEndpointFact],
+    policies: &[EncryptionPolicyFact],
     node: &crate::EncryptionNode,
     available: usize,
 ) -> Result<Vec<NodeLocalDecisionPlan>, FleetPlanProductionError> {
     // Required is monotonic: no identity pair can resolve to Native under a
     // Required baseline. Avoid any local-pair enumeration in that case.
-    if input.model.baseline == crate::EncryptionBaseline::Required {
+    if model.baseline == crate::EncryptionBaseline::Required {
         return Ok(Vec::new());
     }
-    let known = facts
-        .endpoints
+    let known = endpoints
         .iter()
         .map(|endpoint| endpoint.identity)
         .collect::<BTreeSet<_>>();
-    let local = facts
-        .endpoints
+    let local = endpoints
         .iter()
         .filter(|endpoint| endpoint.node.uid == node.uid)
         .map(|endpoint| endpoint.identity)
@@ -386,7 +474,7 @@ fn native_decisions(
     let mut admit = |source, destination| -> Result<(), FleetPlanProductionError> {
         let pair = (source, destination);
         if pairs.contains(&pair)
-            || input.model.requirement(source, destination).disposition
+            || model.requirement(source, destination).disposition
                 != crate::EncryptionDisposition::Native
         {
             return Ok(());
@@ -409,7 +497,7 @@ fn native_decisions(
     // an independently initiated flow in that direction is denied. Cover both
     // Native transport directions without changing either policy fact. A
     // Required opposite direction is deliberately NOT downgraded to Native.
-    for policy in facts.policies.iter().filter(|policy| policy.allowed) {
+    for policy in policies.iter().filter(|policy| policy.allowed) {
         if !known.contains(&policy.source)
             || !known.contains(&policy.destination)
             || (!local.contains(&policy.source) && !local.contains(&policy.destination))
@@ -435,6 +523,10 @@ fn native_decisions(
 
 #[derive(Debug, Error)]
 pub enum FleetPlanProductionError {
+    #[error("key-independent Native production requires a canonical Native model without intents")]
+    InvalidNativeModel,
+    #[error("invalid Native placement/policy projection: {0}")]
+    InvalidProjection(#[from] crate::KubernetesEncryptionProjectionError),
     #[error("Native transport coverage exceeds the remaining {available} bounded decision slots")]
     NativeDecisionCapacity { available: usize },
     #[error("invalid public key transparency cut: {0}")]
@@ -726,6 +818,188 @@ mod tests {
             draining: None,
             key_cut,
         }
+    }
+
+    #[test]
+    fn key_independent_native_cut_matches_keyed_native_semantics() {
+        let mut keyed = input(true);
+        keyed.model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+            Vec::new(),
+        )
+        .unwrap();
+        keyed.policies[1].allowed = false;
+        let native = native_input(&keyed);
+        let expected = produce_fleet_plan_cut(keyed).unwrap();
+        let actual = produce_native_fleet_plan_cut(native.clone()).unwrap();
+        assert_eq!(actual, expected);
+        assert!(actual.plans.iter().all(|plan| plan.epochs.is_empty()));
+        for plan in actual
+            .plans
+            .iter()
+            .filter(|plan| plan.mode == NodeLocalPlanMode::Active)
+        {
+            let prepared = plan.prepare_exact_readback(None, NOW, 1, &[]).unwrap();
+            let state = prepared.fact().checkpoint.desired_state().unwrap();
+            assert_eq!(state.config.epoch_count, 0);
+            assert_eq!(state.config.transport_count, 0);
+            assert_eq!(state.config.path_count, 0);
+        }
+        let mut reordered = native;
+        reordered.placement.nodes.reverse();
+        reordered.placement.workloads.reverse();
+        reordered.placement.policy_observations.reverse();
+        assert_eq!(produce_native_fleet_plan_cut(reordered).unwrap(), actual);
+    }
+
+    fn native_input(keyed: &FleetPlanProductionInput) -> NativeFleetPlanProductionInput {
+        NativeFleetPlanProductionInput {
+            membership_revision: keyed.membership_revision,
+            generation: keyed.generation,
+            policy_revision: keyed.policy_revision,
+            service_revision: keyed.service_revision,
+            egress_revision: keyed.egress_revision,
+            listen_port: keyed.listen_port,
+            persistent_keepalive_seconds: keyed.persistent_keepalive_seconds,
+            model: keyed.model.clone(),
+            placement: crate::KubernetesNativeProjectionInput {
+                cluster_id: keyed.model.cluster_id.clone(),
+                nodes: keyed
+                    .nodes
+                    .iter()
+                    .map(|node| crate::KubernetesEncryptionNodeSnapshot {
+                        name: node.name.clone(),
+                        uid: node.uid.clone(),
+                        ready: true,
+                        managed: true,
+                        pod_cidrs: node.pod_cidrs.clone(),
+                        underlay_addresses: node.underlay_addresses.clone(),
+                    })
+                    .collect(),
+                workloads: keyed
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| crate::KubernetesEncryptionWorkloadSnapshot {
+                        workload_uid: endpoint.workload_uid.clone(),
+                        identity: endpoint.identity,
+                        node_name: endpoint.node.name.clone(),
+                        host_network: false,
+                        addresses: endpoint
+                            .node
+                            .pod_cidrs
+                            .iter()
+                            .filter_map(|prefix| match prefix.address {
+                                IpAddr::V4(address) => {
+                                    Some(IpAddr::V4(Ipv4Addr::from(u32::from(address) + 8)))
+                                }
+                                IpAddr::V6(_) => None,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                policy_observations: keyed
+                    .policies
+                    .iter()
+                    .map(|policy| crate::EncryptionPolicyObservation {
+                        pair: crate::EncryptionIdentityPair {
+                            source: policy.source,
+                            destination: policy.destination,
+                        },
+                        allowed: policy.allowed,
+                        reason: policy.reason,
+                        policy_id: policy.policy_ids.first().copied(),
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn key_independent_native_cut_refuses_required_or_invalid_authority() {
+        let mut keyed = input(true);
+        let required = native_input(&keyed);
+        assert!(matches!(
+            produce_native_fleet_plan_cut(required),
+            Err(FleetPlanProductionError::InvalidNativeModel)
+        ));
+        keyed.model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+            Vec::new(),
+        )
+        .unwrap();
+        let input = native_input(&keyed);
+        for case in [
+            "intent",
+            "schema",
+            "cluster",
+            "node",
+            "ipam",
+            "duplicate",
+            "policy",
+            "revision",
+        ] {
+            let mut invalid = input.clone();
+            match case {
+                "intent" => invalid.model.intents.push(crate::EncryptionIntent {
+                    name: "require".to_owned(),
+                    uid: "require-uid".to_owned(),
+                    priority: 1,
+                    sources: crate::ManagedIdentitySelector::Identities(BTreeSet::from([
+                        IdentityId::new(11),
+                    ])),
+                    destinations: crate::ManagedIdentitySelector::Identities(BTreeSet::from([
+                        IdentityId::new(21),
+                    ])),
+                }),
+                "schema" => invalid.model.schema_version += 1,
+                "cluster" => invalid.placement.cluster_id = "other-cluster".to_owned(),
+                "node" => invalid.placement.nodes[0].ready = false,
+                "ipam" => {
+                    invalid.placement.workloads[0].addresses = vec!["192.0.2.99".parse().unwrap()];
+                }
+                "duplicate" => invalid
+                    .placement
+                    .workloads
+                    .push(invalid.placement.workloads[0].clone()),
+                "policy" => {
+                    invalid.placement.policy_observations[0].pair.source = IdentityId::new(999);
+                }
+                "revision" => invalid.policy_revision = Revision::INITIAL,
+                _ => unreachable!(),
+            }
+            assert!(produce_native_fleet_plan_cut(invalid).is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn key_independent_native_cut_preserves_decision_capacity() {
+        let mut keyed = input(true);
+        keyed.model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+            Vec::new(),
+        )
+        .unwrap();
+        let mut input = native_input(&keyed);
+        input.placement.nodes[0].pod_cidrs[0].prefix_len = 16;
+        input.placement.policy_observations.clear();
+        input.placement.workloads = (0..257_u32)
+            .map(|ordinal| crate::KubernetesEncryptionWorkloadSnapshot {
+                workload_uid: format!("pod-{ordinal}"),
+                identity: IdentityId::new(ordinal + 1),
+                node_name: "worker-a".to_owned(),
+                host_network: false,
+                addresses: vec![IpAddr::V4(Ipv4Addr::from(
+                    u32::from(Ipv4Addr::new(10, 42, 1, 1)) + ordinal,
+                ))],
+            })
+            .collect();
+        assert!(matches!(
+            produce_native_fleet_plan_cut(input),
+            Err(FleetPlanProductionError::NativeDecisionCapacity { .. })
+        ));
     }
 
     #[test]

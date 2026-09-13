@@ -2,7 +2,7 @@
 
 Date: 2026-09-13
 
-Status: observed coupling; implementation and qualification pending
+Status: key-independent Native path implemented; live qualification pending
 
 ADR 0299 retains the failed `b5bf6c6` cl02 packet gate. Readiness, all-node
 generation agreement and policy/Service convergence did not imply traffic
@@ -42,3 +42,39 @@ qualify cl02 before recovering retained Kind. Traffic continuity under metadata
 churn and Required locality/replica/reply coverage remain separate open gates.
 Any performance improvement requires equal-workload measurements, not inference
 from eliminating a code path.
+
+## Implementation and local verification
+
+The new Native producer accepts a separate placement input with no epoch, key,
+route table, mark or interface coordinate. Both projection paths reuse Node,
+IPAM, workload and policy validation; duplicate workload UIDs are explicitly
+rejected. The Native factory rejects a noncanonical model, any intent, Required
+baseline, mismatched cluster, invalid placement and revision/capacity overflow.
+Its plans contain only Native decisions or explicit dormant membership; exact
+map compilation proves zero epochs, transports and paths.
+
+The controller chooses the model and captures revisions/placement under the
+same informer guard. Fully Native plans use an explicit absent key dependency
+in the internal cache key; ready-key publication and expiry therefore do not
+create another Native generation. All other causal inputs and existing
+activation/predecessor barriers remain. The Required path still requires the
+complete valid key cut. Shared catalog publication keeps persistence and
+generation accounting identical across both paths. No wire schema or BPF ABI
+changes are needed.
+
+The new controller regression fails on the old implementation's missing first
+Native publication. Six added tests cover key-independent controller progress,
+activation backpressure, Service revision changes, key-only coalescing/expiry,
+Required baseline/intent refusal and transition, exact equivalence to the
+existing keyed Native semantics, canonical ordering, zero-epoch map compilation,
+invalid authority, and the 65,536-decision bound. All 745 workspace tests pass;
+25 environment-dependent tests remain explicitly ignored. Formatting and strict
+all-target/all-feature workspace Clippy pass. Private logs are retained under
+`.artifacts/s1-native-key-*`.
+
+This isolates only a wholly Native model. A model with any materialized
+Required intent still takes the keyed path, including its Native portions;
+there is no per-policy best-effort fallback. Key lifecycle recovery, continuous
+traffic across metadata churn, Required locality/replica/reply coverage and
+the measured resource/scale envelope remain unverified. The new runtime still
+needs cl02-first packet/recovery qualification before retained or fresh Kind.

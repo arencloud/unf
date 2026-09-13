@@ -451,7 +451,7 @@ struct EncryptionPlanSource {
     routing_revision: Revision,
     service_revision: Revision,
     egress_revision: Revision,
-    key_cut_digest: NodeKeyTransparencyCutDigest,
+    key_cut_digest: Option<NodeKeyTransparencyCutDigest>,
 }
 
 #[derive(Debug, Default)]
@@ -10501,7 +10501,7 @@ fn draining_encryption_contract_revision(
 fn current_encryption_plan_source(
     state: &ControllerState,
     membership_revision: Revision,
-    key_cut_digest: NodeKeyTransparencyCutDigest,
+    key_cut_digest: Option<NodeKeyTransparencyCutDigest>,
 ) -> EncryptionPlanSource {
     let revisions = mutex_lock(&state.revisions).clone();
     let egress_revision = mutex_lock(&state.egress_control_plane)
@@ -11110,7 +11110,22 @@ fn reconcile_encryption_plan_catalog_at(
     {
         return Ok(false);
     }
+    // Bind model selection, causal revisions and placement to the same informer
+    // cut. A concurrent Required intent must not race a Native publication.
+    let _policy_cut = read_lock(&state.policy_state_guard);
     let (membership_revision, members) = encryption_generation_membership(state)?;
+    let model = current_encryption_model(state)?;
+    if model.baseline == EncryptionBaseline::Native && model.intents.is_empty() {
+        return reconcile_native_plan_catalog_at(
+            state,
+            &mut reconciler,
+            now_unix_ms,
+            minimum_generation,
+            membership_revision,
+            &members,
+            model,
+        );
+    }
     let Some(key_cut) = mutex_lock(&state.encryption_key_transparency)
         .complete_cut()
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?
@@ -11122,31 +11137,17 @@ fn reconcile_encryption_plan_catalog_at(
         return Ok(false);
     };
     let draining_epoch = encryption_draining_epoch_window(&key_cut, active_epoch, now_unix_ms)?;
-    let source = current_encryption_plan_source(state, membership_revision, key_cut.cut_digest);
-    let recovery_successor_required =
-        encryption_plan_catalog_requires_recovery(state, minimum_generation);
-    // A current agent cursor is an acknowledgement of the published cut, not
-    // a request to manufacture a successor.  The minimum only fences a
-    // controller that must reconstruct a catalog after losing its in-memory
-    // source; once the causal source matches, every poll must converge on the
-    // same generation until an input actually changes.
-    if !recovery_successor_required
-        && reconciler.source.as_ref() == Some(&source)
-        && reconciler
-            .refresh_at_unix_ms
-            .is_none_or(|deadline| now_unix_ms < deadline)
-    {
+    let source =
+        current_encryption_plan_source(state, membership_revision, Some(key_cut.cut_digest));
+    if encryption_plan_catalog_is_reusable(
+        state,
+        &reconciler,
+        &source,
+        now_unix_ms,
+        minimum_generation,
+    ) {
         return Ok(true);
     }
-    if !recovery_successor_required
-        && let Some(active) = mutex_lock(&state.encryption_local_plans).active()
-        && active.membership_revision == membership_revision
-        && !encryption_plan_cut_is_activated(state, active)
-        && encryption_plan_cut_is_current(active, now_unix_ms)
-    {
-        return Ok(true);
-    }
-    let _policy_cut = read_lock(&state.policy_state_guard);
     let nodes = encryption_nodes(state, &members)?;
     let workloads = encryption_workloads(state, &members);
     let policy_observations = encryption_policy_observations(state, &members)?;
@@ -11167,7 +11168,6 @@ fn reconcile_encryption_plan_catalog_at(
     )?;
     let generation =
         next_encryption_plan_generation(reconciler.generation, now_unix_ms, minimum_generation);
-    let model = current_encryption_model(state)?;
     let cut = produce_fleet_plan_cut(FleetPlanProductionInput {
         membership_revision,
         generation,
@@ -11191,6 +11191,98 @@ fn reconcile_encryption_plan_catalog_at(
         key_cut,
     })
     .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    publish_encryption_plan_cut(
+        state,
+        &mut reconciler,
+        source,
+        cut,
+        draining_epoch.map(|(_, deadline)| deadline),
+    )
+}
+
+fn encryption_plan_catalog_is_reusable(
+    state: &ControllerState,
+    reconciler: &EncryptionPlanReconciler,
+    source: &EncryptionPlanSource,
+    now_unix_ms: u64,
+    minimum_generation: Revision,
+) -> bool {
+    // Cursors acknowledge a cut; they do not manufacture churn. Preserve both
+    // complete-cut recovery and the activation barrier for Native and Required.
+    if encryption_plan_catalog_requires_recovery(state, minimum_generation) {
+        return false;
+    }
+    if reconciler.source.as_ref() == Some(source)
+        && reconciler
+            .refresh_at_unix_ms
+            .is_none_or(|deadline| now_unix_ms < deadline)
+    {
+        return true;
+    }
+    mutex_lock(&state.encryption_local_plans)
+        .active()
+        .is_some_and(|active| {
+            active.membership_revision == source.membership_revision
+                && !encryption_plan_cut_is_activated(state, active)
+                && encryption_plan_cut_is_current(active, now_unix_ms)
+        })
+}
+
+fn reconcile_native_plan_catalog_at(
+    state: &ControllerState,
+    reconciler: &mut EncryptionPlanReconciler,
+    now_unix_ms: u64,
+    minimum_generation: Revision,
+    membership_revision: Revision,
+    members: &[EncryptionGenerationRecipient],
+    model: EncryptionModel,
+) -> Result<bool, ApiError> {
+    // None means no key dependency, not a fabricated key commitment. Key-only
+    // churn must not rematerialize an unchanged, explicitly Native fleet cut.
+    let source = current_encryption_plan_source(state, membership_revision, None);
+    if encryption_plan_catalog_is_reusable(
+        state,
+        reconciler,
+        &source,
+        now_unix_ms,
+        minimum_generation,
+    ) {
+        return Ok(true);
+    }
+    let generation =
+        next_encryption_plan_generation(reconciler.generation, now_unix_ms, minimum_generation);
+    let cut = unf_encryption::produce_native_fleet_plan_cut(
+        unf_encryption::NativeFleetPlanProductionInput {
+            membership_revision,
+            generation,
+            policy_revision: source.policy_revision,
+            service_revision: source.service_revision,
+            egress_revision: source.egress_revision,
+            listen_port: 51_820,
+            persistent_keepalive_seconds: 25,
+            model,
+            placement: unf_encryption::KubernetesNativeProjectionInput {
+                cluster_id: state.encryption_cluster_id.clone(),
+                nodes: encryption_nodes(state, members)?,
+                workloads: encryption_workloads(state, members),
+                policy_observations: encryption_policy_observations(state, members)?,
+            },
+        },
+    )
+    .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
+    publish_encryption_plan_cut(state, reconciler, source, cut, None)
+}
+
+fn publish_encryption_plan_cut(
+    state: &ControllerState,
+    reconciler: &mut EncryptionPlanReconciler,
+    source: EncryptionPlanSource,
+    cut: NodeLocalPlanFleetCut,
+    refresh_at_unix_ms: Option<u64>,
+) -> Result<bool, ApiError> {
+    let generation = cut.generation;
+    let membership_revision = cut.membership_revision;
+    let key_independent_native = source.key_cut_digest.is_none();
     mutex_lock(&state.encryption_local_plans)
         .publish(cut)
         .map_err(|error| ApiError::service_unavailable(error.to_string()))?;
@@ -11199,10 +11291,11 @@ fn reconcile_encryption_plan_catalog_at(
         .store(true, Ordering::Release);
     reconciler.source = Some(source);
     reconciler.generation = generation;
-    reconciler.refresh_at_unix_ms = draining_epoch.map(|(_, deadline)| deadline);
+    reconciler.refresh_at_unix_ms = refresh_at_unix_ms;
     info!(
         generation = generation.get(),
         membership_revision = membership_revision.get(),
+        key_independent_native,
         "published pull-synchronized causal encryption plan catalog"
     );
     Ok(true)
@@ -17524,6 +17617,209 @@ mod tests {
             .unwrap();
         assert!(recovered.snapshot.generation > ahead_request.current.as_ref().unwrap().generation);
         assert_eq!(recovered.snapshot.service_revision, Revision::new(6));
+    }
+
+    fn native_plan_test_state() -> (ControllerState, AuthenticatedAgent) {
+        let mut state = new_state(true);
+        state.encryption_baseline = EncryptionBaseline::Native;
+        let agent = authenticated_egress_agent("worker-a");
+        install_authenticated_agent(&state, &agent);
+        write_lock(&state.nodes).insert(
+            agent.node_name.clone(),
+            TopologyNode {
+                name: agent.node_name.clone(),
+                ready: true,
+                labels: BTreeMap::from([(
+                    PRIMARY_CNI_NODE_LABEL.to_owned(),
+                    PRIMARY_CNI_NODE_LABEL_VALUE.to_owned(),
+                )]),
+            },
+        );
+        write_lock(&state.node_port_nodes)
+            .get_mut(&agent.node_name)
+            .unwrap()
+            .addresses = vec![ServiceNodeAddress {
+            address: "192.0.2.10".parse().unwrap(),
+            kind: NodeAddressKind::Internal,
+        }];
+        write_lock(&state.node_blocks).insert(
+            agent.node_name.clone(),
+            AssignedNodeBlock {
+                node_uid: "worker-a-uid".to_owned(),
+                provider: NodeBlockProvider::new(
+                    Ipv4NodeBlock::new("10.42.0.0".parse().unwrap(), 24).unwrap(),
+                    Ipv6NodeBlock::new("fd42::".parse().unwrap(), 64).unwrap(),
+                ),
+                revision: Revision::new(4),
+                transport: Ok(NodeTransport {
+                    ipv4: "10.42.0.1".parse().unwrap(),
+                    ipv6: "fd42::1".parse().unwrap(),
+                }),
+            },
+        );
+        *mutex_lock(&state.revisions) = RevisionSet {
+            identity: Revision::new(2),
+            policy: Revision::new(3),
+            service: Revision::new(5),
+            routing: Revision::new(4),
+            topology: Revision::new(7),
+            telemetry: Revision::INITIAL,
+        };
+        for (id, namespace, app, address) in [
+            (11, "frontend", "client", "10.42.0.11"),
+            (21, "backend", "server", "10.42.0.21"),
+        ] {
+            let mut pod = pod_record(id, namespace, app, app);
+            pod.ipv4_addresses.insert(address.parse().unwrap());
+            write_lock(&state.pods).insert(format!("{namespace}/{app}"), pod);
+        }
+        (state, agent)
+    }
+
+    #[test]
+    fn native_plan_publication_does_not_wait_for_key_readiness() {
+        let (state, agent) = native_plan_test_state();
+        let request = NodeLocalPlanRequest::issue(agent.node_name.clone(), None, [41; 32]).unwrap();
+        let first = encryption_plan_for(&state, &agent, &request)
+            .unwrap()
+            .expect("fully Native transport must publish without a ready key cut");
+        first.verify().unwrap();
+        assert_eq!(
+            first.snapshot.mode,
+            unf_encryption::NodeLocalPlanMode::Active
+        );
+        assert_eq!(first.snapshot.decisions.len(), 4);
+        assert!(first.snapshot.epochs.is_empty());
+        assert!(
+            first
+                .snapshot
+                .decisions
+                .iter()
+                .all(|decision| decision.disposition
+                    == unf_encryption::EncryptionDisposition::Native
+                    && decision.contract_epoch.is_none()
+                    && decision.plan_index.is_none())
+        );
+        let retry = encryption_plan_for(&state, &agent, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.snapshot, first.snapshot);
+        mutex_lock(&state.revisions).service = Revision::new(6);
+        let held = encryption_plan_for(&state, &agent, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            held.snapshot, first.snapshot,
+            "an unactivated Native cut must not be skipped"
+        );
+        mutex_lock(&state.encryption_activation_cursors).insert(
+            "worker-a-uid".to_owned(),
+            EncryptionActivationCursor {
+                generation: first.snapshot.generation,
+                state_digest: unf_encryption::EncryptionFastPathDigest([42; 32]),
+                report_digest: EncryptionActivationReportDigest([43; 32]),
+            },
+        );
+        let next = encryption_plan_for(&state, &agent, &request)
+            .unwrap()
+            .unwrap();
+        assert!(next.snapshot.generation > first.snapshot.generation);
+        assert_eq!(next.snapshot.service_revision, Revision::new(6));
+        assert_eq!(next.snapshot.policy_revision, Revision::new(3));
+    }
+
+    #[test]
+    fn native_plan_ignores_key_only_churn_but_fences_required_transition() {
+        let (state, agent) = native_plan_test_state();
+        let now = unix_time_millis().max(1);
+        let request = NodeLocalPlanRequest::issue(agent.node_name.clone(), None, [45; 32]).unwrap();
+        let first = encryption_plan_for(&state, &agent, &request)
+            .unwrap()
+            .unwrap();
+        mutex_lock(&state.encryption_activation_cursors).insert(
+            "worker-a-uid".to_owned(),
+            EncryptionActivationCursor {
+                generation: first.snapshot.generation,
+                state_digest: unf_encryption::EncryptionFastPathDigest([46; 32]),
+                report_digest: EncryptionActivationReportDigest([47; 32]),
+            },
+        );
+        let bootstrap = encryption_key_bootstrap_for(&state, &agent).unwrap();
+        let mut authority = unf_encryption::NodeKeyAuthority::new(
+            bootstrap.cluster_id,
+            bootstrap.recipient.node_name,
+            bootstrap.recipient.node_uid,
+        )
+        .unwrap();
+        authority
+            .prepare_epoch(
+                bootstrap.membership_revision,
+                BTreeSet::new(),
+                now,
+                now + 10_000,
+                &mut unf_encryption::OsWireGuardKeyGenerator,
+            )
+            .unwrap();
+        ingest_encryption_keys_for_at(&state, &agent, authority.publication().unwrap(), now + 1)
+            .unwrap();
+        state
+            .encryption_generations_dirty
+            .store(false, Ordering::Release);
+        let unchanged = encryption_plan_for(&state, &agent, &request)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.snapshot, first.snapshot,
+            "key readiness must not churn an activated Native plan"
+        );
+        assert!(
+            reconcile_encryption_plan_catalog_at(&state, now + 10_001, Revision::INITIAL).unwrap()
+        );
+        assert!(
+            !state.encryption_generations_dirty.load(Ordering::Acquire),
+            "key expiry must not invalidate Native transport"
+        );
+        write_lock(&state.encryption_policies).insert(
+            "backend/require".to_owned(),
+            encryption_policy("require", "require-uid"),
+        );
+        assert!(
+            !reconcile_encryption_plan_catalog_at(&state, now + 10_001, Revision::INITIAL).unwrap(),
+            "Required transition must wait for valid keys, never produce a Native fallback"
+        );
+        assert_eq!(
+            mutex_lock(&state.encryption_local_plans)
+                .active()
+                .unwrap()
+                .generation,
+            first.snapshot.generation
+        );
+        assert!(!state.encryption_generations_dirty.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn native_key_independence_never_downgrades_required_demand() {
+        let (mut state, agent) = native_plan_test_state();
+        let request = NodeLocalPlanRequest::issue(agent.node_name.clone(), None, [44; 32]).unwrap();
+        state.encryption_baseline = EncryptionBaseline::Required;
+        assert!(
+            encryption_plan_for(&state, &agent, &request)
+                .unwrap()
+                .is_none()
+        );
+        assert!(mutex_lock(&state.encryption_local_plans).active().is_none());
+        state.encryption_baseline = EncryptionBaseline::Native;
+        write_lock(&state.encryption_policies).insert(
+            "backend/require".to_owned(),
+            encryption_policy("require", "require-uid"),
+        );
+        assert!(!current_encryption_model(&state).unwrap().intents.is_empty());
+        assert!(
+            encryption_plan_for(&state, &agent, &request)
+                .unwrap()
+                .is_none()
+        );
+        assert!(mutex_lock(&state.encryption_local_plans).active().is_none());
     }
 
     #[tokio::test]
