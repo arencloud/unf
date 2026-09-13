@@ -90,6 +90,10 @@ gate on cl02 before Kind. It is not a live plaintext exception.
 ADR 0344 preserves the first cl02 pilot's EEXIST failure and removes ambiguous
 filter handles and non-probe counter noise. The exact eight-snapshot statistics
 gate passes 96 negative mutations locally; corrected cl02 execution is next.
+ADR 0345 verifies the complete corrected cl02 target-device reference gate:
+eight positive payloads, four exact denied attempts, rename/down/recovery and
+no implicit rebinding on ifindex reuse. Matching Kind remains pending. This
+primitive does not establish source/peer lifetime or live locality permission.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

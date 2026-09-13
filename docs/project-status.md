@@ -616,6 +616,9 @@ cl02 run is required and the setup failure remains recorded in ADR 0344.
 The next run completes traffic but fails the observer's obsolete offload-field
 expectation. The gate now requires explicit `skip_hw`, rejects contradictory
 flags and passes 112 local mutations; full cl02 rerun remains pending.
+ADR 0345 verifies that complete cl02 rerun with exact eight-payload/four-denial
+statistics, target invalidation and explicit recovery. Matching Kind is next;
+source/peer lifetime and the authenticated locality consumer remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
