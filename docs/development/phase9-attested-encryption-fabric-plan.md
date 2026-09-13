@@ -21,8 +21,8 @@ separately revisioned. The authoritative state remains in
 | 9.5 | Intent-Coalesced Cryptographic Fast Path | **Verified** | Phase 9.5a adds the canonical compiler and Causal Epoch Lease; Phase 9.5b adds the Causal Commit Vector. Later slices connect proof-carrying maps/routes, authenticated complete-cut distribution, local Linux/key proof, quiescent generations, the policy-first dual-stack TC consumer, and Flow-Adaptive Secure DSR. Phase 9.5af closes the chain with independently captured real-kernel IPv4/IPv6 WireGuard ciphertext, positive transfer counters, peer-removal denial, exact recovery, and scoped cleanup under `make encryption-ciphertext-live-test`; ADRs 0162–0193 |
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
-| 9.8 | Kube-proxy-free Kind qualification | **Verified** | Runtime `cb59e90`, qualifier `8fa15a1`, passed the complete fresh three-Node dual-stack Kubernetes 1.35.0 gate after cl02: strict denial, ciphertext, rotation/replacements, bounded history, egress coexistence, positive cleanup and no-CNI rollback. JSON `04e9d300…839f`; capture `c3428057…3d11`. ADR 0292; historical ADR 0267 retained |
-| 9.9 | OpenShift qualification | **Verified** | Runtime `cb59e90`, qualifier `dbefd3e`, passed the stricter full cl02 gate in 1,420 seconds before matching-image Kind. ADRs 0290–0292 record exact hashes, persistence/history, positive cleanup and scope. Six unhealthy operators and internal reachability issues remain S1 stabilization work |
+| 9.8 | Kube-proxy-free Kind qualification | **Reopened — coverage repair** | Historical runtime `cb59e90`, qualifier `8fa15a1`, passed the complete fresh three-Node dual-stack gate after cl02. JSON `04e9d300…839f`; capture `c3428057…3d11`. ADR 0292 retains that scope. ADRs 0293–0294 require expanded locality/isolated-return coverage and requalification after cl02 |
+| 9.9 | OpenShift qualification | **Reopened — coverage repair** | Historical runtime `cb59e90`, qualifier `dbefd3e`, passed the strict cl02 gate in 1,420 seconds. ADRs 0290–0292 retain those real results. S1 then identified uncovered Native locality/isolated-return failures. ADR 0294 implements the Native repair; expanded live tests and Required coverage are pending |
 
 ## Accepted Phase 9 gate
 
@@ -175,10 +175,12 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Phase 9 closed on runtime `cb59e90`, cl02 first (`dbefd3e`), then matching-image
-fresh Kind (`8fa15a1`). ADR 0292 records exact hashes and bounded claims. Earlier
-failed attempts, intermittent migration timeout and startup exits remain in the
-record; they are not erased by a passing gate.
+Phase 9's historical closure on `cb59e90` (ADR 0292) was reopened by S1's
+locality/isolated-return findings (ADR 0293). ADR 0294 implements explicit Native
+coverage; qualify it on cl02 first, then matching-image fresh Kind. Required
+locality/replica and return-path coverage still need separate work. Earlier
+passing runs, failed attempts, intermittent migration timeout and startup exits
+remain in the record.
 
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate

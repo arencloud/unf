@@ -296,7 +296,12 @@ fn produce_node_plan(
             plan_index: Some(plan_index),
         })
         .collect::<Vec<_>>();
-    decisions.extend(native_decisions(input, facts, &node));
+    decisions.extend(native_decisions(
+        input,
+        facts,
+        &node,
+        crate::MAX_FAST_PATH_DECISIONS.saturating_sub(decisions.len()),
+    )?);
     let mode = if decisions.is_empty() {
         NodeLocalPlanMode::Dormant
     } else {
@@ -359,31 +364,62 @@ fn native_decisions(
     input: &FleetPlanProductionInput,
     facts: &EncryptionContractFacts,
     node: &crate::EncryptionNode,
-) -> Vec<NodeLocalDecisionPlan> {
-    let allowed = facts
-        .policies
-        .iter()
-        .filter(|policy| policy.allowed)
-        .map(|policy| (policy.source, policy.destination))
-        .collect::<BTreeSet<_>>();
-    facts
+    available: usize,
+) -> Result<Vec<NodeLocalDecisionPlan>, FleetPlanProductionError> {
+    // Required is monotonic: no identity pair can resolve to Native under a
+    // Required baseline. Avoid any local-pair enumeration in that case.
+    if input.model.baseline == crate::EncryptionBaseline::Required {
+        return Ok(Vec::new());
+    }
+    let known = facts
         .endpoints
         .iter()
-        .flat_map(|source| {
-            facts
-                .endpoints
-                .iter()
-                .filter(|destination| destination.node.uid != source.node.uid)
-                .filter_map(|destination| {
-                    let pair = (source.identity, destination.identity);
-                    ((source.node.uid == node.uid || destination.node.uid == node.uid)
-                        && allowed.contains(&pair)
-                        && input.model.requirement(pair.0, pair.1).disposition
-                            == crate::EncryptionDisposition::Native)
-                        .then_some(pair)
-                })
-        })
-        .collect::<BTreeSet<_>>()
+        .map(|endpoint| endpoint.identity)
+        .collect::<BTreeSet<_>>();
+    let local = facts
+        .endpoints
+        .iter()
+        .filter(|endpoint| endpoint.node.uid == node.uid)
+        .map(|endpoint| endpoint.identity)
+        .collect::<BTreeSet<_>>();
+    let mut pairs = BTreeSet::new();
+    let mut admit = |source, destination| -> Result<(), FleetPlanProductionError> {
+        let pair = (source, destination);
+        if pairs.contains(&pair)
+            || input.model.requirement(source, destination).disposition
+                != crate::EncryptionDisposition::Native
+        {
+            return Ok(());
+        }
+        if pairs.len() >= available {
+            return Err(FleetPlanProductionError::NativeDecisionCapacity { available });
+        }
+        pairs.insert(pair);
+        Ok(())
+    };
+    // A Native record selects transport, never policy permission. Local paths
+    // have no underlay policy fact, but still need explicit transport coverage
+    // after the ordinary packet-policy checks. Deduplicate replicas first.
+    for source in &local {
+        for destination in &local {
+            admit(*source, *destination)?;
+        }
+    }
+    // Stateful policy may admit the response to an allowed request even when
+    // an independently initiated flow in that direction is denied. Cover both
+    // Native transport directions without changing either policy fact. A
+    // Required opposite direction is deliberately NOT downgraded to Native.
+    for policy in facts.policies.iter().filter(|policy| policy.allowed) {
+        if !known.contains(&policy.source)
+            || !known.contains(&policy.destination)
+            || (!local.contains(&policy.source) && !local.contains(&policy.destination))
+        {
+            continue;
+        }
+        admit(policy.source, policy.destination)?;
+        admit(policy.destination, policy.source)?;
+    }
+    Ok(pairs
         .into_iter()
         .map(
             |(source_identity, destination_identity)| NodeLocalDecisionPlan {
@@ -394,11 +430,13 @@ fn native_decisions(
                 plan_index: None,
             },
         )
-        .collect()
+        .collect())
 }
 
 #[derive(Debug, Error)]
 pub enum FleetPlanProductionError {
+    #[error("Native transport coverage exceeds the remaining {available} bounded decision slots")]
+    NativeDecisionCapacity { available: usize },
     #[error("invalid public key transparency cut: {0}")]
     InvalidKeyCut(crate::NodeKeyTransparencyError),
     #[error("fleet plan membership or causal revisions are incomplete")]
@@ -801,7 +839,13 @@ mod tests {
             .unwrap();
         assert_eq!(source.epochs.len(), 1);
         assert_eq!(
-            source.decisions[0].disposition,
+            source
+                .decisions
+                .iter()
+                .find(|decision| decision.source_identity == IdentityId::new(11)
+                    && decision.destination_identity == IdentityId::new(21))
+                .unwrap()
+                .disposition,
             crate::EncryptionDisposition::Required
         );
 
@@ -812,7 +856,7 @@ mod tests {
             .unwrap();
         assert_eq!(reverse.mode, NodeLocalPlanMode::Active);
         assert!(reverse.epochs.is_empty());
-        assert_eq!(reverse.decisions.len(), 1);
+        assert_eq!(reverse.decisions.len(), 2);
         assert_eq!(
             reverse.decisions[0].disposition,
             crate::EncryptionDisposition::Native
@@ -823,11 +867,173 @@ mod tests {
             .unwrap();
         let desired = prepared.fact().checkpoint.desired_state().unwrap();
         assert_eq!(desired.config.epoch_count, 0);
-        assert_eq!(desired.config.decision_count, 1);
+        assert_eq!(desired.config.decision_count, 2);
         assert_eq!(desired.config.transport_count, 0);
         assert!(unf_ebpf_common::encryption_config_is_active(
             &desired.config
         ));
+    }
+
+    #[test]
+    fn native_transport_covers_same_node_pairs_without_an_underlay_policy_fact() {
+        let mut input = input(true);
+        input.model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+            Vec::new(),
+        )
+        .unwrap();
+        input.endpoints.push(EncryptionEndpointFact {
+            identity: IdentityId::new(31),
+            workload_uid: "local-dns".to_owned(),
+            node: input.nodes[0].clone(),
+        });
+        let cut = produce_fleet_plan_cut(input).unwrap();
+        let local = cut
+            .plans
+            .iter()
+            .find(|plan| plan.recipient.node_uid == "uid-a")
+            .unwrap();
+        for (source, destination) in [(11, 31), (31, 11), (31, 31)] {
+            assert!(
+                local
+                    .decisions
+                    .iter()
+                    .any(
+                        |decision| decision.source_identity == IdentityId::new(source)
+                            && decision.destination_identity == IdentityId::new(destination)
+                            && decision.disposition == crate::EncryptionDisposition::Native
+                    )
+            );
+        }
+        assert!(local.epochs.is_empty());
+        local.verify().unwrap();
+    }
+
+    #[test]
+    fn native_transport_covers_policy_tracked_return_without_new_reverse_permission() {
+        let mut input = input(true);
+        input.model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+            Vec::new(),
+        )
+        .unwrap();
+        let reverse = input
+            .policies
+            .iter_mut()
+            .find(|policy| {
+                policy.source == IdentityId::new(21) && policy.destination == IdentityId::new(11)
+            })
+            .unwrap();
+        reverse.allowed = false;
+        let cut = produce_fleet_plan_cut(input).unwrap();
+        for plan in cut
+            .plans
+            .iter()
+            .filter(|plan| matches!(plan.recipient.node_uid.as_str(), "uid-a" | "uid-b"))
+        {
+            assert!(
+                plan.decisions
+                    .iter()
+                    .any(|decision| decision.source_identity == IdentityId::new(21)
+                        && decision.destination_identity == IdentityId::new(11)
+                        && decision.disposition == crate::EncryptionDisposition::Native)
+            );
+            assert!(plan.epochs.is_empty());
+            plan.verify().unwrap();
+            let prepared = plan.prepare_exact_readback(None, NOW + 3, 1, &[]).unwrap();
+            let desired = prepared.fact().checkpoint.desired_state().unwrap();
+            let mut packet = crate::FastPathPacketContext {
+                source_identity: IdentityId::new(21),
+                destination_identity: IdentityId::new(11),
+                destination_address: "10.42.0.2".parse().unwrap(),
+                policy_authorized: false,
+                policy_revision: Revision::new(3),
+                service_revision: Revision::new(5),
+                egress_revision: Revision::new(6),
+                now_monotonic_ns: 2,
+            };
+            assert_eq!(
+                crate::select_encryption_transport(&desired, packet, None),
+                crate::FastPathPacketDecision::Drop(crate::FastPathDropReason::PolicyDenied)
+            );
+            packet.policy_authorized = true;
+            assert_eq!(
+                crate::select_encryption_transport(&desired, packet, None),
+                crate::FastPathPacketDecision::Native
+            );
+            packet.destination_identity = IdentityId::new(99);
+            assert_eq!(
+                crate::select_encryption_transport(&desired, packet, None),
+                crate::FastPathPacketDecision::Drop(crate::FastPathDropReason::AuthorityMissing)
+            );
+        }
+    }
+
+    #[test]
+    fn native_transport_deduplicates_replica_identity_coverage() {
+        let mut input = input(true);
+        input.model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+            Vec::new(),
+        )
+        .unwrap();
+        let expected = produce_fleet_plan_cut(input.clone()).unwrap();
+        let original = input.endpoints[0].clone();
+        for replica in 0..256 {
+            let mut endpoint = original.clone();
+            endpoint.workload_uid = format!("same-identity-replica-{replica}");
+            input.endpoints.push(endpoint);
+        }
+        input.endpoints.reverse();
+        input.policies.reverse();
+        let actual = produce_fleet_plan_cut(input).unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn native_transport_refuses_capacity_before_publishing_partial_coverage() {
+        let mut input = input(true);
+        input.model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+            Vec::new(),
+        )
+        .unwrap();
+        for identity in 1_000..1_256 {
+            input.endpoints.push(EncryptionEndpointFact {
+                identity: IdentityId::new(identity),
+                workload_uid: format!("distinct-local-identity-{identity}"),
+                node: input.nodes[0].clone(),
+            });
+        }
+        assert!(matches!(produce_fleet_plan_cut(input),
+            Err(FleetPlanProductionError::NativeDecisionCapacity { available })
+                if available == crate::MAX_FAST_PATH_DECISIONS));
+    }
+
+    #[test]
+    fn native_transport_does_not_add_denied_unrelated_remote_pairs() {
+        let mut input = input(true);
+        input.model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Native,
+            Vec::new(),
+        )
+        .unwrap();
+        for policy in &mut input.policies {
+            policy.allowed = false;
+        }
+        let cut = produce_fleet_plan_cut(input).unwrap();
+        assert!(
+            cut.plans
+                .iter()
+                .flat_map(|plan| &plan.decisions)
+                .all(|decision| decision.source_identity == decision.destination_identity)
+        );
+        assert_eq!(cut.plans[2].mode, NodeLocalPlanMode::Dormant);
     }
 
     #[test]
@@ -847,7 +1053,7 @@ mod tests {
         {
             assert_eq!(plan.mode, NodeLocalPlanMode::Active);
             assert!(plan.epochs.is_empty());
-            assert_eq!(plan.decisions.len(), 2);
+            assert_eq!(plan.decisions.len(), 3);
             assert!(plan.decisions.iter().all(|decision| {
                 decision.disposition == crate::EncryptionDisposition::Native
                     && decision.contract_epoch.is_none()

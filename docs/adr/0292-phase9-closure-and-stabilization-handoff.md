@@ -2,7 +2,12 @@
 
 Date: 2026-09-13
 
-Status: Phase 9 lab qualification verified; S1–S5 stabilization remains open
+Status: historical lab passes retained; closure reopened by ADR 0293
+
+The milestone states below describe the closure at the time of these runs.
+Subsequent S1 diagnosis found uncovered Native locality and reply failures;
+ADR 0294 starts their repair. These passes do not qualify that repair or the
+remaining Required locality/return contract work.
 
 ## Verified tuple and order
 

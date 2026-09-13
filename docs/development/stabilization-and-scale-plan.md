@@ -1,7 +1,9 @@
 # Stabilization and scale qualification
 
-Requested 2026-09-12. Phase 9 closed 2026-09-13 (ADR 0292); stabilization starts
-with S1. S1–S5 are not yet verified.
+Requested 2026-09-12. Phase 9's 2026-09-13 closure (ADR 0292) was reopened by
+S1's missing transport coverage findings (ADR 0293). ADR 0294 implements the
+Native repair; live requalification and Required coverage remain pending.
+S1–S5 are not yet verified.
 
 Commit and push each completed step before the next. Platform feature tests run
 on OpenShift cl02 first, then isolated Kind; local checks precede deployment.
