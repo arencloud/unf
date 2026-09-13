@@ -580,6 +580,9 @@ matching Kind is pending. Both live runtime fleets remain `67c2772`.
 ADR 0335 verifies the identical isolated packaging image on retained Kind,
 including full rotated-log review. Live rollout/runtime UID capture and the
 locality consumer remain next; neither full platform row is closed.
+ADR 0336 adds locally checked live CNI-incarnation and retirement assertions to
+the Required reply qualifier. Candidate `450de80` images are built and version
+checked with unchanged eBPF; live rollout and this expanded gate remain pending.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 

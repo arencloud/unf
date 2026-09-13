@@ -60,6 +60,9 @@ the Kind live upgrade ordering remain open; no live installation has changed.
 ADR 0334 verifies the isolated packaging slice on cl02; matching Kind is next.
 ADR 0335 completes that identical-image Kind packaging gate. Live rollout,
 runtime UID capture and consuming locality integration remain open.
+ADR 0336 adds opt-in live runtime UID/nonce/lease and normal-retirement evidence
+to the complete selective Required reply gate. Local positive/19-negative
+validation passes; real cl02 rollout and matching Kind are pending.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

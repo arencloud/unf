@@ -12,6 +12,8 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $UNF_REQUIRED_REPLY_CAPTURE_INTERFACE =~ ^[a-zA-Z0-9_.-]{1,15}$ ]]
 diagnostic_hold=${UNF_REQUIRED_REPLY_DIAGNOSTIC_HOLD_SECONDS:-0}
 [[ $diagnostic_hold =~ ^(0|[1-9]|[1-5][0-9]|60)$ ]]
+require_cni_ownership=${UNF_REQUIRED_REPLY_REQUIRE_CNI_OWNERSHIP:-false}
+[[ $require_cni_ownership == true || $require_cni_ownership == false ]]
 [[ -z $(git -C "$project_root" status --porcelain) ]]
 git -C "$project_root" merge-base --is-ancestor "$UNF_REQUIRED_REPLY_RUNTIME_REVISION" HEAD
 context=${KUBE_CONTEXT:-$(kubectl --kubeconfig "$KUBECONFIG" config current-context)}
@@ -29,6 +31,7 @@ stage=preflight
 source "$project_root/hack/phase9-http-probe.sh"
 source "$project_root/hack/phase9-capture.sh"
 source "$project_root/hack/required-reply-diagnostics.sh"
+source "$project_root/hack/required-reply-cni-ownership.sh"
 cleanup() {
     local status=$?
     trap - EXIT ERR
@@ -166,6 +169,10 @@ spec:
       ports: [{protocol: TCP, port: 8080}, {protocol: UDP, port: 5353}]
 EOF
 "${kc[@]}" -n "$namespace" wait --for=condition=Ready pods --all --timeout=180s >/dev/null
+if [[ $require_cni_ownership == true ]]; then
+    stage=runtime-cni-ownership
+    required_reply_cni_capture
+fi
 udp_probe() {
     local result
     result=$(timeout 10 "${kc[@]}" -n "$namespace" exec "$1" -- sh -ec '
@@ -261,10 +268,18 @@ stage=cleanup
 owned=false
 "${read_api[@]}" get namespaces -o json | jq -e --arg ns "$namespace" 'all(.items[];.metadata.name!=$ns)' >/dev/null
 required_reply_wait_generation native
+if [[ $require_cni_ownership == true ]]; then
+    stage=runtime-cni-retirement
+    required_reply_cni_retirement
+else
+    printf 'null\n' > "$directory/cni-ownership.json"
+fi
 jq -n --arg runtime "$UNF_REQUIRED_REPLY_RUNTIME_REVISION" --arg qualifier "$(git -C "$project_root" rev-parse HEAD)" \
     --arg context "$context" --argjson allowed "$allowed" --argjson denied "$denied" --slurpfile capture "$directory/capture-summary.json" \
+    --slurpfile cni "$directory/cni-ownership.json" \
     '{schemaVersion:1,result:"passed",runtimeRevision:$runtime,qualificationRevision:$qualifier,context:$context,
       requiredRequests:12,nativeControls:12,allowedRequests:$allowed,unsolicitedDenials:$denied,
       families:["IPv4","IPv6"],protocols:["TCP","UDP"],paths:["cross-node PodIP","Service","translated Service port"],
-      capture:$capture[0],replyContractSchema:2,cleanup:"namespace absent; fleet Native and converged"}' > "$directory/evidence.json"
+      capture:$capture[0],replyContractSchema:2,cleanup:"namespace absent; fleet Native and converged"}
+      + (if $cni[0] == null then {} else {cniOwnership:$cni[0]} end)' > "$directory/evidence.json"
 echo "Required reply qualification passed: $directory/evidence.json"
