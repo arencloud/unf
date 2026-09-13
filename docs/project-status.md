@@ -669,6 +669,9 @@ ADR 0355 adds opaque held-namespace veth observations with strict snapshot
 rechecks and sticky retirement on failure/cancellation (807 passing workspace
 tests, 26 ignored). The isolated cl02/Kind fixture is pending. This preserves
 namespace identity for a later consumer, not continuous packet-time authority.
+ADR 0356 verifies all thirteen isolated held-namespace observation checks on
+cl02, including exact drift rejection and sticky retirement after restoration.
+Live runtime remains unchanged; matching retained Kind is next.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
