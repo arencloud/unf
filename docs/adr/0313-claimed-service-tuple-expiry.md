@@ -2,7 +2,7 @@
 
 Date: 2026-09-13
 
-Status: implementation and local kernel regressions pass; cl02-first qualification pending
+Status: local kernel regressions pass; cl02 rejects verifier complexity (ADR 0314)
 
 ## Decision
 

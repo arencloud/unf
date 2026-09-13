@@ -30,6 +30,11 @@ and workspace checks. Publish its newly built BPF object with exact runtime
 provenance, then qualify cl02/logs/continuity before updating Kind. LRU capacity
 eviction and active tuple collisions remain explicit load-envelope boundaries.
 
+ADR 0314 rejects candidate `5505d00` on cl02's RHCOS verifier budget despite
+local kernel passes. Rollout stopped after three replacements; previous-image
+recovery preserves state. Reduce verified instruction/state exploration and
+prove isolated cl02 loading before another rollout. Kind remains untouched.
+
 S2 profiling lead, not an attributed CPU result: `policy_snapshot` calls
 `dataplane_policy_state` for every authenticated pull; the latter clones the
 full cached tuple even on a matching revision and the endpoint returns the
