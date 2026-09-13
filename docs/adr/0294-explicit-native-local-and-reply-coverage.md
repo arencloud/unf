@@ -45,6 +45,13 @@ reverse denials. All listeners must first respond locally; cleanup requires
 positive Namespace absence and agent convergence. cl02 runs before matching-image
 fresh Kind. Neither live result is claimed in this implementation commit.
 
+The initial old-runtime live attempt stopped at observer preflight: the
+controller's loopback-bound API rejected a Pod-IP proxy request. No fixture was
+created and this is not a traffic result. The qualifier now uses one owned,
+authenticated, loopback-only port-forward for controller observations, removed
+on exit. Agent API version checks remain separate. No dataplane check falls
+back to that management tunnel.
+
 ## Open boundaries
 
 Required locality with identities replicated across local and remote Nodes,

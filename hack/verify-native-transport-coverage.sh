@@ -15,9 +15,14 @@ test_tools_image=${UNF_TEST_TOOLS_IMAGE:?immutable test-tools image required}
 directory=${UNF_NATIVE_COVERAGE_DIAGNOSTICS:-"$root/.artifacts/native-coverage-$(date +%s)"}
 install -d -m 0700 "$directory"
 owned=false
+forward_pid=
 stage=preflight
 source "$root/hack/phase9-http-probe.sh"
 cleanup() {
+    if [[ -n $forward_pid ]]; then
+        kill "$forward_pid" 2>/dev/null || true
+        wait "$forward_pid" 2>/dev/null || true
+    fi
     if [[ $owned == true ]]; then
         "${kc[@]}" delete namespace "$namespace" --wait=false >/dev/null 2>&1 || true
     fi
@@ -39,11 +44,23 @@ fi
     any(.spec.template.spec.containers[] | select(.name=="controller") | .env[];
         .name=="UNF_ENCRYPTION_BASELINE" and .value=="native")' >/dev/null
 "${kc[@]}" get encryptionpolicies.network.unf.io -A -o json | jq -e '.items|length==0' >/dev/null
+controller=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json |
+    jq -er '[.items[]|select(.metadata.deletionTimestamp==null and .status.phase=="Running")]|select(length==1)|.[0].metadata.name')
+# cl02's controller observer binds loopback. Use a single authenticated,
+# loopback-only tunnel, never treat a failed Pod-IP proxy as dataplane denial.
+"${kc[@]}" -n unf-system port-forward --address=127.0.0.1 "pod/$controller" :9962 > "$directory/controller-forward.log" 2>&1 &
+forward_pid=$!
+controller_port=
+for _ in $(seq 1 30); do
+    kill -0 "$forward_pid"
+    controller_port=$(sed -n 's/^Forwarding from 127\.0\.0\.1:\([0-9]*\) -> 9962$/\1/p' "$directory/controller-forward.log")
+    [[ -z $controller_port ]] || break
+    sleep 1
+done
+[[ $controller_port =~ ^[0-9]+$ ]]
 controller_raw() {
-    local pod
-    pod=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json |
-        jq -er '[.items[]|select(.metadata.deletionTimestamp==null and .status.phase=="Running")]|select(length==1)|.[0].metadata.name')
-    timeout 20 "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/$pod:9962/proxy$1"
+    kill -0 "$forward_pid" || return 1
+    curl --fail --silent --show-error --max-time 15 "http://127.0.0.1:$controller_port$1"
 }
 controller_raw /v1/version > "$directory/controller-version.json"
 jq -e --arg revision "$UNF_NATIVE_COVERAGE_RUNTIME_REVISION" '.build_revision==$revision' "$directory/controller-version.json" >/dev/null
