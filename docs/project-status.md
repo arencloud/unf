@@ -563,6 +563,12 @@ cleanup and three-agent convergence. ADR 0305 records the evidence hash. This
 closes the matching-runtime Native recovery slice, not full Phase 9 or scale
 qualification; controlled continuity and Required coverage are next.
 
+ADR 0306 adds an all-Pod log review (cl02 then Kind): zero restarts and no
+observed ERROR entries; cl02 has repeated retention warnings and one rejected
+key-attestation row followed by a complete public attestation cut. A bounded
+46-second resource sample leaves controller CPU (~1.27 cores) as a profiling
+target. No heavy-load, leak-free or healthy-platform claim follows.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.
