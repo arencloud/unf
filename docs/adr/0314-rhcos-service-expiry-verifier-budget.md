@@ -80,3 +80,18 @@ positively absent after cleanup.
 
 All three previous-image agents recovered Ready with zero restarts. Existing
 maps/journals remain intact; the two untouched agent Pods were not replaced.
+
+## Rebuilt immutable candidate
+
+Source `5ea1bd2b759915edae0fe674863c5b3e9ebefb24` is published to the
+development repositories. Both isolated image APIs report that exact revision;
+both packaged objects match the repaired `d8551daa…` SHA-256 above.
+
+- Controller: `2f3a4e4e9265e319d2fde9f60c971188e7120910d89d222e6332826b34397846`.
+- Agent: `ddafaa1489a8ff426f729ae744483089a1626e11d0fd59bd67d75661de9484a3`.
+
+The pre-rollout public cut has five receipts at generation `1789309599511`;
+all five public Node journals were captured without accessing private keys.
+Release pins retain OpenShift-first ordering and pending full Kind evidence.
+ADR 0315's fault guard applies to this next rollout. These publication and
+preflight facts are not a runtime traffic or Phase 9 completion claim.
