@@ -66,6 +66,9 @@ validation passes; real cl02 rollout and matching Kind are pending.
 ADR 0337 verifies live cl02 rollout and the complete expanded CNI/reply gate
 on `450de80`. Matching Kind remains pending. This closes the cl02 runtime UID
 prerequisite only; it does not admit local Required plaintext or close L3.
+ADR 0338 extends staging failure checks to Kind's init installer, including
+successful-completion semantics and seven negative mutations. Matching Kind
+runtime rollout and the live CNI/Required reply gate remain next.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

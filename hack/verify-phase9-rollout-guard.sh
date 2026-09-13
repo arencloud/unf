@@ -24,5 +24,23 @@ for mutation in \
         exit 1
     fi
 done
+init_fixture=$(jq '.items[0].status.initContainerStatuses=[{
+  name:"install-primary-cni",ready:true,restartCount:0,lastState:{},
+  state:{terminated:{exitCode:0,reason:"Completed"}}}]' <<< "$fixture")
+check <<< "$init_fixture"
+jq '.items[0].status.initContainerStatuses[0].state={running:{}}' <<< "$init_fixture" | check
+for mutation in \
+  '.items[0].status.initContainerStatuses[0].restartCount=1' \
+  '.items[0].status.initContainerStatuses[0].restartCount=null' \
+  '.items[0].status.initContainerStatuses[0].state.terminated.exitCode=1' \
+  '.items[0].status.initContainerStatuses[0].state.terminated.reason="Error"' \
+  '.items[0].status.initContainerStatuses[0].state.terminated.signal=9' \
+  '.items[0].status.initContainerStatuses[0].lastState={terminated:{exitCode:0}}' \
+  '.items[0].status.initContainerStatuses[0].state={waiting:{reason:"CrashLoopBackOff"}}'; do
+    if jq "$mutation" <<< "$init_fixture" | check 2>/dev/null; then
+        echo "Rollout guard accepted failed init container: $mutation" >&2
+        exit 1
+    fi
+done
 bash -n "$root/hack/deploy-openshift-service-fabric.sh"
-echo 'Phase 9 rollout guard rejects candidate restarts/termination without requiring pre-admission readiness'
+echo 'Phase 9 rollout guard rejects regular/init failures and restarts while permitting successful init completion'

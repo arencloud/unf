@@ -587,6 +587,8 @@ ADR 0337 verifies the guarded `450de80` live cl02 rollout, real runtime UID/nonc
 capture and retirement, 24 allowed/eight denied requests, ciphertext and exact
 fixture cleanup. All UNF containers are Ready with zero restarts. Matching Kind
 still runs `67c2772` and is next; operational log findings remain open.
+ADR 0338 closes the staging guard's init-container failure/restart gap before
+the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 
