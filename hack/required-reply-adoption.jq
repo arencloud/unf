@@ -18,3 +18,16 @@ def reply_provenance_valid($source; $destination; $source_node; $destination_nod
     and .source.node.name==$destination_node and .destination.node.name==$source_node
     and .disposition=="required"
     and .policy.replyTo=={source:$source,destination:$destination} and .policy.revision==$policy));
+
+# Read the live controller checkpoint coordinate, including its explicit
+# initial revision zero. Match current_encryption_plan_source's max(1) only
+# after validating a real observation; missing evidence is never revision one.
+def reply_egress_revision($policy):
+  select(.schema_version==1 and .mode=="explain")
+  | select([.evidence[]|select(.layer=="network_policy")]
+      | length==1 and .[0].state=="authoritative" and .[0].revision==$policy)
+  | [.evidence[]|select(.layer=="intent")]
+  | select(length==1) | .[0].revision
+  | select(type=="number")
+  | select(.>=0 and .<=9007199254740991 and floor==.)
+  | if .==0 then 1 else . end;

@@ -30,6 +30,21 @@ jq -L "$root/hack" -ne '
     (good|.snapshot.epochs[0].contract.plans[0].disposition="native")]|length==8 and all(.[];valid|not))
 ' >/dev/null
 bash "$root/hack/verify-phase9-capture.sh"
+jq -L "$root/hack" -ne '
+  include "required-reply-adoption";
+  def good: {schema_version:1,mode:"explain",evidence:[
+    {layer:"network_policy",state:"authoritative",revision:3},
+    {layer:"intent",state:"unavailable",revision:0}]};
+  def revision: reply_egress_revision(3);
+  (good|revision)==1 and (good|.evidence[1].revision=38|revision)==38
+  and ([ (good|del(.evidence[1].revision)),(good|.evidence[1].revision=null),
+    (good|.evidence[1].revision="0"),(good|.evidence[1].revision=-1),
+    (good|.evidence[1].revision=0.5),(good|.evidence[1].revision=9007199254740992),
+    (good|.evidence+= [.evidence[1]]),(good|.evidence[0].revision=2),
+    (good|.evidence[0].state="unavailable"),(good|.schema_version=2),
+    (good|.mode="counterfactual"),(good|.evidence=[]) ]
+    | all(.[];[revision]|length==0))
+' >/dev/null
 rg -Fq 'del(.explicitStopAfterFault) + {explicitStopAfterTraffic:true}' "$root/hack/required-reply-capture.sh"
 rg -Fq 'required_reply_preserve_failure_capture >' "$root/hack/verify-required-reply-transport.sh"
 rg -Fq '"$directory/probes.jsonl"' "$root/hack/verify-required-reply-transport.sh"

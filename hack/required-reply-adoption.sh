@@ -54,6 +54,22 @@ required_reply_wait_policy() {
     return 1
 }
 
+required_reply_observe_egress_revision() {
+    local attempt_dir=$1 policy=$2 request
+    # A valid never-used egress control plane need not have a durable ConfigMap
+    # payload. Public explanation reads its live checkpoint, even after the
+    # owned fixture is gone. It sends no packet and creates no resource.
+    controller_raw /v1/topology > "$attempt_dir/egress-topology.json" || return
+    request=$(jq -ce '[.workloads[]|select(.identity_id>0 and (.ipv4_addresses|length)>0)]
+      | sort_by(.reference) | .[0] | select(.reference|type=="string")
+      | {from:.reference,destination:.ipv4_addresses[0],protocol:"tcp",port:8080}' \
+      "$attempt_dir/egress-topology.json") || return
+    curl --fail --silent --show-error --max-time 15 -H 'Content-Type: application/json' --data-binary "$request" \
+      "http://127.0.0.1:$controller_port/v1/egress/explain" > "$attempt_dir/egress-explanation.json" || return
+    jq -L "$project_root/hack" -er --argjson policy "$policy" \
+      'include "required-reply-adoption"; reply_egress_revision($policy)' "$attempt_dir/egress-explanation.json"
+}
+
 required_reply_wait_generation() {
     local mode=$1 deadline=$((SECONDS+360)) attempt=0 attempt_dir pod node valid policy service egress generation
     local -a records
@@ -65,7 +81,9 @@ required_reply_wait_generation() {
           and all(.nodes[];.fresh and .converged and .report.ready and .report.bpf_loaded)' "$attempt_dir/agents.json" >/dev/null; then sleep 2; continue; fi
         policy=$(jq -er '[.nodes[].report.applied_policy_revision]|unique|select(length==1)|.[0]' "$attempt_dir/agents.json")
         service=$(jq -er '[.nodes[].report.applied_service_revision]|unique|select(length==1)|.[0]' "$attempt_dir/agents.json")
-        egress=$("${read_api[@]}" -n unf-system get configmap unf-egress-control-plane -o json | jq -er '.data["state.json"]|fromjson|.desiredRevision')
+        if ! egress=$(required_reply_observe_egress_revision "$attempt_dir" "$policy" 2> "$attempt_dir/egress-observer.log"); then
+            sleep 2; continue
+        fi
         # Public recovery plans only; gzip avoids requiring jq in the agent.
         records=()
         while IFS=$'\t' read -r pod node; do
