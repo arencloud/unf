@@ -546,7 +546,8 @@ ADR 0322 verifies the corrected scoped cl02 gate: 12 Required requests,
 12 Native controls, eight reverse denials, zero Required plaintext and exact
 cleanup. Retained Kind's first attempt stops before traffic because its unused
 egress ConfigMap has no payload. ADR 0323 replaces that persistence assumption
-with a strict live-controller revision read; cl02-first rerun is next.
+with a strict live-controller revision read; the complete cl02 rerun passes
+with egress revision 38. Retained Kind's initial-revision case is next.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 

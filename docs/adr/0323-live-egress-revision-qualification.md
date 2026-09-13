@@ -2,7 +2,7 @@
 
 Date: 2026-09-13
 
-Status: local observer regressions pass; cl02-first rerun required
+Status: local observer regressions and corrected cl02 gate pass; Kind next
 
 After ADR 0322's cl02 pass, retained Kind receives the identical `67c2772`
 controller/agent digests through a guarded serial rollout. Node UIDs remain
@@ -37,3 +37,21 @@ The failed Kind attempt remains in ignored
 `.artifacts/p9-required-reply-67c2772-kind/`; it is not a denied/allowed packet
 result. Repeat the corrected observer on cl02 first, then retained Kind.
 Required locality/replicas, full lifecycle qualification and S1–S5 remain open.
+
+## cl02 verification
+
+Qualifier `9547c8b` repeats the complete gate on unchanged runtime `67c2772`.
+The API independently observes egress revision 38 and the matching policy cut.
+All 12 Required requests, 12 Native controls and eight unsolicited reverse
+denials pass. The cleanly stopped `br-ex` capture has 176 WireGuard frames,
+zero Required plaintext, 72 Native control frames and zero kernel loss. The
+owned Namespace is absent and every agent returns to a converged Native cut.
+No packet is retried and no runtime image/configuration is changed.
+
+Evidence SHA-256:
+`7ab39e4d4c262e0578c0c050de81a57288caa9cbe52e78046538c100afa8f401`.
+Capture SHA-256:
+`7fa8f2e2c325cd4a96426cb75efdaa46d1dc98a0774c1bc2e6c989a6365a5014`.
+Ignored evidence: `.artifacts/p9-required-reply-67c2772-cl02-live-egress/`.
+This passes the nonzero-revision platform case first; retained Kind's explicit
+initial-revision case is next.
