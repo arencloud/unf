@@ -30,7 +30,7 @@ response=$'udp-ok\nnetwork-denied'; check 2
 response=network-denied; transport_status=124; check 2
 response=udp-ok; transport_status=1; check 2
 for invariant in 'policyTypes: \[Ingress, Egress\]' 'same-node' 'cross-node' \
-    'allowed == 16 && \$denied == 8' 'status == 1' 'UNF_NATIVE_COVERAGE_RUNTIME_REVISION' \
+    'allowed == 24 && \$denied == 8' 'port:53,targetPort:5353' 'port:18080,targetPort:8080' 'status == 1' 'UNF_NATIVE_COVERAGE_RUNTIME_REVISION' \
     'UNF_NATIVE_COVERAGE_INFRASTRUCTURE' 'all_converged==true' 'project_root=\$root'; do
     rg -q "$invariant" "$gate"
 done

@@ -103,7 +103,8 @@ for pod in client local-server remote-server; do
     if [[ $role == server ]]; then
         jq -cn --arg namespace "$namespace" --arg pod "$pod" '
           {apiVersion:"v1",kind:"Service",metadata:{name:$pod,namespace:$namespace},spec:{ipFamilyPolicy:"RequireDualStack",
-           selector:{app:$pod},ports:[{name:"tcp",port:8080,targetPort:8080,protocol:"TCP"},{name:"udp",port:5353,targetPort:5353,protocol:"UDP"}]}}' |
+           selector:{app:$pod},ports:[{name:"tcp",port:8080,targetPort:8080,protocol:"TCP"},{name:"udp",port:5353,targetPort:5353,protocol:"UDP"},
+             {name:"tcp-remap",port:18080,targetPort:8080,protocol:"TCP"},{name:"udp-remap",port:53,targetPort:5353,protocol:"UDP"}]}}' |
           "${fixture_apply[@]}" >/dev/null
     fi
 done
@@ -135,22 +136,22 @@ spec:
       ports: [{protocol: TCP, port: 8080}, {protocol: UDP, port: 5353}]
 EOF
 udp_probe() {
-    local pod=$1 address=$2 result
+    local pod=$1 address=$2 port=${3:-5353} result
     result=$(timeout 10 "${kc[@]}" -n "$namespace" exec "$pod" -- sh -ec '
-      case "$1" in *:*) target="UDP6-DATAGRAM:[$1]:5353";; *) target="UDP4-DATAGRAM:$1:5353";; esac
+      case "$1" in *:*) target="UDP6-DATAGRAM:[$1]:$2";; *) target="UDP4-DATAGRAM:$1:$2";; esac
       result=$(printf native-coverage | socat -T 2 - "$target") || { printf probe-error; exit 0; }
       case "$result" in native-coverage) printf udp-ok;; "") printf network-denied;; *) printf probe-error;; esac
-    ' native-coverage "$address") || return 2
+    ' native-coverage "$address" "$port") || return 2
     case "$result" in udp-ok) return 0;; network-denied) return 1;; *) return 2;; esac
 }
 probe() {
-    case $1 in tcp) phase9_http_probe_once "$2" "$3" 8080;; udp) udp_probe "$2" "$3";; *) return 2;; esac
+    case $1 in tcp) phase9_http_probe_once "$2" "$3" "${4:-8080}";; udp) udp_probe "$2" "$3" "${4:-5353}";; *) return 2;; esac
 }
 wait_probe() {
-    local protocol=$1 pod=$2 address=$3
-    printf 'Checking allowed %s from %s to %s\n' "$protocol" "$pod" "$address"
+    local protocol=$1 pod=$2 address=$3 port=${4:-}
+    printf 'Checking allowed %s from %s to %s port %s\n' "$protocol" "$pod" "$address" "${port:-default}"
     for _ in $(seq 1 30); do
-        if probe "$protocol" "$pod" "$address"; then return 0; fi
+        if probe "$protocol" "$pod" "$address" "$port"; then return 0; fi
         sleep 1
     done
     return 1
@@ -175,6 +176,12 @@ for server in local-server remote-server; do
             for protocol in tcp udp; do
                 wait_probe "$protocol" client "$address"
                 allowed=$((allowed+1))
+                if [[ $kind == service ]]; then
+                    port=18080
+                    [[ $protocol != udp ]] || port=53
+                    wait_probe "$protocol" client "$address" "$port"
+                    allowed=$((allowed+1))
+                fi
             done
         done < <(jq -r '.[]' <<<"$addresses")
     done
@@ -193,7 +200,7 @@ for server in local-server remote-server; do
         done
     done < <(jq -r '.[]' <<<"$addresses")
 done
-[[ $allowed == 16 && $denied == 8 ]]
+[[ $allowed == 24 && $denied == 8 ]]
 stage=cleanup
 "${kc[@]}" delete namespace "$namespace" --wait=true --timeout=180s >/dev/null
 owned=false
@@ -213,5 +220,5 @@ jq -n --arg revision "$UNF_NATIVE_COVERAGE_RUNTIME_REVISION" --arg qualifier "$(
     --arg context "$context" --arg source "$source_node" --arg destination "$destination_node" --argjson allowed "$allowed" --argjson denied "$denied" \
     '{schemaVersion:1,result:"passed",runtimeRevision:$revision,qualificationRevision:$qualifier,context:$context,
       sourceNode:$source,destinationNode:$destination,allowedRequests:$allowed,unsolicitedDenials:$denied,
-      protocols:["TCP","UDP"],families:["IPv4","IPv6"],paths:["same-node","cross-node","PodIP","Service"],cleanup:"passed"}' > "$directory/evidence.json"
+      protocols:["TCP","UDP"],families:["IPv4","IPv6"],paths:["same-node","cross-node","PodIP","Service","translated-Service-port"],cleanup:"passed"}' > "$directory/evidence.json"
 echo "Native local/return coverage passed: $directory/evidence.json"
