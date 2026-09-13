@@ -963,6 +963,10 @@ encryption-phase9-kind-test: encryption-phase9-kind-gate-test
 encryption-phase9-openshift-gate-test:
 	hack/verify-encryption-phase9-openshift-gate.sh
 
+.PHONY: encryption-required-reply-gate-test
+encryption-required-reply-gate-test:
+	bash hack/verify-required-reply-gate.sh
+
 encryption-phase9-openshift-deploy:
 	KUBECONFIG=$(OPENSHIFT_KUBECONFIG) \
 	UNF_OPENSHIFT_SERVICE_RELEASE_RECORD=$(CURDIR)/deploy/openshift-primary-cni/encryption-phase9/release.json \

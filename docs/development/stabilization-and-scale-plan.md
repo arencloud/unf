@@ -14,7 +14,9 @@ are claimed.
 ADR 0318 adds locally verified Required policy-tracked reply contracts with
 explicit initiating-pair provenance and fail-closed schema-2 compatibility.
 The live clusters remain on the qualified Native runtime; Required reply
-traffic has not yet been qualified on either platform.
+traffic has not yet been qualified on either platform. ADR 0319 publishes
+candidate `67c2772` and a scoped cl02-first reply/ciphertext gate, with exact
+policy/generation adoption and public reply-provenance checks.
 
 Next: qualify Required replies on cl02 before Kind, finish Required locality/replica coverage and full current
 runtime lifecycle qualification, cl02 before Kind. Empty-Namespace no-op
