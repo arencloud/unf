@@ -14,6 +14,8 @@ diagnostic_hold=${UNF_REQUIRED_REPLY_DIAGNOSTIC_HOLD_SECONDS:-0}
 [[ $diagnostic_hold =~ ^(0|[1-9]|[1-5][0-9]|60)$ ]]
 require_cni_ownership=${UNF_REQUIRED_REPLY_REQUIRE_CNI_OWNERSHIP:-false}
 [[ $require_cni_ownership == true || $require_cni_ownership == false ]]
+require_locality_candidate=${UNF_REQUIRED_REPLY_REQUIRE_LOCALITY_CANDIDATE:-false}
+[[ $require_locality_candidate == true || $require_locality_candidate == false ]]
 [[ -z $(git -C "$project_root" status --porcelain) ]]
 git -C "$project_root" merge-base --is-ancestor "$UNF_REQUIRED_REPLY_RUNTIME_REVISION" HEAD
 context=${KUBE_CONTEXT:-$(kubectl --kubeconfig "$KUBECONFIG" config current-context)}
@@ -32,6 +34,7 @@ source "$project_root/hack/phase9-http-probe.sh"
 source "$project_root/hack/phase9-capture.sh"
 source "$project_root/hack/required-reply-diagnostics.sh"
 source "$project_root/hack/required-reply-cni-ownership.sh"
+source "$project_root/hack/required-reply-locality.sh"
 cleanup() {
     local status=$?
     trap - EXIT ERR
@@ -110,6 +113,12 @@ source_node=${workers[0]}
 destination_node=${workers[1]}
 source_agent=$(jq -er --arg node "$source_node" '.items[]|select(.spec.nodeName==$node and .metadata.labels["app.kubernetes.io/name"]=="unf-agent")|.metadata.name' "$directory/unf-before.json")
 reply_agent=$(jq -er --arg node "$destination_node" '.items[]|select(.spec.nodeName==$node and .metadata.labels["app.kubernetes.io/name"]=="unf-agent")|.metadata.name' "$directory/unf-before.json")
+if [[ $require_locality_candidate == true ]]; then
+    locality_cluster_uid=$("${read_api[@]}" get namespace kube-system -o jsonpath='{.metadata.uid}')
+    [[ -n $locality_cluster_uid ]]
+    stage=locality-native-baseline
+    required_reply_locality_wait native
+fi
 "${read_api[@]}" create namespace "$namespace" >/dev/null
 owned=true
 fixture_uid=65532
@@ -228,6 +237,10 @@ spec:
   destinations: {matchLabels: {app: server}}
 EOF
 required_reply_wait_generation required
+if [[ $require_locality_candidate == true ]]; then
+    stage=locality-required-candidate
+    required_reply_locality_wait required
+fi
 stage=capture-and-traffic
 required_reply_capture_start
 capture_started=true
@@ -268,6 +281,14 @@ stage=cleanup
 owned=false
 "${read_api[@]}" get namespaces -o json | jq -e --arg ns "$namespace" 'all(.items[];.metadata.name!=$ns)' >/dev/null
 required_reply_wait_generation native
+if [[ $require_locality_candidate == true ]]; then
+    stage=locality-native-retirement
+    required_reply_locality_wait native
+    jq -n --slurpfile candidate "$directory/locality-required.json" --slurpfile retired "$directory/locality-native.json" \
+      '{scope:"placement-candidate-only",replayedAgents:($candidate[0]|length),retiredAgents:($retired[0]|length),kernelAdmitted:false,observedDelivery:false}' > "$directory/locality-candidate.json"
+else
+    printf 'null\n' > "$directory/locality-candidate.json"
+fi
 if [[ $require_cni_ownership == true ]]; then
     stage=runtime-cni-retirement
     required_reply_cni_retirement
@@ -277,9 +298,11 @@ fi
 jq -n --arg runtime "$UNF_REQUIRED_REPLY_RUNTIME_REVISION" --arg qualifier "$(git -C "$project_root" rev-parse HEAD)" \
     --arg context "$context" --argjson allowed "$allowed" --argjson denied "$denied" --slurpfile capture "$directory/capture-summary.json" \
     --slurpfile cni "$directory/cni-ownership.json" \
+    --slurpfile locality "$directory/locality-candidate.json" \
     '{schemaVersion:1,result:"passed",runtimeRevision:$runtime,qualificationRevision:$qualifier,context:$context,
       requiredRequests:12,nativeControls:12,allowedRequests:$allowed,unsolicitedDenials:$denied,
       families:["IPv4","IPv6"],protocols:["TCP","UDP"],paths:["cross-node PodIP","Service","translated Service port"],
       capture:$capture[0],replyContractSchema:2,cleanup:"namespace absent; fleet Native and converged"}
-      + (if $cni[0] == null then {} else {cniOwnership:$cni[0]} end)' > "$directory/evidence.json"
+      + (if $cni[0] == null then {} else {cniOwnership:$cni[0]} end)
+      + (if $locality[0] == null then {} else {localityCandidate:$locality[0]} end)' > "$directory/evidence.json"
 echo "Required reply qualification passed: $directory/evidence.json"

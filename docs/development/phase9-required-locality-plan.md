@@ -45,6 +45,10 @@ adds the locally verified Required-only background agent fetch, bounded stream,
 single replay slot and current-cut handoff. ADR 0349 adds locally verified
 candidate-only status with explicit false kernel/delivery claims. Live
 cl02-before-Kind distribution qualification remains pending.
+ADR 0350 adds its opt-in platform gate, joining each worker observation to
+Kubernetes metadata, its public plan and fresh applied reports, with Native
+candidate retirement. Two positive and 105 negative local gate cases pass;
+the live runtime qualification remains pending.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

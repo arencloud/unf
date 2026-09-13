@@ -640,6 +640,9 @@ distribution qualification remain next; no local packet authority is enabled.
 ADR 0349 adds candidate-only agent status (804 passing tests, 26 ignored),
 distinguishing absent/fetching/replayed/failed from kernel admission and delivery.
 Both latter claims remain false; authenticated live distribution is next.
+ADR 0350 adds the cl02-before-Kind distribution qualifier with exact public-cut
+joins and Native candidate retirement; local positive/negative observer tests
+pass. Platform results and packet consumption are not yet verified.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
