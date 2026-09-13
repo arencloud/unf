@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_ipam::{DualStackLease, IpamError, IpamProvider, NodeBlockProvider, UsedAddresses};
 
-pub const CNI_TRANSACTION_SCHEMA_VERSION: u16 = 2;
+pub const CNI_TRANSACTION_SCHEMA_VERSION: u16 = 3;
+pub const LEGACY_CNI_TRANSACTION_SCHEMA_VERSION: u16 = 2;
 pub const MAX_TRANSACTION_MESSAGE_BYTES: usize = 65_536;
 pub const MAX_ATTACHMENT_LIST_RECORDS: u16 = 8;
 
-const ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 2;
+const ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 3;
+const UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 2;
 const LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 1;
 
 const MIN_DUAL_STACK_MTU: u32 = 1_280;
@@ -34,6 +36,31 @@ pub struct AttachmentSpec {
     pub key: AttachmentKey,
     pub netns: String,
     pub mtu: u32,
+    /// Runtime-supplied Pod incarnation, not independently authenticated placement.
+    /// Old attachments remain explicitly unbound; replay never upgrades them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_uid: Option<Box<str>>,
+}
+
+impl AttachmentSpec {
+    /// Compares a request without silently upgrading a legacy attachment.
+    /// A bound attachment always requires the exact UID, including on replay.
+    #[must_use]
+    pub fn accepts_replay(&self, requested: &Self) -> bool {
+        self.key == requested.key
+            && self.netns == requested.netns
+            && self.mtu == requested.mtu
+            && self
+                .workload_uid
+                .as_ref()
+                .is_none_or(|uid| requested.workload_uid.as_ref() == Some(uid))
+    }
+}
+
+/// Bounded runtime UID syntax. This validates text, not Kubernetes authenticity.
+#[must_use]
+pub fn valid_workload_uid(uid: &str) -> bool {
+    valid_identifier(uid, 128)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -409,15 +436,24 @@ impl AttachmentJournal {
         &mut self,
         request: TransactionRequest,
     ) -> Result<TransactionResponse, JournalError> {
-        if request.schema_version() != CNI_TRANSACTION_SCHEMA_VERSION {
+        let schema_version = request.schema_version();
+        if !matches!(
+            schema_version,
+            CNI_TRANSACTION_SCHEMA_VERSION | LEGACY_CNI_TRANSACTION_SCHEMA_VERSION
+        ) {
             return Err(JournalError::IncompatibleSchema {
                 actual: request.schema_version(),
                 expected: CNI_TRANSACTION_SCHEMA_VERSION,
             });
         }
 
+        let operation = request.into_operation();
+        if schema_version == LEGACY_CNI_TRANSACTION_SCHEMA_VERSION {
+            self.validate_legacy_operation(&operation)?;
+        }
+
         let previous = self.attachments.clone();
-        let (attachment, attachments) = match request.into_operation() {
+        let (attachment, attachments) = match operation {
             TransactionOperation::Status => (None, Vec::new()),
             TransactionOperation::List {
                 network,
@@ -492,7 +528,7 @@ impl AttachmentJournal {
             return Err(error);
         }
         Ok(TransactionResponse {
-            schema_version: CNI_TRANSACTION_SCHEMA_VERSION,
+            schema_version,
             outcome: TransactionOutcome::Ok {
                 attachment,
                 attachments,
@@ -501,11 +537,52 @@ impl AttachmentJournal {
         })
     }
 
+    // Never hide a binding from an old reader or let an old writer mutate it.
+    fn validate_legacy_operation(
+        &self,
+        operation: &TransactionOperation,
+    ) -> Result<(), JournalError> {
+        let bound = match operation {
+            TransactionOperation::Status => false,
+            TransactionOperation::List { network, after, .. } => {
+                self.attachments.values().any(|record| {
+                    record.spec.key.network == *network
+                        && after
+                            .as_ref()
+                            .is_none_or(|cursor| record.spec.key > *cursor)
+                        && record.spec.workload_uid.is_some()
+                })
+            }
+            TransactionOperation::Prepare { attachment }
+            | TransactionOperation::Check { attachment } => {
+                attachment.workload_uid.is_some()
+                    || self
+                        .get(&attachment.key)
+                        .is_some_and(|record| record.spec.workload_uid.is_some())
+            }
+            TransactionOperation::Inspect { key }
+            | TransactionOperation::Commit { key }
+            | TransactionOperation::BeginAbort { key }
+            | TransactionOperation::CompleteAbort { key }
+            | TransactionOperation::BeginDelete { key }
+            | TransactionOperation::CompleteDelete { key } => self
+                .get(key)
+                .is_some_and(|record| record.spec.workload_uid.is_some()),
+        };
+        if bound {
+            return Err(JournalError::IncompatibleSchema {
+                actual: LEGACY_CNI_TRANSACTION_SCHEMA_VERSION,
+                expected: CNI_TRANSACTION_SCHEMA_VERSION,
+            });
+        }
+        Ok(())
+    }
+
     fn prepare(&mut self, spec: AttachmentSpec) -> Result<AttachmentRecord, JournalError> {
         if let Some(existing) = self.attachments.get(&spec.key) {
-            if existing.spec != spec {
+            if !existing.spec.accepts_replay(&spec) {
                 return Err(JournalError::Conflict(
-                    "the same key has a different namespace or MTU".to_owned(),
+                    "the same key has a different namespace, MTU or workload UID".to_owned(),
                 ));
             }
             if existing.phase == AttachmentPhase::Preparing {
@@ -597,7 +674,7 @@ impl AttachmentJournal {
             .attachments
             .get(&spec.key)
             .ok_or(JournalError::NotFound)?;
-        if record.spec != *spec {
+        if !record.spec.accepts_replay(spec) {
             return Err(JournalError::Conflict(
                 "CHECK does not match the durable attachment specification".to_owned(),
             ));
@@ -660,7 +737,17 @@ impl AttachmentJournal {
             )));
         }
         let document = JournalDocument {
-            schema_version: ATTACHMENT_JOURNAL_SCHEMA_VERSION,
+            // Preserve schema-2 recovery while every attachment is unbound.
+            // A document carrying any Pod incarnation requires a v3 reader.
+            schema_version: if self
+                .attachments
+                .values()
+                .any(|record| record.spec.workload_uid.is_some())
+            {
+                ATTACHMENT_JOURNAL_SCHEMA_VERSION
+            } else {
+                UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION
+            },
             provider: self.provider,
             attachments: self.attachments.values().cloned().collect(),
         };
@@ -698,7 +785,7 @@ fn load_document(
         .and_then(|version| u16::try_from(version).ok())
         .ok_or_else(|| JournalError::Invalid("journal schemaVersion is missing".to_owned()))?;
     match actual {
-        ATTACHMENT_JOURNAL_SCHEMA_VERSION => {
+        ATTACHMENT_JOURNAL_SCHEMA_VERSION | UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION => {
             let document: JournalDocument = serde_json::from_value(value)?;
             if document.provider != provider {
                 return Err(JournalError::Conflict(format!(
@@ -723,7 +810,10 @@ fn validate_document(
     document: JournalDocument,
     provider: NodeBlockProvider,
 ) -> Result<BTreeMap<AttachmentKey, AttachmentRecord>, JournalError> {
-    if document.schema_version != ATTACHMENT_JOURNAL_SCHEMA_VERSION {
+    if !matches!(
+        document.schema_version,
+        ATTACHMENT_JOURNAL_SCHEMA_VERSION | UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION
+    ) {
         return Err(JournalError::IncompatibleSchema {
             actual: document.schema_version,
             expected: ATTACHMENT_JOURNAL_SCHEMA_VERSION,
@@ -734,6 +824,13 @@ fn validate_document(
     let mut used = UsedAddresses::default();
     let mut previous_key: Option<AttachmentKey> = None;
     for record in document.attachments {
+        if document.schema_version == UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION
+            && record.spec.workload_uid.is_some()
+        {
+            return Err(JournalError::Invalid(
+                "schema-2 journal cannot carry workload UID authority".to_owned(),
+            ));
+        }
         validate_record_identity(
             &record.spec,
             &record.host_interface,
@@ -763,6 +860,11 @@ fn migrate_legacy_document(
     let mut used = UsedAddresses::default();
     let mut previous_key: Option<AttachmentKey> = None;
     for legacy in document.attachments {
+        if legacy.spec.workload_uid.is_some() {
+            return Err(JournalError::Invalid(
+                "schema-1 journal cannot carry workload UID authority".to_owned(),
+            ));
+        }
         validate_record_identity(
             &legacy.spec,
             &legacy.host_interface,
@@ -810,6 +912,15 @@ fn validate_record_identity(
 
 fn validate_spec(spec: &AttachmentSpec) -> Result<(), JournalError> {
     validate_key(&spec.key)?;
+    if spec
+        .workload_uid
+        .as_deref()
+        .is_some_and(|uid| !valid_workload_uid(uid))
+    {
+        return Err(JournalError::Invalid(
+            "workload UID must be a bounded identifier".to_owned(),
+        ));
+    }
     if !spec.netns.starts_with('/')
         || spec.netns.as_bytes().contains(&0)
         || spec.netns.len() > MAX_NETNS_BYTES
@@ -904,6 +1015,7 @@ fn remove_stale_temporary(path: &Path) -> Result<(), JournalError> {
 
 #[cfg(test)]
 mod tests {
+    mod ownership;
     use std::os::unix::fs::symlink;
 
     use super::*;
@@ -928,6 +1040,7 @@ mod tests {
             key: key(container_id),
             netns: format!("/run/netns/{container_id}"),
             mtu: 1_500,
+            workload_uid: None,
         }
     }
 
@@ -1227,7 +1340,7 @@ mod tests {
     fn incompatible_malformed_unsorted_and_symlinked_journals_are_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let incompatible = directory.path().join("incompatible.json");
-        fs::write(&incompatible, r#"{"schemaVersion":3}"#).expect("write incompatible state");
+        fs::write(&incompatible, r#"{"schemaVersion":4}"#).expect("write incompatible state");
         assert!(matches!(
             AttachmentJournal::open(incompatible, provider()),
             Err(JournalError::IncompatibleSchema { .. })
@@ -1287,7 +1400,7 @@ mod tests {
     fn requests_and_results_have_a_stable_versioned_wire_shape() {
         let encoded =
             serde_json::to_value(request(TransactionOperation::Status)).expect("encode request");
-        assert_eq!(encoded["schemaVersion"], 2);
+        assert_eq!(encoded["schemaVersion"], 3);
         assert_eq!(encoded["operation"], "status");
         let inspect = serde_json::to_value(request(TransactionOperation::Inspect {
             key: key("container-1"),
@@ -1300,7 +1413,7 @@ mod tests {
             "root credentials required",
         );
         let encoded = serde_json::to_value(response).expect("encode response");
-        assert_eq!(encoded["schemaVersion"], 2);
+        assert_eq!(encoded["schemaVersion"], 3);
         assert_eq!(encoded["status"], "error");
         assert_eq!(encoded["code"], "unauthorized");
 

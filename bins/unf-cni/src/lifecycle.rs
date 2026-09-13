@@ -11,7 +11,7 @@ use unf_cni_state::{
     AttachmentKey, AttachmentPhase, AttachmentRecord, AttachmentSpec,
     CNI_TRANSACTION_SCHEMA_VERSION, MAX_ATTACHMENT_LIST_RECORDS, MAX_TRANSACTION_MESSAGE_BYTES,
     TransactionErrorCode, TransactionOperation, TransactionOutcome, TransactionRequest,
-    TransactionResponse,
+    TransactionResponse, valid_workload_uid,
 };
 use unf_link::{LinkReadback, VethPlan};
 use unf_route::{NativeRoutePlan, NativeRoutingProvider, RoutingProvider};
@@ -725,7 +725,33 @@ fn attachment_spec(
             .clone()
             .ok_or_else(|| CniError::invalid_environment("CNI_NETNS is required".to_owned()))?,
         mtu: config.mtu.unwrap_or(DEFAULT_MTU),
+        workload_uid: workload_uid(environment.args.as_deref())?,
     })
+}
+
+// Parse only the runtime ownership coordinate; unrelated CNI arguments retain
+// their existing behavior. Never log the complete environment or its values.
+fn workload_uid(args: Option<&str>) -> Result<Option<Box<str>>, CniError> {
+    let mut uid = None;
+    let Some(args) = args else { return Ok(None) };
+    if args.len() > MAX_TRANSACTION_MESSAGE_BYTES {
+        return Err(CniError::invalid_environment(
+            "CNI_ARGS exceeds the transaction bound".to_owned(),
+        ));
+    }
+    for arg in args.split(';') {
+        let (key, value) = arg.split_once('=').unwrap_or((arg, ""));
+        if key != "K8S_POD_UID" {
+            continue;
+        }
+        if uid.is_some() || !valid_workload_uid(value) {
+            return Err(CniError::invalid_environment(
+                "K8S_POD_UID must be one bounded, nonempty identifier".to_owned(),
+            ));
+        }
+        uid = Some(value.into());
+    }
+    Ok(uid)
 }
 
 fn attachment_key(
@@ -762,12 +788,12 @@ fn ensure_spec(
     spec: &AttachmentSpec,
     version: &str,
 ) -> Result<(), CniError> {
-    if record.spec == *spec {
+    if record.spec.accepts_replay(spec) {
         Ok(())
     } else {
         Err(CniError::retry_with_details(
             version,
-            "durable attachment conflicts with the requested namespace or MTU",
+            "durable attachment conflicts with the requested namespace, MTU or workload UID",
         ))
     }
 }
@@ -847,6 +873,37 @@ mod tests {
     }
 
     #[test]
+    fn runtime_uid_is_optional_but_never_ambiguous_or_unbounded() {
+        assert_eq!(workload_uid(None).unwrap(), None);
+        assert_eq!(
+            workload_uid(Some("IgnoreUnknown=1;K8S_POD_NAME=app")).unwrap(),
+            None
+        );
+        assert_eq!(
+            workload_uid(Some("K8S_POD_UID=pod-uid-a;IgnoreUnknown=1"))
+                .unwrap()
+                .as_deref(),
+            Some("pod-uid-a")
+        );
+        for args in [
+            "K8S_POD_UID",
+            "K8S_POD_UID=",
+            "K8S_POD_UID=a;K8S_POD_UID=a",
+            "K8S_POD_UID=a;K8S_POD_UID=b",
+            "K8S_POD_UID=a=b",
+            "K8S_POD_UID=a/b",
+            "K8S_POD_UID=a\nb",
+        ] {
+            assert!(
+                workload_uid(Some(args)).is_err(),
+                "accepted malformed UID argument"
+            );
+        }
+        assert!(workload_uid(Some(&format!("K8S_POD_UID={}", "a".repeat(129)))).is_err());
+        assert!(workload_uid(Some(&"a".repeat(MAX_TRANSACTION_MESSAGE_BYTES + 1))).is_err());
+    }
+
+    #[test]
     fn transaction_transport_and_protocol_fail_closed() {
         let mut transport = Responses(VecDeque::from([Err("offline".to_owned())]));
         let error = operation(&mut transport, "1.1.0", TransactionOperation::Status)
@@ -875,6 +932,7 @@ mod tests {
                 },
                 netns: "/run/netns/pod-1".to_owned(),
                 mtu: 1_400,
+                workload_uid: None,
             },
             host_interface: "unf123".to_owned(),
             lease: unf_ipam::DualStackLease {

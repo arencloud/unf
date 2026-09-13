@@ -10,6 +10,7 @@ repository.workspace = true
 futures.workspace = true
 rtnetlink.workspace = true
 rustix.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 unf-cni-state = { path = "../unf-cni-state" }

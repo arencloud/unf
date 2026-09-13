@@ -370,6 +370,7 @@ mod tests {
             },
             netns: "/run/netns/container-1".to_owned(),
             mtu: 1_500,
+            workload_uid: None,
         }
     }
 

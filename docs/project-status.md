@@ -556,6 +556,10 @@ ADR 0326 adds a versioned, independently replayed exact-address locality
 certificate with 770 passing workspace tests. Neither slice introduces a
 plaintext exception or live image change; kernel attachment/route proof and
 the banked consuming boundary are next.
+ADR 0327 implements L3a's CNI Pod-incarnation ownership prerequisite, with
+explicit legacy journal/request compatibility and kernel alias fencing. All 778
+workspace tests and strict Clippy pass; no live runtime or encryption behavior
+is changed. Isolated cl02 kernel validation is next, before Kind.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 

@@ -42,6 +42,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             netns: environment.netns.ok_or("missing CNI_NETNS")?,
             mtu: 1_400,
+            workload_uid: None,
         };
         transaction.0.apply(TransactionRequest::new(
             CNI_TRANSACTION_SCHEMA_VERSION,

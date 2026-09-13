@@ -16,6 +16,7 @@ fn attachment(host_name: String, netns: String) -> AttachmentRecord {
             },
             netns,
             mtu: 1_400,
+            workload_uid: None,
         },
         host_interface: host_name,
         lease: DualStackLease {

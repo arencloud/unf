@@ -526,6 +526,7 @@ mod tests {
                 },
                 netns: "/run/netns/pod-1".to_string(),
                 mtu: 1_400,
+                workload_uid: None,
             },
             host_interface: "unf01234567890".to_string(),
             lease: DualStackLease {

@@ -17,8 +17,9 @@ use rtnetlink::packet_route::neighbour::{
 use rtnetlink::{Handle, LinkDummy, LinkMessageBuilder, LinkUnspec, LinkVeth, new_connection};
 use rustix::fs::{Mode, OFlags, open};
 use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
+use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use unf_cni_state::AttachmentRecord;
+use unf_cni_state::{AttachmentRecord, valid_workload_uid};
 
 const LINUX_INTERFACE_NAME_MAX: usize = 15;
 const MIN_DUAL_STACK_MTU: u32 = 1_280;
@@ -146,7 +147,7 @@ impl VethPlan {
     /// Rejects names, namespace paths, MTUs, or prefixes that Linux cannot
     /// apply safely.
     pub fn from_attachment(record: &AttachmentRecord) -> Result<Self, LinkError> {
-        Self::new(
+        let mut plan = Self::new(
             record.host_interface.clone(),
             record.spec.key.ifname.clone(),
             PathBuf::from(&record.spec.netns),
@@ -161,7 +162,30 @@ impl VethPlan {
                     prefix_len: 128,
                 },
             ],
-        )
+        )?;
+        if let Some(uid) = &record.spec.workload_uid {
+            if !valid_workload_uid(uid) {
+                return Err(LinkError::InvalidPlan("invalid workload UID".to_owned()));
+            }
+            // Versioned owner cookie binds the complete sandbox key and Pod
+            // incarnation. Both kernel aliases are independently read back by
+            // the existing apply/CHECK/delete ownership checks.
+            let mut digest = Sha256::new();
+            digest.update(b"unf.cni-workload-owner.v2\0");
+            for value in [
+                &record.spec.key.network,
+                &record.spec.key.container_id,
+                &record.spec.key.ifname,
+                uid.as_ref(),
+            ] {
+                digest.update(value.as_bytes());
+                digest.update([0]);
+            }
+            let cookie = digest.finalize();
+            plan.host_alias = format!("unf:cni:v2:{}:{cookie:x}:host", plan.host_name);
+            plan.peer_alias = format!("unf:cni:v2:{}:{cookie:x}:peer", plan.host_name);
+        }
+        Ok(plan)
     }
 
     /// Creates a deterministic plan from explicit attachment inputs.
@@ -1660,7 +1684,9 @@ fn validate_recoverable_link(
             "interface does not carry the deterministic UNF creation identity",
         ));
     }
-    if link_alias(link).is_some_and(|alias| alias != expected_alias) {
+    if link_alias(link).is_some_and(|alias| alias != expected_alias)
+        || (expected_alias.starts_with("unf:cni:v2:") && link_alias(link).is_none())
+    {
         return Err(conflict(
             expected_name,
             &format!("unexpected ownership alias {:?}", link_alias(link)),
@@ -1912,9 +1938,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn durable_node_block_lease_becomes_routed_host_prefixes() {
-        let record = AttachmentRecord {
+    fn attachment() -> AttachmentRecord {
+        AttachmentRecord {
             spec: AttachmentSpec {
                 key: AttachmentKey {
                     network: "unf-test".to_string(),
@@ -1923,6 +1948,7 @@ mod tests {
                 },
                 netns: "/run/netns/pod-1".to_string(),
                 mtu: 1_400,
+                workload_uid: None,
             },
             host_interface: "unf01234567890".to_string(),
             lease: DualStackLease {
@@ -1938,10 +1964,86 @@ mod tests {
                 },
             },
             phase: AttachmentPhase::Preparing,
-        };
+        }
+    }
+
+    #[test]
+    fn durable_node_block_lease_becomes_routed_host_prefixes() {
+        let record = attachment();
         let plan = VethPlan::from_attachment(&record).expect("durable record is valid");
         assert_eq!(plan.addresses[0].prefix_len, 32);
         assert_eq!(plan.addresses[1].prefix_len, 128);
+    }
+
+    #[test]
+    fn workload_alias_binds_full_sandbox_key_and_uid_without_changing_legacy_links() {
+        let mut record = attachment();
+        let legacy = VethPlan::from_attachment(&record).unwrap();
+        assert_eq!(legacy.host_alias, "unf:cni:v1:unf01234567890:host");
+        record.spec.workload_uid = Some("pod-a".into());
+        let bound = VethPlan::from_attachment(&record).unwrap();
+        assert!(bound.host_alias.starts_with("unf:cni:v2:"));
+        assert!(bound.host_alias.len() < 256);
+        assert_ne!(bound.host_alias, bound.peer_alias);
+        assert_eq!(bound, VethPlan::from_attachment(&record).unwrap());
+        for field in 0..4 {
+            let mut replaced = record.clone();
+            match field {
+                0 => replaced.spec.workload_uid = Some("pod-b".into()),
+                1 => replaced.spec.key.container_id.push('2'),
+                2 => replaced.spec.key.network.push('2'),
+                _ => replaced.spec.key.ifname = "eth1".to_owned(),
+            }
+            let changed = VethPlan::from_attachment(&replaced).unwrap();
+            assert_ne!(changed.host_alias, bound.host_alias);
+            assert_ne!(changed.peer_alias, bound.peer_alias);
+        }
+        record.spec.workload_uid = Some("invalid/uid".into());
+        assert!(VethPlan::from_attachment(&record).is_err());
+    }
+
+    #[test]
+    fn bound_link_recovery_refuses_missing_foreign_or_previous_incarnation_alias() {
+        let mut record = attachment();
+        record.spec.workload_uid = Some("pod-a".into());
+        let bound = VethPlan::from_attachment(&record).unwrap();
+        let link = LinkVeth::new(&bound.host_name, &bound.temporary_peer_name)
+            .mtu(bound.mtu)
+            .address(bound.host_address.to_vec())
+            .alias(&bound.host_alias)
+            .build();
+        let validate = |link: &LinkMessage, alias: &str| {
+            validate_recoverable_link(link, &bound.host_name, alias, bound.mtu, bound.host_address)
+        };
+        assert!(validate(&link, &bound.host_alias).is_ok());
+        for alias in [
+            None,
+            Some(""),
+            Some("foreign"),
+            Some("unf:cni:v1:unf01234567890:host"),
+        ] {
+            let mut changed = link.clone();
+            changed
+                .attributes
+                .retain(|attribute| !matches!(attribute, LinkAttribute::IfAlias(_)));
+            if let Some(alias) = alias {
+                changed
+                    .attributes
+                    .push(LinkAttribute::IfAlias(alias.to_owned()));
+            }
+            assert!(validate(&changed, &bound.host_alias).is_err());
+        }
+        record.spec.workload_uid = Some("pod-b".into());
+        let replacement = VethPlan::from_attachment(&record).unwrap();
+        assert!(validate(&link, &replacement.host_alias).is_err());
+        let mut missing_alias = link;
+        missing_alias
+            .attributes
+            .retain(|attribute| !matches!(attribute, LinkAttribute::IfAlias(_)));
+        assert!(
+            validate(&missing_alias, "unf:cni:v1:unf01234567890:host").is_ok(),
+            "legacy partial-state recovery remains supported"
+        );
     }
 
     #[test]
