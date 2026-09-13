@@ -277,7 +277,7 @@ assert_version() {
         and .agent_status_schema_version == $agent
         and .flow_export_schema_version == $flow
         and ($selection == 0 or .selection_contract_schema_version == $selection)
-    ' <<<"${json}" >/dev/null
+    ' <<<"${json}" >/dev/null || return 1
 
     if ((egress_distribution_schema > 0)); then
         jq -e --argjson distribution "${egress_distribution_schema}" \
@@ -288,7 +288,7 @@ assert_version() {
             and .egress_ha_promotion_schema_version == $ha
             and .egress_map_schema_version == $map
             and .egress_event_schema_version == $event
-        ' <<<"${json}" >/dev/null
+        ' <<<"${json}" >/dev/null || return 1
     fi
     if ((encryption_model_schema > 0)); then
         jq -e --argjson model "${encryption_model_schema}" \
@@ -299,7 +299,7 @@ assert_version() {
             and .encryption_path_proof_schema_version == $path
             and .encryption_operations_schema_version == $operations
             and .encryption_map_abi_version == $map
-        ' <<<"${json}" >/dev/null
+        ' <<<"${json}" >/dev/null || return 1
     fi
 }
 

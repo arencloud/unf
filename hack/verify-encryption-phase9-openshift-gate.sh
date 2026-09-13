@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+bash "${root}/hack/verify-deployment-version.sh"
 gate=${root}/hack/verify-openshift-encryption-phase9.sh
 bash "${root}/hack/verify-phase9-operations-continuity.sh"
 bash "${root}/hack/verify-phase9-witness-read.sh"

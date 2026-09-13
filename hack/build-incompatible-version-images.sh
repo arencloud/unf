@@ -61,7 +61,7 @@ for package in unf-controller unf-agent; do
         image=${agent_image}
     fi
     podman build \
-        --build-arg "UNF_BUILD_REVISION=${build_revision}" \
+        --build-arg "UNF_SOURCE_REVISION=${build_revision}" \
         --build-arg "UNF_PACKAGE=${package}" \
         --label "org.opencontainers.image.revision=${revision}" \
         --label "io.unf.test.policy-snapshot-schema=${incompatible_policy_schema}" \

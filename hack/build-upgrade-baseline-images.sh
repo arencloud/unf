@@ -36,7 +36,9 @@ git -C "${project_root}" archive --format=tar "${baseline_commit}" \
     | tar -xf - -C "${temporary_root}"
 make -C "${temporary_root}" artifacts
 revision_build_arg=()
-if rg -q '^ARG UNF_BUILD_REVISION' "${temporary_root}/images/Containerfile"; then
+if rg -q '^ARG UNF_SOURCE_REVISION' "${temporary_root}/images/Containerfile"; then
+    revision_build_arg=(--build-arg "UNF_SOURCE_REVISION=${baseline_commit}")
+elif rg -q '^ARG UNF_BUILD_REVISION' "${temporary_root}/images/Containerfile"; then
     revision_build_arg=(--build-arg "UNF_BUILD_REVISION=${baseline_commit}")
 fi
 podman build \

@@ -44,11 +44,15 @@ build_generation() {
     local controller_local="localhost/unf-controller:${generation}"
     local agent_local="localhost/unf-agent:${generation}"
     local tools_local="localhost/unf-test-tools:${generation}"
-    podman build --build-arg "UNF_BUILD_REVISION=${revision}" \
+    local revision_arg=UNF_BUILD_REVISION
+    if rg -q '^ARG UNF_SOURCE_REVISION' "${source_root}/images/Containerfile"; then
+        revision_arg=UNF_SOURCE_REVISION
+    fi
+    podman build --build-arg "${revision_arg}=${revision}" \
         --build-arg UNF_PACKAGE=unf-controller \
         --label "org.opencontainers.image.revision=${revision}" \
         --tag "${controller_local}" --file "${source_root}/images/Containerfile" "${source_root}"
-    podman build --build-arg "UNF_BUILD_REVISION=${revision}" \
+    podman build --build-arg "${revision_arg}=${revision}" \
         --build-arg UNF_PACKAGE=unf-agent \
         --label "org.opencontainers.image.revision=${revision}" \
         --tag "${agent_local}" --file "${source_root}/images/Containerfile" "${source_root}"

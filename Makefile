@@ -1055,8 +1055,8 @@ artifacts: ebpf
 	cp ebpf/unf-ebpf-tc/target/bpfel-unknown-none/release/unf-ebpf-tc .artifacts/unf-ebpf-tc
 
 images: artifacts
-	podman build --build-arg UNF_BUILD_REVISION=$(UNF_BUILD_REVISION) --build-arg UNF_PACKAGE=unf-controller --tag localhost/unf-controller:dev --file images/Containerfile .
-	podman build --build-arg UNF_BUILD_REVISION=$(UNF_BUILD_REVISION) --build-arg UNF_PACKAGE=unf-agent --tag localhost/unf-agent:dev --file images/Containerfile .
+	podman build --build-arg UNF_SOURCE_REVISION=$(UNF_BUILD_REVISION) --build-arg UNF_PACKAGE=unf-controller --tag localhost/unf-controller:dev --file images/Containerfile .
+	podman build --build-arg UNF_SOURCE_REVISION=$(UNF_BUILD_REVISION) --build-arg UNF_PACKAGE=unf-agent --tag localhost/unf-agent:dev --file images/Containerfile .
 	podman build --tag $(TEST_TOOLS_IMAGE) --file images/SctpTestContainerfile .
 	podman run --rm --entrypoint sh $(TEST_TOOLS_IMAGE) -ec 'command -v bpftool >/dev/null && command -v jq >/dev/null'
 

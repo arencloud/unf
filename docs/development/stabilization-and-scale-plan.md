@@ -5,6 +5,9 @@ S1's missing transport coverage findings (ADR 0293). ADR 0294 implements the
 Native repair; live requalification and Required coverage remain pending.
 S1–S5 are not yet verified.
 
+ADR 0303 rejects the first key-independent candidate's embedded provenance and
+repairs fail-open conditional deployment checks; rebuilding and cl02-first
+qualification remain required. Retained Kind has not been reset or upgraded.
 ADR 0300 now implements key-independent publication for wholly Native models,
 after ADR 0299's cl02 failure. Its local regressions pass; a new immutable
 runtime must pass cl02 before retained Kind is updated. Do not treat the

@@ -2,9 +2,9 @@
 
 Date: 2026-09-13
 
-Status: immutable candidate published; cl02-first live gates pending
+Status: candidate rejected by Native preflight; superseded by ADR 0303 provenance repair
 
-Runtime `64ad5599bbb21ecdbf0c859d7090f16714a33f96` includes exact
+Source `64ad5599bbb21ecdbf0c859d7090f16714a33f96` includes exact
 predecessor-receipt recovery (ADR 0298) and wholly Native key-readiness isolation
 (ADR 0300). Its 745 workspace tests, 25 explicit environment-dependent ignores,
 formatting and strict all-target/all-feature Clippy checks are recorded in
@@ -23,8 +23,13 @@ The original Containerfile is unchanged. Its Rust base argument reuses the
 previous compiler/cache layer
 `a65a90027d74bb7f079b59b94f4ef98b378da8ae8cad988236e987d90a9b7b61`,
 which was built from the same Rust 1.95 toolchain for `b5bf6c6`. Current sources
-are copied and `cargo build --locked --release` runs with the exact new revision.
-This compiler-cache reuse is build provenance, not a UNF performance result.
+were copied and `cargo build --locked --release` ran, but subsequent live
+preflight found that the inherited builder environment overrode the requested
+revision: the binaries report `b5bf6c6`, not `64ad559`. The image digests remain
+correct, but their asserted embedded source provenance is invalid. The staged
+deployment's conditional shell check masked this mismatch (ADR 0303). Its
+success must not be counted as runtime-version verification. No Native traffic
+fixture ran for this candidate and it was not deployed to retained Kind.
 
 Deploy cl02 controller-first/node-serially, verify runtime versions and the
 expanded Native packet gate, then recover the retained Kind cluster without
