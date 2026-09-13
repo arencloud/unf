@@ -15,6 +15,65 @@ use crate::{
     project_encryption_policy_facts,
 };
 
+/// Whole-cut address budget, independent of identity-pair cardinality.
+pub const MAX_ENCRYPTION_ENDPOINT_ADDRESSES: usize = 65_536;
+
+/// An exact address owner, never an identity-wide transport permission.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct EncryptionEndpointAddressFact {
+    pub address: IpAddr,
+    pub workload_uid: String,
+    pub identity: IdentityId,
+    pub node_uid: String,
+}
+
+/// Validated placement without policy-pair enumeration or cryptographic work.
+/// Private fields prevent callers from replacing validated address ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubernetesEncryptionPlacement {
+    cluster_id: String,
+    nodes: Vec<EncryptionNode>,
+    endpoints: Vec<EncryptionEndpointFact>,
+    addresses: Vec<EncryptionEndpointAddressFact>,
+}
+
+impl KubernetesEncryptionPlacement {
+    #[must_use]
+    pub fn cluster_id(&self) -> &str {
+        &self.cluster_id
+    }
+
+    #[must_use]
+    pub fn nodes(&self) -> &[EncryptionNode] {
+        &self.nodes
+    }
+
+    #[must_use]
+    pub fn endpoints(&self) -> &[EncryptionEndpointFact] {
+        &self.endpoints
+    }
+
+    #[must_use]
+    pub fn addresses(&self) -> &[EncryptionEndpointAddressFact] {
+        &self.addresses
+    }
+}
+
+/// Projects the complete managed address cut without enumerating policy pairs.
+///
+/// # Errors
+///
+/// Rejects invalid membership, IPAM drift, duplicate workload/address owners,
+/// reserved proof addresses and bounded endpoint/address capacity overflow.
+pub fn project_kubernetes_encryption_placement(
+    cluster_id: &str,
+    mut nodes: Vec<KubernetesEncryptionNodeSnapshot>,
+    mut workloads: Vec<KubernetesEncryptionWorkloadSnapshot>,
+) -> Result<KubernetesEncryptionPlacement, KubernetesEncryptionProjectionError> {
+    project_placement_facts(cluster_id, &mut nodes, &mut workloads)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KubernetesEncryptionNodeSnapshot {
     pub name: String,
@@ -105,7 +164,6 @@ pub fn project_kubernetes_encryption(
 pub fn project_kubernetes_native(
     mut input: KubernetesNativeProjectionInput,
 ) -> Result<KubernetesEncryptionProjection, KubernetesEncryptionProjectionError> {
-    validate_nodes(&input.cluster_id, &input.nodes)?;
     project_placement(
         &input.cluster_id,
         &mut input.nodes,
@@ -120,6 +178,42 @@ fn project_placement(
     workloads: &mut [KubernetesEncryptionWorkloadSnapshot],
     observations: &[EncryptionPolicyObservation],
 ) -> Result<KubernetesEncryptionProjection, KubernetesEncryptionProjectionError> {
+    let placement = project_placement_facts(cluster_id, node_snapshots, workloads)?;
+    let pairs = demanded_identity_pairs(&placement.endpoints);
+    let policies = if pairs.is_empty() {
+        if !observations.is_empty() {
+            return Err(KubernetesEncryptionProjectionError::InvalidPolicy);
+        }
+        Vec::new()
+    } else {
+        project_encryption_policy_facts(pairs.iter().copied(), observations.iter().copied())
+            .map_err(|_| KubernetesEncryptionProjectionError::InvalidPolicy)?
+    };
+    Ok(KubernetesEncryptionProjection {
+        nodes: placement.nodes,
+        endpoints: placement.endpoints,
+        policies,
+        paths: Vec::new(),
+    })
+}
+
+fn project_placement_facts(
+    cluster_id: &str,
+    node_snapshots: &mut [KubernetesEncryptionNodeSnapshot],
+    workloads: &mut [KubernetesEncryptionWorkloadSnapshot],
+) -> Result<KubernetesEncryptionPlacement, KubernetesEncryptionProjectionError> {
+    validate_nodes(cluster_id, node_snapshots)?;
+    let mut address_count = 0_usize;
+    let mut endpoint_count = 0_usize;
+    for workload in workloads.iter().filter(|workload| !workload.host_network) {
+        endpoint_count += 1;
+        address_count = address_count.saturating_add(workload.addresses.len());
+        if endpoint_count > MAX_ENCRYPTION_ENDPOINTS
+            || address_count > MAX_ENCRYPTION_ENDPOINT_ADDRESSES
+        {
+            return Err(KubernetesEncryptionProjectionError::Capacity);
+        }
+    }
     node_snapshots.sort_by(|left, right| left.name.cmp(&right.name));
     workloads.sort_by(|left, right| left.workload_uid.cmp(&right.workload_uid));
     if workloads
@@ -156,6 +250,7 @@ fn project_placement(
         .map(|node| (node.name.as_str(), node))
         .collect::<BTreeMap<_, _>>();
     let mut endpoints = Vec::new();
+    let mut addresses = BTreeMap::new();
     for workload in workloads
         .iter()
         .filter(|workload| !workload.host_network)
@@ -167,7 +262,7 @@ fn project_placement(
         let proof_beacons = derive_wireguard_proof_addresses(&node.pod_cidrs)
             .map_err(|_| KubernetesEncryptionProjectionError::InvalidNode)?;
         if workload.identity.get() == 0
-            || workload.workload_uid.is_empty()
+            || !crate::validate_text(&workload.workload_uid)
             || workload.addresses.is_empty()
             || workload.addresses.iter().any(|address| {
                 !node
@@ -183,30 +278,30 @@ fn project_placement(
         {
             return Err(KubernetesEncryptionProjectionError::InvalidWorkload);
         }
+        for address in workload.addresses {
+            let owner = EncryptionEndpointAddressFact {
+                address,
+                workload_uid: workload.workload_uid.clone(),
+                identity: workload.identity,
+                node_uid: node.uid.clone(),
+            };
+            // Even matching identities cannot share an address across UIDs.
+            // Duplicate entries within one workload are also noncanonical.
+            if addresses.insert(address, owner).is_some() {
+                return Err(KubernetesEncryptionProjectionError::InvalidWorkload);
+            }
+        }
         endpoints.push(EncryptionEndpointFact {
             identity: workload.identity,
             workload_uid: workload.workload_uid,
             node: (*node).clone(),
         });
     }
-    if endpoints.len() > MAX_ENCRYPTION_ENDPOINTS {
-        return Err(KubernetesEncryptionProjectionError::Capacity);
-    }
-    let pairs = demanded_identity_pairs(&endpoints);
-    let policies = if pairs.is_empty() {
-        if !observations.is_empty() {
-            return Err(KubernetesEncryptionProjectionError::InvalidPolicy);
-        }
-        Vec::new()
-    } else {
-        project_encryption_policy_facts(pairs.iter().copied(), observations.iter().copied())
-            .map_err(|_| KubernetesEncryptionProjectionError::InvalidPolicy)?
-    };
-    Ok(KubernetesEncryptionProjection {
+    Ok(KubernetesEncryptionPlacement {
+        cluster_id: cluster_id.to_owned(),
         nodes,
         endpoints,
-        policies,
-        paths: Vec::new(),
+        addresses: addresses.into_values().collect(),
     })
 }
 
@@ -225,15 +320,18 @@ fn validate_shape(
     {
         return Err(KubernetesEncryptionProjectionError::InvalidInput);
     }
-    validate_nodes(&input.cluster_id, &input.nodes)
+    Ok(())
 }
 
 fn validate_nodes(
     cluster_id: &str,
     nodes: &[KubernetesEncryptionNodeSnapshot],
 ) -> Result<(), KubernetesEncryptionProjectionError> {
-    if cluster_id.is_empty() || nodes.is_empty() {
+    if !crate::validate_text(cluster_id) || nodes.is_empty() {
         return Err(KubernetesEncryptionProjectionError::InvalidInput);
+    }
+    if nodes.len() > crate::MAX_ENCRYPTION_PLAN_MEMBERS {
+        return Err(KubernetesEncryptionProjectionError::Capacity);
     }
     let mut names = BTreeSet::new();
     let mut uids = BTreeSet::new();
@@ -241,8 +339,8 @@ fn validate_nodes(
     for node in nodes {
         if !node.ready
             || !node.managed
-            || node.name.is_empty()
-            || node.uid.is_empty()
+            || !crate::validate_text(&node.name)
+            || !crate::validate_text(&node.uid)
             || !names.insert(node.name.as_str())
             || !uids.insert(node.uid.as_str())
             || node.pod_cidrs.is_empty()
@@ -491,5 +589,133 @@ mod tests {
         let projected = project_kubernetes_encryption(local).unwrap();
         assert!(projected.policies.is_empty());
         assert!(projected.paths.is_empty());
+    }
+
+    #[test]
+    fn kubernetes_projection_refuses_ambiguous_workload_address_ownership() {
+        for same_identity in [false, true] {
+            let mut duplicate = input();
+            let mut replica = duplicate.workloads[0].clone();
+            replica.workload_uid = "another-pod".to_owned();
+            if !same_identity {
+                replica.identity = IdentityId::new(12);
+            }
+            duplicate.workloads.push(replica);
+            assert_eq!(
+                project_kubernetes_encryption(duplicate),
+                Err(KubernetesEncryptionProjectionError::InvalidWorkload),
+                "one address must not name two workload UIDs, even with one identity"
+            );
+        }
+        let mut duplicate = input();
+        duplicate.workloads[0]
+            .addresses
+            .push("10.42.1.8".parse().unwrap());
+        assert_eq!(
+            project_kubernetes_encryption(duplicate),
+            Err(KubernetesEncryptionProjectionError::InvalidWorkload)
+        );
+    }
+
+    #[test]
+    fn kubernetes_placement_keeps_canonical_exact_owners_without_policy_pairs() {
+        let mut fixture = input();
+        let mut replica = fixture.workloads[0].clone();
+        replica.workload_uid = "replica".to_owned();
+        replica.addresses = vec!["10.42.1.9".parse().unwrap(), "fd42:1::9".parse().unwrap()];
+        fixture.workloads.push(replica);
+        let mut host = fixture.workloads[0].clone();
+        host.workload_uid = "host".to_owned();
+        host.host_network = true;
+        fixture.workloads.push(host);
+        let original = project_kubernetes_encryption_placement(
+            &fixture.cluster_id,
+            fixture.nodes.clone(),
+            fixture.workloads.clone(),
+        )
+        .unwrap();
+        assert_eq!(original.endpoints().len(), 3);
+        assert_eq!(original.addresses().len(), 6);
+        assert_eq!(original.cluster_id(), "cluster-a");
+        assert_eq!(original.nodes().len(), 2);
+        assert_eq!(
+            original.addresses()[0],
+            EncryptionEndpointAddressFact {
+                address: "10.42.1.8".parse().unwrap(),
+                workload_uid: "pod-a".to_owned(),
+                identity: IdentityId::new(11),
+                node_uid: "uid-a".to_owned(),
+            }
+        );
+        fixture.nodes.reverse();
+        fixture.workloads.reverse();
+        for workload in &mut fixture.workloads {
+            workload.addresses.reverse();
+        }
+        assert_eq!(
+            project_kubernetes_encryption_placement(
+                &fixture.cluster_id,
+                fixture.nodes,
+                fixture.workloads
+            )
+            .unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn kubernetes_placement_refuses_address_and_endpoint_overflow_before_expansion() {
+        let mut fixture = input();
+        fixture.workloads[0].addresses =
+            vec!["10.42.1.8".parse().unwrap(); MAX_ENCRYPTION_ENDPOINT_ADDRESSES + 1];
+        assert_eq!(
+            project_kubernetes_encryption_placement(
+                &fixture.cluster_id,
+                fixture.nodes,
+                fixture.workloads
+            ),
+            Err(KubernetesEncryptionProjectionError::Capacity)
+        );
+        let fixture = input();
+        assert_eq!(
+            project_kubernetes_encryption_placement(
+                &fixture.cluster_id,
+                fixture.nodes,
+                vec![fixture.workloads[0].clone(); MAX_ENCRYPTION_ENDPOINTS + 1]
+            ),
+            Err(KubernetesEncryptionProjectionError::Capacity)
+        );
+    }
+
+    #[test]
+    fn kubernetes_placement_full_endpoint_budget_has_only_linear_address_records() {
+        let mut fixture = input();
+        fixture.nodes[0].pod_cidrs[0] = prefix("10.20.0.0", 16);
+        fixture.nodes[1].pod_cidrs[0] = prefix("10.21.0.0", 16);
+        let workloads = (0..MAX_ENCRYPTION_ENDPOINTS)
+            .map(|index| {
+                let ordinal = u16::try_from(index + 8).unwrap();
+                let [high, low] = ordinal.to_be_bytes();
+                let node_index = index % 2;
+                let subnet = 20 + node_index;
+                KubernetesEncryptionWorkloadSnapshot {
+                    workload_uid: format!("workload-{index}"),
+                    identity: IdentityId::new(u32::try_from(index + 1).unwrap()),
+                    node_name: fixture.nodes[node_index].name.clone(),
+                    host_network: false,
+                    addresses: vec![
+                        format!("10.{subnet}.{high}.{low}").parse().unwrap(),
+                        format!("fd42:{}::{ordinal:x}", node_index + 1)
+                            .parse()
+                            .unwrap(),
+                    ],
+                }
+            })
+            .collect();
+        let placement =
+            project_kubernetes_encryption_placement(&fixture.cluster_id, fixture.nodes, workloads)
+                .unwrap();
+        assert_eq!(placement.endpoints().len(), MAX_ENCRYPTION_ENDPOINTS);
+        assert_eq!(placement.addresses().len(), MAX_ENCRYPTION_ENDPOINTS * 2);
     }
 }

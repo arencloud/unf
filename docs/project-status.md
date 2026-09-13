@@ -550,6 +550,9 @@ with a strict live-controller revision read; the complete cl02 rerun passes
 with egress revision 38. ADR 0324 verifies the identical scoped gate on
 retained Kind with explicit initial egress revision, ciphertext and cleanup.
 Both fleets now run immutable `67c2772`; the Required reply slice is verified.
+ADR 0325 starts the [Required locality closure plan](development/phase9-required-locality-plan.md)
+with exact, ambiguity-rejecting workload-address placement and local regressions.
+It introduces no plaintext exception or live image change.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 
