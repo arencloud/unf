@@ -613,6 +613,12 @@ Archive JSON SHA-256 is `5950ed91…a942`; ADR 0290 records exact provenance.
 The earlier timeout remains a reliability observation, not an attributed
 registry-contention diagnosis. Matching-image fresh Kind is next. Existing
 internal DNS/Pod-endpoint failures and six unhealthy operators remain S1 work.
+ADR 0291 prepares fresh dual-stack Kind with exact cl02 runtime manifests,
+explicit cached-node repackaging provenance and matching controller limits.
+Image-ID validation now accepts exact qualified references as well as complete
+bare hashes; malformed and mismatched IDs fail. The post-bootstrap runtime is
+Ready with zero restarts. Initial controller-unavailable agent exits remain
+recorded; full Kind lifecycle and S1–S5 remain pending.
 
 ## Updating this tracker
 

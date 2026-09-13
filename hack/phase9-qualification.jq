@@ -1,3 +1,13 @@
+# CRI may expose a bare content/config digest or an exact qualified image ref.
+# A qualified reference must match the requested immutable image, not just look
+# like a digest. Build-version checks remain independently required by the gate.
+def phase9_runtime_image_id_valid:
+  (.image | type == "string" and length > 0)
+  and (.imageID | type == "string")
+  and ((.imageID | test("^sha256:[0-9a-f]{64}\\z"))
+    or (.imageID == .image
+      and (.image | test("^[A-Za-z0-9._:/-]+@sha256:[0-9a-f]{64}\\z"))));
+
 # Independent platform results may arrive in either order. Pending evidence
 # carries no invented revision, capture, hash, or kube-proxy observation.
 def phase9_kind_qualification_valid:

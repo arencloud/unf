@@ -7,10 +7,12 @@ bash "${root}/hack/verify-phase9-operations-continuity.sh"
 bash "${root}/hack/verify-phase9-link-fault.sh"
 bash "${root}/hack/verify-phase9-capture.sh"
 bash "${root}/hack/verify-phase9-negative-evidence.sh"
+bash "${root}/hack/verify-phase9-runtime-image-id.sh"
 overlay=${root}/deploy/kind-encryption-phase9
 
 bash -n "${gate}"
 kubectl kustomize "${overlay}" >/dev/null
+kubectl kustomize "${overlay}" | rg -q 'memory: 2Gi'
 
 require() {
     rg -q "$1" "$2" || {

@@ -316,10 +316,11 @@ images_json=$("${kc[@]}" -n unf-system get pods -o json | jq -c '
      | select(.name == $spec.name and (.name == "agent" or .name == "controller"))
      | {pod:$pod,node:$node,component:.name,image:$spec.image,imageID:.imageID,ready:.ready,restarts:.restartCount}]
     | sort_by(.component,.node)')
-jq -e 'length == 4 and all(.[];
+jq -L "${project_root}/hack" -e 'include "phase9-qualification";
+    length == 4 and all(.[];
     .ready == true and .restarts == 0
     and (.image | test("@sha256:|:[A-Za-z0-9._-]+$"))
-    and (.imageID | startswith("sha256:")))' <<<"${images_json}" >/dev/null || {
+    and phase9_runtime_image_id_valid)' <<<"${images_json}" >/dev/null || {
     echo "controller/agent Pods do not expose one healthy immutable runtime tuple" >&2
     exit 1
 }
