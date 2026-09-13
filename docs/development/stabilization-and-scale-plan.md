@@ -73,6 +73,10 @@ index reuse. Setup/observer/initial Kind IPv4 failures remain recorded. This
 does not activate UNF locality or close S1–S5. Kind's final retained CRI review
 spans 160,765,444 bytes; log amplification remains a measured-volume finding,
 not a measured CPU, memory or throughput result.
+ADR 0347 adds bounded, nonce/current-cut-fenced locality placement distribution
+at the controller/wire boundary, with 797 local tests passing. The size check
+uses a counting writer, but serialization/copying still require measurement.
+No agent polling or live packet admission is introduced; S1–S5 remain open.
 
 Repair evidence is retained chronologically in the ADRs:
 

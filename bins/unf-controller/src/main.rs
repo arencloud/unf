@@ -1,3 +1,5 @@
+mod encryption_locality;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -1654,6 +1656,10 @@ async fn spawn_internal_api(
             post(ingest_encryption_admitted_generation_fact),
         )
         .route("/v1/state/encryption-plan", post(encryption_plan))
+        .route(
+            "/v1/state/encryption-locality",
+            post(encryption_locality::snapshot),
+        )
         .route(
             "/v1/state/encryption-key-bootstrap",
             get(encryption_key_bootstrap),
@@ -17708,6 +17714,137 @@ mod tests {
             write_lock(&state.pods).insert(format!("{namespace}/{app}"), pod);
         }
         (state, agent)
+    }
+
+    fn locality_distribution_test_state() -> (
+        ControllerState,
+        AuthenticatedAgent,
+        unf_encryption::EncryptionLocalityRequest,
+    ) {
+        let (state, agent) = native_plan_test_state();
+        for (key, pod) in read_lock(&state.pods)
+            .iter()
+            .filter(|(_, pod)| !pod.host_network)
+        {
+            mutex_lock(&state.identities)
+                .admit_pod(
+                    key.clone(),
+                    key.clone(),
+                    &NetworkIdentity {
+                        id: pod.endpoint.identity,
+                        cluster: "local".into(),
+                        namespace: pod.namespace.clone(),
+                        workload: pod.name.clone(),
+                        service_account: pod.endpoint.service_account.clone(),
+                        application: pod.endpoint.application.clone(),
+                        labels: pod.endpoint.labels.clone(),
+                    },
+                    pod.ipv4_addresses.iter().copied().map(IpAddr::V4),
+                )
+                .unwrap();
+        }
+        let (membership_revision, members) = encryption_generation_membership(&state).unwrap();
+        let request = unf_encryption::EncryptionLocalityRequest::issue(
+            unf_encryption::EncryptionLocalityContext {
+                cluster_id: state.encryption_cluster_id.clone(),
+                recipient: members[0].clone(),
+                membership_revision,
+                identity_epoch: state.identity_epoch,
+                identity_revision: mutex_lock(&state.identities).revision(),
+                routing_revision: mutex_lock(&state.revisions).routing,
+            },
+        )
+        .unwrap();
+        (state, agent, request)
+    }
+
+    #[test]
+    fn locality_distribution_is_current_agent_and_node_incarnation_scoped() {
+        let (state, agent, request) = locality_distribution_test_state();
+        let response = encryption_locality::snapshot_for(&state, &agent, &request).unwrap();
+        let verified = unf_encryption::EncryptionLocalityResponse::decode_authenticated(
+            &serde_json::to_vec(&response).unwrap(),
+            &request,
+            &request.context,
+        )
+        .unwrap();
+        assert_eq!(verified.certificate().addresses().len(), 2);
+        assert!(request_requires_authority_materialization(
+            &Request::builder()
+                .method("POST")
+                .uri("/v1/state/encryption-locality")
+                .body(Body::empty())
+                .unwrap()
+        ));
+        for mutation in 0..4 {
+            let mut foreign = request.clone();
+            match mutation {
+                0 => foreign.context.cluster_id.push('x'),
+                1 => foreign.context.recipient.node_name.push('x'),
+                2 => foreign.context.recipient.node_uid.push('x'),
+                _ => foreign.context.identity_epoch += 1,
+            }
+            assert_eq!(
+                encryption_locality::snapshot_for(&state, &agent, &foreign)
+                    .unwrap_err()
+                    .status,
+                if mutation == 3 {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::FORBIDDEN
+                }
+            );
+        }
+        write_lock(&state.pods)
+            .get_mut(&format!("{}/{}", agent.namespace, agent.pod_name))
+            .unwrap()
+            .uid
+            .push('x');
+        assert_eq!(
+            encryption_locality::snapshot_for(&state, &agent, &request)
+                .unwrap_err()
+                .status,
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn locality_distribution_rejects_unready_stale_and_inconsistent_cuts() {
+        for mutation in 0..7 {
+            let (state, agent, request) = locality_distribution_test_state();
+            match mutation {
+                0 => state.ready.store(false, Ordering::Release),
+                1 => mutex_lock(&state.identities).clear(),
+                2 => mutex_lock(&state.revisions).routing = Revision::new(99),
+                3 => {
+                    write_lock(&state.node_blocks)
+                        .get_mut(&agent.node_name)
+                        .unwrap()
+                        .node_uid
+                        .push('x');
+                }
+                4 => {
+                    write_lock(&state.nodes)
+                        .get_mut(&agent.node_name)
+                        .unwrap()
+                        .ready = false;
+                }
+                5 => {
+                    write_lock(&state.node_blocks).remove(&agent.node_name);
+                }
+                _ => {
+                    write_lock(&state.node_port_nodes)
+                        .get_mut(&agent.node_name)
+                        .unwrap()
+                        .node_uid
+                        .push('x');
+                }
+            }
+            assert!(
+                encryption_locality::snapshot_for(&state, &agent, &request).is_err(),
+                "mutation {mutation}"
+            );
+        }
     }
 
     #[test]

@@ -294,7 +294,9 @@ impl VerifiedEncryptionLocality {
     }
 }
 
-fn validate_context(context: &EncryptionLocalityContext) -> Result<(), EncryptionLocalityError> {
+pub(super) fn validate_context(
+    context: &EncryptionLocalityContext,
+) -> Result<(), EncryptionLocalityError> {
     if !crate::validate_text(&context.cluster_id)
         || !crate::validate_text(&context.recipient.node_name)
         || !crate::validate_text(&context.recipient.node_uid)

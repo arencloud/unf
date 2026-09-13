@@ -629,6 +629,10 @@ ADR 0346 verifies the identical revised image on retained Kind, with exact
 device-lifetime statistics, valid return routes under private-interface RPF=2,
 cleanup and full convergence. The target-device primitive is verified on both
 platforms; authenticated/banked locality consumption and S1–S5 remain open.
+ADR 0347 adds the locally verified nonce-bound locality controller endpoint and
+bounded replay wire contract (797 passing workspace tests, 26 ignored).
+Agent fetch, kernel admission and platform qualification remain pending;
+live runtime and Phase 9/stabilization verification states are unchanged.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

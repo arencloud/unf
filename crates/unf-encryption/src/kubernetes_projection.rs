@@ -74,7 +74,8 @@ pub fn project_kubernetes_encryption_placement(
     project_placement_facts(cluster_id, &mut nodes, &mut workloads)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct KubernetesEncryptionNodeSnapshot {
     pub name: String,
     pub uid: String,
@@ -84,7 +85,8 @@ pub struct KubernetesEncryptionNodeSnapshot {
     pub underlay_addresses: Vec<IpAddr>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct KubernetesEncryptionWorkloadSnapshot {
     pub workload_uid: String,
     pub identity: IdentityId,
