@@ -2,7 +2,7 @@
 
 Date: 2026-09-13
 
-Status: candidate published; rollout and ordered platform tests pending
+Status: staged cl02 deployment and focused Native gate passed; Kind pending
 
 ## Immutable candidate
 
@@ -21,6 +21,29 @@ older passes are not transferred to it. The controller keeps its 2-CPU/2-GiB
 ceiling. No map ABI, wire schema, crypto or key lifetime changes are introduced.
 The build uses the isolated temporary image store, without pruning user images
 or rebalancing the host filesystem. Credentials remain ignored and mode 0600.
+
+## cl02 result and remaining platform failure
+
+Qualifier `31ce13a19e1f4be974f9cc59b70f50da133feadb` passes the controller-first,
+node-serial deployment with all five agents converged and kube-proxy absent.
+The focused Native gate then passes all 16 allowed cases and eight unsolicited
+reverse denials across TCP/UDP, IPv4/IPv6, PodIP/Service and same/cross-worker
+paths. Restricted non-root fixtures run without an SCC exemption. Namespace
+absence and final five-agent convergence pass. Evidence JSON SHA-256:
+`1e9242df973c866af5ab8fff6346523a0af8402e26adbc3bc268fb67d8aa758d`.
+
+This is not complete platform recovery: the original ingress-operator Pod on
+control-plane Node `bc-24-11-47-5e-1b` still times out against the DNS Service,
+direct DNS Pod on its actual port 5353 (UDP and TCP), and direct OAuth TLS
+transport. Earlier direct-DNS attempts without `-p 5353` incorrectly tested
+port 53 and cannot establish backend DNS health; the corrected-port attempts
+also fail. The OAuth transport-only probe skips certificate validation, so it
+makes no certificate-trust claim. Six unhealthy operators remain.
+
+The worker fixture pass does not close this control-plane-node/older-workload
+failure, Required locality/replica/reply coverage, or Phase 9 requalification.
+Keep those failures visible and diagnose their actual map/attachment/path state.
+No completed Kind result is claimed for this runtime yet.
 
 ## Short pre-repair cl02 sample
 
