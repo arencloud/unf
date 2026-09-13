@@ -189,6 +189,15 @@ locality/replica and return-path coverage still need separate work. Earlier
 passing runs, failed attempts, intermittent migration timeout and startup exits
 remain in the record.
 
+ADRs 0304–0305 subsequently qualify the Native recovery slice on cl02 and
+retained Kind with matching `54f5511` images and no state reset. Continuity
+remains open: ADR 0308 records ten of 208 failed fresh connections; ADRs
+0309–0310 eliminate empty-namespace policy invalidation but the `42907aa`
+cl02 window still loses one of 232 connections with stable revision 468.
+All-Pod logs and public journals were inspected; no ERROR/restart or durable
+generation mismatch explains that sample. Preserve both failed windows and
+instrument the packet path before proceeding to Kind or claiming closure.
+
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
 commit/push and evidence record for every step. Four of the six initially

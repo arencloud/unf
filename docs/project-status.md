@@ -587,6 +587,15 @@ dependencies remain fenced. Local verification is 747 workspace tests plus
 strict Clippy/format checks. Immutable cl02-first continuity qualification is
 pending; no resource-saving or Phase 9 completion claim is made yet.
 
+ADR 0310 records candidate `42907aa` passing cl02 deployment and the original
+24 allows/eight denials, but failing one of 232 continuity connections. Policy
+revision remained 468 and four invalidations were skipped; the optimization
+works without closing the remaining interruption. Public journals matched
+across five Nodes, and all-Pod log review found no ERROR entries or restarts,
+but existing policy/named-port rejections and encryption retries remain visible.
+Both fixture namespaces were removed. Kind is unchanged; precise failure-path
+diagnostics are next, not a Phase 9 or heavy-load completion claim.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.

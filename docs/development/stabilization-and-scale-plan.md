@@ -13,8 +13,10 @@ Phase 9 lifecycle and heavy-load stabilization are still unverified.
 
 The next continuity slice failed on cl02 (ADR 0308: 10/208 fresh connections).
 ADR 0309 implements dependency-aware namespace invalidation and an observable
-skipped-work counter; local regressions pass, live qualification is pending.
-Do not run this repaired slice on Kind before cl02 passes.
+skipped-work counter; local regressions pass. ADR 0310's cl02 rollout and
+24-allow/eight-denial gate pass, but continuity fails one of 232 connections
+despite stable policy revision and four skipped invalidations. Capture the
+remaining exact failure path; do not upgrade Kind before cl02 passes.
 
 S2 profiling lead, not an attributed CPU result: `policy_snapshot` calls
 `dataplane_policy_state` for every authenticated pull; the latter clones the
