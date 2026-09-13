@@ -57,6 +57,9 @@ pending; holding namespace FDs does not pin device placement or close L3.
 ADR 0356 verifies its complete isolated cl02 fixture; matching Kind is next.
 ADR 0357 verifies the identical retained-Kind fixture and complete log/state
 audit. Both snapshot prerequisites pass; continuous packet-time proof is next.
+ADR 0358 investigates a separate drop-only TC program reading current device/
+peer namespace cookies against independent socket observations. This is not
+yet kernel-qualified or production authority; cl02 must precede matching Kind.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

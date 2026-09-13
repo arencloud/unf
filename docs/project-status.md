@@ -676,6 +676,10 @@ ADR 0357 verifies the identical held-namespace fixture on retained Kind, with
 all thirteen checks, cleanup, current/rotated log review and full convergence.
 Both platform snapshot prerequisites pass; continuous packet-time authority
 and consuming locality remain open alongside full Phase 9 and S1–S5.
+ADR 0358 begins an isolated packet-time device/peer namespace readback
+investigation with a separate drop-only BPF object and checked running-kernel
+layout. Local compilation and positive/22-negative decoder checks pass;
+cl02 verifier/runtime qualification is pending. No live map or packet changes.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

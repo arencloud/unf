@@ -5,6 +5,7 @@
 .tools/
 .artifacts/*
 !.artifacts/unf-ebpf-tc
+!.artifacts/unf-device-observation
 target/
 ebpf/unf-ebpf-tc/target/
 docs/
@@ -13,4 +14,6 @@ hack/*
 !hack/verify-local-delivery-device-lifetime.sh
 !hack/local-delivery-device-gate.jq
 !hack/verify-veth-observation.sh
+!hack/verify-device-observation.sh
+!hack/device-observation-layout.jq
 tests/
