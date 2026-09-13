@@ -12,7 +12,7 @@ remain in ignored, owner-only local files and never enter evidence or Git.
 
 | Step | State | Required exit evidence |
 |---|---|---|
-| P9 coverage repair | In progress | ADRs 0293–0296: Native locality/reply repair passes 24 cl02 allow cases, eight reverse denials and cleanup; matching-image Kind remains pending. Four platform operators recover, but transient reachability, Required locality/replica/reply coverage and full lifecycle requalification remain open |
+| P9 coverage repair | In progress | ADRs 0293–0296: Native locality/reply repair passes 24 cl02 allow cases, eight reverse denials and cleanup; four platform operators recover. Matching-image Kind exposes a mixed-cursor/lost-predecessor-receipt recovery gap (ADR 0297). Repair it cl02-first, then recover retained Kind state. Continuity, Required locality/replica/reply coverage and full lifecycle qualification remain open |
 | S1 baseline and budgets | In progress | Attribute internal DNS/Pod-endpoint failures and operator health first; feature/limit inventory; hardware/kernel/MTU/offloads, endpoints/policies/services/flows; idle/loaded CPU, RSS/cgroup peak, BPF memory, throughput, latency percentiles, convergence |
 | S2 control-plane scale | Pending | Profile policy compilation, snapshots, informer churn and agent pulls; remove measured repeated work; bound queues/caches; compare equal input and churn fixtures before/after |
 | S3 agent and dataplane efficiency | Pending | Map occupancy/update work, connection creation/expiry, telemetry backpressure, Service selection, encryption and egress under mixed dual-stack load; policy correctness and bounded recovery |
