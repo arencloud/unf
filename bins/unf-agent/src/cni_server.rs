@@ -192,9 +192,21 @@ async fn handle_request(input: &[u8], journal: &Mutex<AttachmentJournal>) -> Tra
         }
     };
     let mut journal = journal.lock().await;
+    let schema_version = request.schema_version();
     match journal.apply(request) {
         Ok(response) => response,
-        Err(error) => journal_error_response(&error),
+        Err(error) => {
+            let mut response = journal_error_response(&error);
+            if matches!(
+                schema_version,
+                unf_cni_state::LEGACY_CNI_TRANSACTION_SCHEMA_VERSION
+                    | unf_cni_state::UID_CNI_TRANSACTION_SCHEMA_VERSION
+                    | unf_cni_state::CNI_TRANSACTION_SCHEMA_VERSION
+            ) {
+                response.schema_version = schema_version;
+            }
+            response
+        }
     }
 }
 
@@ -371,6 +383,62 @@ mod tests {
             netns: "/run/netns/container-1".to_owned(),
             mtu: 1_500,
             workload_uid: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn supported_legacy_requests_receive_readable_errors_without_new_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal = Mutex::new(
+            AttachmentJournal::open(directory.path().join("attachments.json"), provider()).unwrap(),
+        );
+        for version in [2, 3, 4] {
+            let input = serde_json::to_vec(&TransactionRequest::new(
+                version,
+                TransactionOperation::Check { attachment: spec() },
+            ))
+            .unwrap();
+            let response = handle_request(&input, &journal).await;
+            assert_eq!(response.schema_version, version);
+            assert!(matches!(
+                response.outcome,
+                TransactionOutcome::Error {
+                    code: TransactionErrorCode::NotFound,
+                    ..
+                }
+            ));
+        }
+        let mut bound = spec();
+        bound.workload_uid = Some("pod-uid-a".into());
+        let input = request(TransactionOperation::Prepare {
+            attachment: bound.clone(),
+        });
+        assert!(matches!(
+            handle_request(&input, &journal).await.outcome,
+            TransactionOutcome::Ok { .. }
+        ));
+        for version in [2, 3] {
+            let input = serde_json::to_vec(&TransactionRequest::new(
+                version,
+                TransactionOperation::Inspect {
+                    key: bound.key.clone(),
+                },
+            ))
+            .unwrap();
+            let response = handle_request(&input, &journal).await;
+            assert_eq!(response.schema_version, version);
+            assert!(matches!(
+                response.outcome,
+                TransactionOutcome::Error {
+                    code: TransactionErrorCode::IncompatibleSchema,
+                    ..
+                }
+            ));
+            assert!(
+                !serde_json::to_string(&response)
+                    .unwrap()
+                    .contains("creationToken")
+            );
         }
     }
 

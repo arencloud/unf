@@ -19,7 +19,7 @@ use rustix::fs::{Mode, OFlags, open};
 use rustix::thread::{LinkNameSpaceType, move_into_link_name_space};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use unf_cni_state::{AttachmentRecord, valid_workload_uid};
+use unf_cni_state::{AttachmentPhase, AttachmentRecord, valid_workload_uid};
 
 const LINUX_INTERFACE_NAME_MAX: usize = 15;
 const MIN_DUAL_STACK_MTU: u32 = 1_280;
@@ -47,6 +47,7 @@ pub struct VethPlan {
     netns: PathBuf,
     mtu: u32,
     addresses: [AssignedAddress; 2],
+    recover_pending_creation: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -163,6 +164,11 @@ impl VethPlan {
                 },
             ],
         )?;
+        if record.creation_token.is_some() && record.spec.workload_uid.is_none() {
+            return Err(LinkError::InvalidPlan(
+                "creation nonce requires workload UID".to_owned(),
+            ));
+        }
         if let Some(uid) = &record.spec.workload_uid {
             if !valid_workload_uid(uid) {
                 return Err(LinkError::InvalidPlan("invalid workload UID".to_owned()));
@@ -171,7 +177,15 @@ impl VethPlan {
             // incarnation. Both kernel aliases are independently read back by
             // the existing apply/CHECK/delete ownership checks.
             let mut digest = Sha256::new();
-            digest.update(b"unf.cni-workload-owner.v2\0");
+            if let Some(token) = record.creation_token {
+                if token == [0; 32] {
+                    return Err(LinkError::InvalidPlan("zero creation nonce".to_owned()));
+                }
+                digest.update(b"unf.cni-workload-owner.v3\0");
+                digest.update(token);
+            } else {
+                digest.update(b"unf.cni-workload-owner.v2\0");
+            }
             for value in [
                 &record.spec.key.network,
                 &record.spec.key.container_id,
@@ -182,8 +196,31 @@ impl VethPlan {
                 digest.update([0]);
             }
             let cookie = digest.finalize();
-            plan.host_alias = format!("unf:cni:v2:{}:{cookie:x}:host", plan.host_name);
-            plan.peer_alias = format!("unf:cni:v2:{}:{cookie:x}:peer", plan.host_name);
+            let version = if record.creation_token.is_some() {
+                3
+            } else {
+                2
+            };
+            plan.host_alias = format!("unf:cni:v{version}:{}:{cookie:x}:host", plan.host_name);
+            plan.peer_alias = format!("unf:cni:v{version}:{}:{cookie:x}:peer", plan.host_name);
+            if record.creation_token.is_some() {
+                plan.host_address.copy_from_slice(&cookie[..6]);
+                plan.peer_address.copy_from_slice(&cookie[6..12]);
+                // Distinct locally administered unicast MAC roles: 45 bits
+                // each, plus an independent 48-bit temporary peer name.
+                plan.host_address[0] = (plan.host_address[0] & 0xf8) | 0x02;
+                plan.peer_address[0] = (plan.peer_address[0] & 0xf8) | 0x06;
+                let hex = format!("{cookie:x}");
+                plan.temporary_peer_name = format!("unp{}", &hex[24..36]);
+                if plan.temporary_peer_name == plan.host_name
+                    || plan.temporary_peer_name == plan.container_name
+                {
+                    return Err(LinkError::InvalidPlan(
+                        "creation peer name collides with an endpoint".to_owned(),
+                    ));
+                }
+                plan.recover_pending_creation = record.phase != AttachmentPhase::Ready;
+            }
         }
         Ok(plan)
     }
@@ -244,6 +281,7 @@ impl VethPlan {
             netns,
             mtu,
             addresses,
+            recover_pending_creation: false,
         })
     }
 
@@ -260,6 +298,18 @@ impl VethPlan {
     #[must_use]
     pub fn container_name(&self) -> &str {
         &self.container_name
+    }
+
+    /// Expected public creation markers, not independently observed ownership.
+    #[must_use]
+    pub const fn hardware_addresses(&self) -> ([u8; 6], [u8; 6]) {
+        (self.host_address, self.peer_address)
+    }
+
+    /// Expected aliases; callers must independently read them back from Linux.
+    #[must_use]
+    pub fn ownership_aliases(&self) -> (&str, &str) {
+        (&self.host_alias, &self.peer_alias)
     }
 
     #[must_use]
@@ -306,9 +356,11 @@ impl VethPlan {
 
     async fn ensure_host(&self, handle: &Handle) -> Result<(), LinkError> {
         let host = find_link(handle, &self.host_name).await?;
-        if let Some(ref link) = host {
+        if host.is_some() {
+            self.seal_pending_creation(handle).await?;
+            let link = require_link(handle, &self.host_name).await?;
             validate_recoverable_link(
-                link,
+                &link,
                 &self.host_name,
                 &self.host_alias,
                 self.mtu,
@@ -346,7 +398,7 @@ impl VethPlan {
                     operation: "create veth",
                     source,
                 })?;
-            if self.host_alias.starts_with("unf:cni:v2:") {
+            if !self.host_alias.starts_with(OWNER_PREFIX) {
                 self.seal_just_created_pair(handle).await?;
             }
         }
@@ -377,8 +429,8 @@ impl VethPlan {
     }
 
     // Some kernels do not retain IFLA_IFALIAS from RTM_NEWLINK. Only the
-    // successful exclusive creator may seal that initially unaliased pair.
-    // Existing-link recovery must never call this path or infer this receipt.
+    // successful exclusive creator, or nonce-bound pending-pair replay, may
+    // seal that initially unaliased pair. Ordinary drift recovery cannot.
     async fn seal_just_created_pair(&self, handle: &Handle) -> Result<(), LinkError> {
         let host = require_link(handle, &self.host_name).await?;
         let peer = require_link(handle, &self.temporary_peer_name).await?;
@@ -422,6 +474,28 @@ impl VethPlan {
             self.mtu,
             self.peer_address,
         )
+    }
+
+    async fn seal_pending_creation(&self, handle: &Handle) -> Result<(), LinkError> {
+        if !self.recover_pending_creation {
+            return Ok(());
+        }
+        let Some(host) = find_link(handle, &self.host_name).await? else {
+            return Ok(());
+        };
+        let Some(peer) = find_link(handle, &self.temporary_peer_name).await? else {
+            return Ok(());
+        };
+        // Full journal nonce derives both independent MACs and this temporary
+        // name. Only a down reciprocal pair still in the creation namespace
+        // can recover; a moved/up/Ready endpoint is never reclassified.
+        if link_alias(&host) == Some(self.host_alias.as_str())
+            && link_alias(&peer) == Some(self.peer_alias.as_str())
+        {
+            return Ok(());
+        }
+        validate_created_pair(self, &host, &peer)?;
+        self.seal_just_created_pair(handle).await
     }
 
     async fn move_temporary_peer(
@@ -518,6 +592,7 @@ impl VethPlan {
                 source,
             })?;
         tokio::spawn(connection);
+        self.seal_pending_creation(&handle).await?;
         let host_index = if let Some(host) = find_link(&handle, &self.host_name).await? {
             validate_recoverable_link(
                 &host,
@@ -587,6 +662,7 @@ impl VethPlan {
                 source,
             })?;
         tokio::spawn(connection);
+        self.seal_pending_creation(&handle).await?;
         if let Some(host) = find_link(&handle, &self.host_name).await? {
             validate_recoverable_link(
                 &host,
@@ -1781,7 +1857,7 @@ fn validate_recoverable_link(
         ));
     }
     if link_alias(link).is_some_and(|alias| alias != expected_alias)
-        || (expected_alias.starts_with("unf:cni:v2:") && link_alias(link).is_none())
+        || (!expected_alias.starts_with(OWNER_PREFIX) && link_alias(link).is_none())
     {
         return Err(conflict(
             expected_name,
@@ -2060,6 +2136,7 @@ mod tests {
                 },
             },
             phase: AttachmentPhase::Preparing,
+            creation_token: None,
         }
     }
 
@@ -2095,6 +2172,46 @@ mod tests {
             assert_ne!(changed.peer_alias, bound.peer_alias);
         }
         record.spec.workload_uid = Some("invalid/uid".into());
+        assert!(VethPlan::from_attachment(&record).is_err());
+    }
+
+    #[test]
+    fn durable_creation_nonce_binds_independent_kernel_markers_and_recovery_phase() {
+        let mut record = attachment();
+        record.spec.workload_uid = Some("pod-a".into());
+        record.creation_token = Some([7; 32]);
+        let first = VethPlan::from_attachment(&record).unwrap();
+        assert!(first.recover_pending_creation);
+        assert!(first.host_alias.starts_with("unf:cni:v3:"));
+        assert_eq!(first.temporary_peer_name.len(), 15);
+        assert_ne!(first.host_address, first.peer_address);
+        assert_eq!(first.host_address[0] & 3, 2);
+        assert_eq!(first.peer_address[0] & 3, 2);
+        for phase in [
+            AttachmentPhase::Preparing,
+            AttachmentPhase::Aborting,
+            AttachmentPhase::Deleting,
+            AttachmentPhase::Ready,
+        ] {
+            record.phase = phase;
+            let plan = VethPlan::from_attachment(&record).unwrap();
+            assert_eq!(plan.host_alias, first.host_alias);
+            assert_eq!(plan.hardware_addresses(), first.hardware_addresses());
+            assert_eq!(
+                plan.recover_pending_creation,
+                phase != AttachmentPhase::Ready
+            );
+        }
+        record.creation_token = Some([8; 32]);
+        let next = VethPlan::from_attachment(&record).unwrap();
+        assert_ne!(next.host_alias, first.host_alias);
+        assert_ne!(next.host_address, first.host_address);
+        assert_ne!(next.peer_address, first.peer_address);
+        assert_ne!(next.temporary_peer_name, first.temporary_peer_name);
+        record.creation_token = Some([0; 32]);
+        assert!(VethPlan::from_attachment(&record).is_err());
+        record.creation_token = Some([7; 32]);
+        record.spec.workload_uid = None;
         assert!(VethPlan::from_attachment(&record).is_err());
     }
 

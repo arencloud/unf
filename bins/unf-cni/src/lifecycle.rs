@@ -678,7 +678,7 @@ fn operation_result<T: TransactionApi>(
             attachment,
             attachments,
             ..
-        } => Ok((attachment, attachments)),
+        } => Ok((attachment.map(|record| *record), attachments)),
         TransactionOutcome::Error { code, message } => {
             Err(transaction_error(version, code, &message))
         }
@@ -948,6 +948,7 @@ mod tests {
                 },
             },
             phase: AttachmentPhase::Ready,
+            creation_token: None,
         };
         let links = LinkReadback {
             host_index: 4,

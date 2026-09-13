@@ -48,6 +48,9 @@ cl02 after a creation-only alias seal repair. The full workspace passes 779
 tests. ADR 0329 verifies the identical isolated image on retained Kind. Both
 live CNI installations remain unchanged; interrupted-creation recovery, live
 rollout and the actual locality consumer are still pending.
+ADR 0330 implements a versioned, durable nonce and exact pending-pair recovery
+for interrupted creation; all 784 workspace tests and strict Clippy pass.
+The expanded cl02 and matching Kind qualification remain pending.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

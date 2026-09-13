@@ -42,12 +42,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             netns: environment.netns.ok_or("missing CNI_NETNS")?,
             mtu: 1_400,
-            workload_uid: None,
+            workload_uid: env::var("UNF_CNI_TEST_WORKLOAD_UID")
+                .ok()
+                .map(String::into_boxed_str),
         };
+        let key = attachment.key.clone();
         transaction.0.apply(TransactionRequest::new(
             CNI_TRANSACTION_SCHEMA_VERSION,
             TransactionOperation::Prepare { attachment },
         ))?;
+        if env::var_os("UNF_CNI_TEST_CREATION_PLAN").is_some() {
+            let record = transaction
+                .0
+                .get(&key)
+                .ok_or("missing prepared attachment")?;
+            let plan = unf_link::VethPlan::from_attachment(record)?;
+            let (host, peer) = plan.hardware_addresses();
+            let (host_alias, peer_alias) = plan.ownership_aliases();
+            emit(&serde_json::json!({
+                "hostName":plan.host_name(), "peerName":plan.temporary_peer_name(),
+                "hostMac":mac(host), "peerMac":mac(peer),
+                "hostAlias":host_alias, "peerAlias":peer_alias,
+            }))?;
+        }
         return Ok(());
     }
 
@@ -76,4 +93,11 @@ fn emit(value: &impl Serialize) -> Result<(), Box<dyn std::error::Error>> {
     serde_json::to_writer(io::stdout(), value)?;
     println!();
     Ok(())
+}
+
+fn mac(address: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        address[0], address[1], address[2], address[3], address[4], address[5]
+    )
 }

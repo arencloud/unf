@@ -1,6 +1,151 @@
 use super::*;
 
 #[test]
+fn creation_nonce_is_durable_unique_and_cannot_be_downgraded() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attachments.json");
+    let mut journal = AttachmentJournal::open(&path, provider()).unwrap();
+    let mut bound = spec("container-1");
+    bound.workload_uid = Some("pod-a".into());
+    journal
+        .apply(request(TransactionOperation::Prepare {
+            attachment: bound.clone(),
+        }))
+        .unwrap();
+    let first = journal.get(&bound.key).unwrap().creation_token.unwrap();
+    assert_ne!(first, [0; 32]);
+    let bytes = fs::read(&path).unwrap();
+    let mut reopened = AttachmentJournal::open(&path, provider()).unwrap();
+    reopened
+        .apply(request(TransactionOperation::Prepare {
+            attachment: bound.clone(),
+        }))
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        reopened.get(&bound.key).unwrap().creation_token,
+        Some(first)
+    );
+    for version in [2, 3] {
+        for operation in [
+            TransactionOperation::Inspect {
+                key: bound.key.clone(),
+            },
+            TransactionOperation::BeginDelete {
+                key: bound.key.clone(),
+            },
+            TransactionOperation::List {
+                network: bound.key.network.clone(),
+                after: None,
+                limit: 8,
+            },
+        ] {
+            assert!(matches!(
+                reopened.apply(TransactionRequest::new(version, operation)),
+                Err(JournalError::IncompatibleSchema { .. })
+            ));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+    reopened
+        .apply(request(TransactionOperation::BeginAbort {
+            key: bound.key.clone(),
+        }))
+        .unwrap();
+    reopened
+        .apply(request(TransactionOperation::CompleteAbort {
+            key: bound.key.clone(),
+        }))
+        .unwrap();
+    reopened
+        .apply(request(TransactionOperation::Prepare {
+            attachment: bound.clone(),
+        }))
+        .unwrap();
+    assert_ne!(
+        reopened.get(&bound.key).unwrap().creation_token,
+        Some(first)
+    );
+    assert_eq!(
+        reopened.get(&bound.key).unwrap().lease,
+        journal.get(&bound.key).unwrap().lease
+    );
+    let mut document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(document["schemaVersion"], 4);
+    for version in [2, 3] {
+        document["schemaVersion"] = version.into();
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(AttachmentJournal::open(&path, provider()).is_err());
+    }
+}
+
+#[test]
+fn persisted_creation_nonce_rejects_zero_duplicates_and_unbound_owners() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attachments.json");
+    let mut journal = AttachmentJournal::open(&path, provider()).unwrap();
+    for container in ["container-1", "container-2"] {
+        let mut bound = spec(container);
+        bound.workload_uid = Some(container.into());
+        journal
+            .apply(request(TransactionOperation::Prepare { attachment: bound }))
+            .unwrap();
+    }
+    let original: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for mutation in 0..3 {
+        let mut document = original.clone();
+        match mutation {
+            0 => {
+                document["attachments"][0]["creationToken"] =
+                    serde_json::to_value([0_u8; 32]).unwrap();
+            }
+            1 => {
+                document["attachments"][1]["creationToken"] =
+                    document["attachments"][0]["creationToken"].clone();
+            }
+            _ => document["attachments"][0]["spec"]["workloadUid"] = serde_json::Value::Null,
+        }
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(matches!(
+            AttachmentJournal::open(&path, provider()),
+            Err(JournalError::Invalid(_))
+        ));
+    }
+}
+
+#[test]
+fn schema_three_uid_record_keeps_its_original_markers_after_upgrade() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attachments.json");
+    let mut journal = AttachmentJournal::open(&path, provider()).unwrap();
+    let mut bound = spec("container-1");
+    bound.workload_uid = Some("pod-a".into());
+    let response = journal
+        .apply(TransactionRequest::new(
+            3,
+            TransactionOperation::Prepare {
+                attachment: bound.clone(),
+            },
+        ))
+        .unwrap();
+    assert_eq!(response.schema_version, 3);
+    assert!(journal.get(&bound.key).unwrap().creation_token.is_none());
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["schemaVersion"],
+        3
+    );
+    let mut reopened = AttachmentJournal::open(&path, provider()).unwrap();
+    reopened
+        .apply(request(TransactionOperation::Prepare {
+            attachment: bound.clone(),
+        }))
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(reopened.get(&bound.key).unwrap().creation_token.is_none());
+}
+
+#[test]
 fn incarnation_survives_restart_and_rejects_replacement_or_omission() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("attachments.json");

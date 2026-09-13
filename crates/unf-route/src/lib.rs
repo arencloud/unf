@@ -542,6 +542,7 @@ mod tests {
                 },
             },
             phase: AttachmentPhase::Preparing,
+            creation_token: None,
         }
     }
 

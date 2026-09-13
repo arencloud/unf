@@ -951,6 +951,7 @@ mod tests {
                 },
             },
             phase: AttachmentPhase::Preparing,
+            creation_token: None,
         };
         let links = VethPlan::from_attachment(&attachment).expect("valid link plan");
         let link_state = links.apply().await.expect("link apply");

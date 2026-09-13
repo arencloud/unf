@@ -8,12 +8,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_ipam::{DualStackLease, IpamError, IpamProvider, NodeBlockProvider, UsedAddresses};
 
-pub const CNI_TRANSACTION_SCHEMA_VERSION: u16 = 3;
+pub const CNI_TRANSACTION_SCHEMA_VERSION: u16 = 4;
+pub const UID_CNI_TRANSACTION_SCHEMA_VERSION: u16 = 3;
 pub const LEGACY_CNI_TRANSACTION_SCHEMA_VERSION: u16 = 2;
 pub const MAX_TRANSACTION_MESSAGE_BYTES: usize = 65_536;
 pub const MAX_ATTACHMENT_LIST_RECORDS: u16 = 8;
 
-const ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 3;
+const ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 4;
+const UID_ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 3;
 const UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 2;
 const LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 1;
 
@@ -79,6 +81,10 @@ pub struct AttachmentRecord {
     pub host_interface: String,
     pub lease: DualStackLease,
     pub phase: AttachmentPhase,
+    /// One-time public creation nonce, generated and persisted before any link
+    /// creation. Not a credential or authorization to admit plaintext.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creation_token: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -217,7 +223,8 @@ impl TransactionRequest {
         }
     }
 
-    const fn schema_version(&self) -> u16 {
+    #[must_use]
+    pub const fn schema_version(&self) -> u16 {
         match self {
             Self::Status { schema_version }
             | Self::List { schema_version, .. }
@@ -275,7 +282,7 @@ pub enum TransactionErrorCode {
 pub enum TransactionOutcome {
     #[serde(rename = "ok")]
     Ok {
-        attachment: Option<AttachmentRecord>,
+        attachment: Option<Box<AttachmentRecord>>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<AttachmentRecord>,
         attachment_count: usize,
@@ -439,7 +446,9 @@ impl AttachmentJournal {
         let schema_version = request.schema_version();
         if !matches!(
             schema_version,
-            CNI_TRANSACTION_SCHEMA_VERSION | LEGACY_CNI_TRANSACTION_SCHEMA_VERSION
+            CNI_TRANSACTION_SCHEMA_VERSION
+                | UID_CNI_TRANSACTION_SCHEMA_VERSION
+                | LEGACY_CNI_TRANSACTION_SCHEMA_VERSION
         ) {
             return Err(JournalError::IncompatibleSchema {
                 actual: request.schema_version(),
@@ -448,8 +457,8 @@ impl AttachmentJournal {
         }
 
         let operation = request.into_operation();
-        if schema_version == LEGACY_CNI_TRANSACTION_SCHEMA_VERSION {
-            self.validate_legacy_operation(&operation)?;
+        if schema_version != CNI_TRANSACTION_SCHEMA_VERSION {
+            self.validate_legacy_operation(schema_version, &operation)?;
         }
 
         let previous = self.attachments.clone();
@@ -493,7 +502,7 @@ impl AttachmentJournal {
             }
             TransactionOperation::Prepare { attachment } => {
                 validate_spec(&attachment)?;
-                (Some(self.prepare(attachment)?), Vec::new())
+                (Some(self.prepare(attachment, schema_version)?), Vec::new())
             }
             TransactionOperation::Commit { key } => {
                 validate_key(&key)?;
@@ -530,7 +539,7 @@ impl AttachmentJournal {
         Ok(TransactionResponse {
             schema_version,
             outcome: TransactionOutcome::Ok {
-                attachment,
+                attachment: attachment.map(Box::new),
                 attachments,
                 attachment_count: self.attachments.len(),
             },
@@ -540,8 +549,14 @@ impl AttachmentJournal {
     // Never hide a binding from an old reader or let an old writer mutate it.
     fn validate_legacy_operation(
         &self,
+        schema_version: u16,
         operation: &TransactionOperation,
     ) -> Result<(), JournalError> {
+        let unreadable = |record: &AttachmentRecord| {
+            record.creation_token.is_some()
+                || (schema_version == LEGACY_CNI_TRANSACTION_SCHEMA_VERSION
+                    && record.spec.workload_uid.is_some())
+        };
         let bound = match operation {
             TransactionOperation::Status => false,
             TransactionOperation::List { network, after, .. } => {
@@ -550,35 +565,36 @@ impl AttachmentJournal {
                         && after
                             .as_ref()
                             .is_none_or(|cursor| record.spec.key > *cursor)
-                        && record.spec.workload_uid.is_some()
+                        && unreadable(record)
                 })
             }
             TransactionOperation::Prepare { attachment }
             | TransactionOperation::Check { attachment } => {
-                attachment.workload_uid.is_some()
-                    || self
-                        .get(&attachment.key)
-                        .is_some_and(|record| record.spec.workload_uid.is_some())
+                (schema_version == LEGACY_CNI_TRANSACTION_SCHEMA_VERSION
+                    && attachment.workload_uid.is_some())
+                    || self.get(&attachment.key).is_some_and(unreadable)
             }
             TransactionOperation::Inspect { key }
             | TransactionOperation::Commit { key }
             | TransactionOperation::BeginAbort { key }
             | TransactionOperation::CompleteAbort { key }
             | TransactionOperation::BeginDelete { key }
-            | TransactionOperation::CompleteDelete { key } => self
-                .get(key)
-                .is_some_and(|record| record.spec.workload_uid.is_some()),
+            | TransactionOperation::CompleteDelete { key } => self.get(key).is_some_and(unreadable),
         };
         if bound {
             return Err(JournalError::IncompatibleSchema {
-                actual: LEGACY_CNI_TRANSACTION_SCHEMA_VERSION,
+                actual: schema_version,
                 expected: CNI_TRANSACTION_SCHEMA_VERSION,
             });
         }
         Ok(())
     }
 
-    fn prepare(&mut self, spec: AttachmentSpec) -> Result<AttachmentRecord, JournalError> {
+    fn prepare(
+        &mut self,
+        spec: AttachmentSpec,
+        schema_version: u16,
+    ) -> Result<AttachmentRecord, JournalError> {
         if let Some(existing) = self.attachments.get(&spec.key) {
             if !existing.spec.accepts_replay(&spec) {
                 return Err(JournalError::Conflict(
@@ -607,11 +623,31 @@ impl AttachmentJournal {
         let used =
             UsedAddresses::from_leases(self.attachments.values().map(|record| record.lease))?;
         let lease = self.provider.allocate(&used)?;
+        let creation_token =
+            if schema_version == CNI_TRANSACTION_SCHEMA_VERSION && spec.workload_uid.is_some() {
+                let mut token = [0; 32];
+                getrandom::fill(&mut token)
+                    .map_err(|error| JournalError::Io(io::Error::other(error.to_string())))?;
+                if token == [0; 32]
+                    || self
+                        .attachments
+                        .values()
+                        .any(|record| record.creation_token == Some(token))
+                {
+                    return Err(JournalError::Conflict(
+                        "creation nonce must be nonzero and unique".to_owned(),
+                    ));
+                }
+                Some(token)
+            } else {
+                None
+            };
         let record = AttachmentRecord {
             spec: spec.clone(),
             host_interface,
             lease,
             phase: AttachmentPhase::Preparing,
+            creation_token,
         };
         self.attachments.insert(spec.key, record.clone());
         Ok(record)
@@ -742,9 +778,15 @@ impl AttachmentJournal {
             schema_version: if self
                 .attachments
                 .values()
-                .any(|record| record.spec.workload_uid.is_some())
+                .any(|record| record.creation_token.is_some())
             {
                 ATTACHMENT_JOURNAL_SCHEMA_VERSION
+            } else if self
+                .attachments
+                .values()
+                .any(|record| record.spec.workload_uid.is_some())
+            {
+                UID_ATTACHMENT_JOURNAL_SCHEMA_VERSION
             } else {
                 UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION
             },
@@ -785,7 +827,9 @@ fn load_document(
         .and_then(|version| u16::try_from(version).ok())
         .ok_or_else(|| JournalError::Invalid("journal schemaVersion is missing".to_owned()))?;
     match actual {
-        ATTACHMENT_JOURNAL_SCHEMA_VERSION | UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION => {
+        ATTACHMENT_JOURNAL_SCHEMA_VERSION
+        | UID_ATTACHMENT_JOURNAL_SCHEMA_VERSION
+        | UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION => {
             let document: JournalDocument = serde_json::from_value(value)?;
             if document.provider != provider {
                 return Err(JournalError::Conflict(format!(
@@ -812,7 +856,9 @@ fn validate_document(
 ) -> Result<BTreeMap<AttachmentKey, AttachmentRecord>, JournalError> {
     if !matches!(
         document.schema_version,
-        ATTACHMENT_JOURNAL_SCHEMA_VERSION | UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION
+        ATTACHMENT_JOURNAL_SCHEMA_VERSION
+            | UID_ATTACHMENT_JOURNAL_SCHEMA_VERSION
+            | UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION
     ) {
         return Err(JournalError::IncompatibleSchema {
             actual: document.schema_version,
@@ -823,7 +869,18 @@ fn validate_document(
     let mut interfaces = BTreeSet::new();
     let mut used = UsedAddresses::default();
     let mut previous_key: Option<AttachmentKey> = None;
+    let mut creation_tokens = BTreeSet::new();
     for record in document.attachments {
+        if let Some(token) = record.creation_token
+            && (document.schema_version != ATTACHMENT_JOURNAL_SCHEMA_VERSION
+                || record.spec.workload_uid.is_none()
+                || token == [0; 32]
+                || !creation_tokens.insert(token))
+        {
+            return Err(JournalError::Invalid(
+                "invalid, duplicate or unsupported creation nonce".to_owned(),
+            ));
+        }
         if document.schema_version == UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION
             && record.spec.workload_uid.is_some()
         {
@@ -879,6 +936,7 @@ fn migrate_legacy_document(
             host_interface: legacy.host_interface,
             lease,
             phase: legacy.phase,
+            creation_token: None,
         };
         attachments.insert(record.spec.key.clone(), record);
     }
@@ -1067,12 +1125,9 @@ mod tests {
         assert!(matches!(
             inspected.outcome,
             TransactionOutcome::Ok {
-                attachment: Some(AttachmentRecord {
-                    phase: AttachmentPhase::Preparing,
-                    ..
-                }),
+                attachment: Some(record),
                 ..
-            }
+            } if record.phase == AttachmentPhase::Preparing
         ));
         assert_eq!(journal.len(), 1);
 
@@ -1340,7 +1395,7 @@ mod tests {
     fn incompatible_malformed_unsorted_and_symlinked_journals_are_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let incompatible = directory.path().join("incompatible.json");
-        fs::write(&incompatible, r#"{"schemaVersion":4}"#).expect("write incompatible state");
+        fs::write(&incompatible, r#"{"schemaVersion":5}"#).expect("write incompatible state");
         assert!(matches!(
             AttachmentJournal::open(incompatible, provider()),
             Err(JournalError::IncompatibleSchema { .. })
@@ -1400,7 +1455,7 @@ mod tests {
     fn requests_and_results_have_a_stable_versioned_wire_shape() {
         let encoded =
             serde_json::to_value(request(TransactionOperation::Status)).expect("encode request");
-        assert_eq!(encoded["schemaVersion"], 3);
+        assert_eq!(encoded["schemaVersion"], 4);
         assert_eq!(encoded["operation"], "status");
         let inspect = serde_json::to_value(request(TransactionOperation::Inspect {
             key: key("container-1"),
@@ -1413,7 +1468,7 @@ mod tests {
             "root credentials required",
         );
         let encoded = serde_json::to_value(response).expect("encode response");
-        assert_eq!(encoded["schemaVersion"], 3);
+        assert_eq!(encoded["schemaVersion"], 4);
         assert_eq!(encoded["status"], "error");
         assert_eq!(encoded["code"], "unauthorized");
 

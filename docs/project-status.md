@@ -566,6 +566,9 @@ the identical isolated image on retained Kind and reviews current/rotated logs.
 Neither live CNI installation is changed; interrupted-creation recovery and
 the locality consumer remain open. No Required locality or full platform row
 is closed by this gate.
+ADR 0330 adds durable, per-creation nonce recovery for an interrupted, exact
+pending veth pair. All 784 workspace tests and strict Clippy pass; expanded
+cl02/Kind recovery qualification is pending. Live installations remain unchanged.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 

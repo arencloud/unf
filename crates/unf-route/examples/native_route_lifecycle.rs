@@ -32,6 +32,7 @@ fn attachment(host_name: String, netns: String) -> AttachmentRecord {
             },
         },
         phase: AttachmentPhase::Preparing,
+        creation_token: None,
     }
 }
 
