@@ -3,6 +3,8 @@
 .idea/
 .master-prompt/
 .tools/
+.artifacts/*
+!.artifacts/unf-ebpf-tc
 target/
 ebpf/unf-ebpf-tc/target/
 docs/
