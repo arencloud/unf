@@ -1,7 +1,7 @@
 # Phase 9 Required locality and replica closure
 
 This completes the open boundary from ADRs 0293–0294 and 0324. Existing
-`67c2772` fleets remain Native by default while this work is implemented and
+`450de80` fleets remain Native by default while this work is implemented and
 qualified. A successful scoped reply gate is not full Phase 9 closure.
 
 ## Safety and efficiency boundary
@@ -69,6 +69,10 @@ prerequisite only; it does not admit local Required plaintext or close L3.
 ADR 0338 extends staging failure checks to Kind's init installer, including
 successful-completion semantics and seven negative mutations. Matching Kind
 runtime rollout and the live CNI/Required reply gate remain next.
+ADR 0339 verifies that matching Kind rollout and expanded live gate: three
+runtime UID/nonce bindings and retirements, 24 allowed/eight denied requests,
+positive ciphertext and exact cleanup. Both fleets now run `450de80`.
+The actual authenticated kernel locality consumer remains the next L3 boundary.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

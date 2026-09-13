@@ -54,6 +54,12 @@ positive ciphertext with exact fixture cleanup. Matching Kind still runs
 `67c2772` and remains pending. Known policy-admission limits, proof/plan warnings,
 an expired watch and the unavailable retired-controller termination logs remain
 explicit findings; no full Phase 9 or stabilization row is closed.
+ADR 0339 completes matching retained Kind's live CNI/Required reply gate on
+the identical `450de80` images, with three real runtime UID/nonce bindings and
+normal retirements, 24 allowed/eight denied probes, ciphertext and exact cleanup.
+Current and rotated CRI logs retain proof/plan/activation warnings and significant
+per-packet INFO volume. Both fleets are Native/converged with zero current UNF
+container restarts. Required locality consumption and S1–S5 remain open.
 
 Repair evidence is retained chronologically in the ADRs:
 

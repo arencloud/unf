@@ -587,6 +587,13 @@ ADR 0337 verifies the guarded `450de80` live cl02 rollout, real runtime UID/nonc
 capture and retirement, 24 allowed/eight denied requests, ciphertext and exact
 fixture cleanup. All UNF containers are Ready with zero restarts. Matching Kind
 still runs `67c2772` and is next; operational log findings remain open.
+ADR 0339 verifies matching retained Kind live rollout and the complete expanded
+CNI/Required reply gate on `450de80`: three UID/nonce bindings and retirements,
+24 allowed/eight denied probes, 242 WireGuard frames, zero observed Required
+plaintext and exact cleanup. Both fleets now run that immutable source with
+zero current UNF restarts. Logs and retained rotated CRI files are reviewed;
+warnings, INFO amplification and the retired-controller log gap remain visible.
+Required locality consumption, L4/L5, Q and S1–S5 remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
