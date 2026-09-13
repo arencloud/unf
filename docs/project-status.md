@@ -600,6 +600,14 @@ ADR 0311 adds bounded connection-stage/reason metadata without raw headers,
 payloads, relaxed timeouts or retry-to-pass. Local and exact deployed-tools
 regressions pass; paired cl02 packet diagnosis is next, with Kind unchanged.
 
+ADR 0312 attributes the next cl02 failure (1/224, IPv6 TCP handshake) to an
+expired Service reverse-tuple collision: source-only SYN capture, matching
+pair-insertion-drop telemetry and exact read-only map lookup find a different
+frontend's approximately 6.9-hour-old entry against a five-minute lifetime.
+The insertion path does not reclaim that expired slot. Ownership-safe,
+regression-backed reclamation is next; live owners must not be overwritten.
+Temporary observers were removed; Kind and Phase 9 status remain unchanged.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.

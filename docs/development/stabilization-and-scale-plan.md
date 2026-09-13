@@ -18,6 +18,12 @@ skipped-work counter; local regressions pass. ADR 0310's cl02 rollout and
 despite stable policy revision and four skipped invalidations. Capture the
 remaining exact failure path; do not upgrade Kind before cl02 passes.
 
+ADR 0312 now attributes a reproduced IPv6 failure to an expired reverse Service
+mapping blocking a new tuple. Packet captures, drop telemetry and an exact
+read-only key lookup agree. Add ownership-safe expiry reclamation regressions
+before another runtime build; preserve live mappings and successor pairs.
+This is a concrete S1 reliability finding, not completed scale optimization.
+
 S2 profiling lead, not an attributed CPU result: `policy_snapshot` calls
 `dataplane_policy_state` for every authenticated pull; the latter clones the
 full cached tuple even on a matching revision and the endpoint returns the
