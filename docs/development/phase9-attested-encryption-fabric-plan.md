@@ -207,6 +207,11 @@ That run passed the complete application fault matrix and explicit capture stop,
 then failed loss-statistics validation. ADR 0289 preserves raw capture evidence
 before cleanup and limits capture to the union of the actual verification
 queries. Its cl02 capture-control smoke passed; full qualification is pending.
+The existing full gate then passed in 1,532 seconds with qualifier `f96aec2`,
+including source-agent/controller recovery, natural rotation, capture and final
+Native convergence (ADR 0289). Preserve that versioned result; the assertion
+audit must still distinguish diagnostic failures from denied probes/cleanup
+and check all rotated-table/IPv6 state before final requalification and Kind.
 Run the full current-cut lifecycle gate, then
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as

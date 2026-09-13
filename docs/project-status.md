@@ -584,6 +584,14 @@ statistics after a clean 105-second capture. Raw statistics were not retained,
 so the cause is unresolved. ADR 0289 adds query-aligned filtering and raw
 statistics/pcap retention before cleanup. Its cl02 capture-control smoke passed;
 the full lifecycle still needs an uninterrupted pass before Kind.
+Runtime `cb59e90`, qualifier `f96aec2`, subsequently passed the existing full cl02
+gate in 1,532 seconds (ADR 0289): loss-free 352-WireGuard/zero-Required-plaintext
+capture, agent/controller recovery, natural rotation, bounded persistence and
+history continuity, final five-Node Native convergence and no newly unhealthy
+operator. Archive JSON SHA-256 is `7bdcbab9…9aae`. Final audit still requires
+strict separation of probe/host-read failures from denial/cleanup evidence and
+coverage of rotating tables plus IPv6 state. Requalify those assertions before
+matching-image fresh Kind and Phase 9 closure; S1–S5 remain pending.
 
 ## Updating this tracker
 

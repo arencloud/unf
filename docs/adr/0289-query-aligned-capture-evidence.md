@@ -48,3 +48,36 @@ fault and is explicitly not a ciphertext or lifecycle qualification.
 The full repaired cl02 gate must rerun against the unchanged pinned `cb59e90`
 images. Matching-image fresh Kind and Phase 9 closure remain pending; the later
 S1–S5 stabilization milestones are not marked complete.
+
+## Subsequent full cl02 run
+
+Runtime `cb59e9080a4cce5544c1ae3c69974233d53d8c52`, qualifier
+`f96aec219b09093dc4120de26f7932c130ec1fcb`, passed the existing uninterrupted
+cl02 gate in 1,532 seconds, completing at 2026-09-13 01:18:02 UTC.
+Archived JSON `.artifacts/phase9-cb59e90-f96aec2-openshift.json` has SHA-256
+`7bdcbab95c5224f7658e2f02496a0befaa4c06cd059ef27d7eb33c51ec269aae`.
+Its 92,316-byte pcap has SHA-256
+`5abaff5c80bd4b7b5ee95f3ecb5e78df8cf2390ed3f231700844dcb42130eefe`.
+
+The 100-second capture retained 352 WireGuard frames, zero Required plaintext,
+200 Native plaintext frames and zero kernel drops. The application fault matrix
+reported eight Required denials and eight Native successes. Source-agent
+replacement, natural rotation, controller replacement, bounded checkpoint and
+operations continuity, and final Native journal convergence passed. All eight
+persistence checkpoints recorded zero errors and controller restarts, under a
+2-GiB limit; the largest stored checkpoint was 877,132 bytes. All sampled codecs
+were gzip, so this run does not demonstrate an actual zstd fallback transition.
+Operations retained 512 records, explicitly reported historical eviction and
+zero upstream loss, and claimed only retained-window completeness.
+
+All five final journals converged to generation 1789262205992 with empty epochs
+and no pending generation. Final agent convergence passed. The same six
+operators remained unhealthy; no new unhealthy operator appeared. This is not
+a wholly healthy-cluster or production-readiness claim.
+
+The final assertion review found two remaining qualifier gaps: an exec failure
+could be counted as an HTTP denial, and a failed host query could be mistaken
+for cleanup. Cleanup also checked only early table numbers instead of the
+rotating range and protocol-owned IPv6 state. Preserve this passing result as
+evidence of this exact gate version, but finish that assertion hardening and
+requalify before closing Phase 9. Matching-image fresh Kind is still pending.
