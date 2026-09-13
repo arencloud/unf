@@ -3,6 +3,7 @@ set -Eeuo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 bash -n "${root}/hack/phase9-link-fault.sh"
 sh -n "${root}/hack/phase9-link-guard.sh"
+sh "${root}/hack/phase9-link-selector-preflight.sh" "$(<"${root}/hack/phase9-link-targets.jq")"
 fixture=$(jq -cn '
   def plan($epoch;$name): {epoch:$epoch,interfaceName:$name,
     ownerAlias:("unf:encryption:v2:cluster:uid:"+($epoch|tostring)),clusterId:"cluster",localNodeUid:"uid"};
@@ -45,6 +46,7 @@ ip() {
     case "$*" in
         '-j -details link show dev '*)
             [[ ${PHASE9_TEST_NETLINK_FAILURE:-false} == false ]] || return 1
+            [[ ${PHASE9_TEST_EMPTY_NETLINK:-false} == false ]] || return 0
             jq -ce --arg name "$6" '[.[]|select(.ifname==$name)]|select(length>0)' <<<"${PHASE9_TEST_LINKS}" ;;
         '-j link show')
             [[ ${PHASE9_TEST_NETLINK_FAILURE:-false} == false ]] || return 1
@@ -77,6 +79,10 @@ PHASE9_TEST_LINKS=$(jq -c '.[0].ifindex=999' <<<"${PHASE9_TEST_LINKS}") \
     bash "${root}/hack/phase9-link-guard.sh" "${target}" up
 [[ ! -s ${calls} ]]
 if PHASE9_TEST_NETLINK_FAILURE=true bash "${root}/hack/phase9-link-guard.sh" "${target}" up >/dev/null 2>&1; then exit 1; fi
+for mode in down up; do
+    if PHASE9_TEST_EMPTY_NETLINK=true bash "${root}/hack/phase9-link-guard.sh" "${target}" "${mode}" >/dev/null 2>&1; then exit 1; fi
+    if bash "${root}/hack/phase9-link-guard.sh" '' "${mode}" >/dev/null 2>&1; then exit 1; fi
+done
 [[ ! -s ${calls} ]]
 # Exercise the actual host-side projection and command quoting, not just the
 # isolated jq predicate. Exported mocks run only in this test's Bash children.

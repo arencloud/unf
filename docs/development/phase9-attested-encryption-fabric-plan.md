@@ -195,6 +195,11 @@ ADR 0286 adds bounded transport-only retries with retained failure metadata and
 single-attempt witness lookups. Invalid successfully transferred content still
 fails immediately. Neither repaired fault selection nor full lifecycle is yet
 live-qualified by that interrupted run.
+ADR 0286's next run passed history, migration and Required/selective traffic,
+then exposed jq 1.6 syntax incompatibility at the first fault selection.
+ADR 0287 adds host-compatible selection, strict netlink-read validation and
+read-only host preflight. Bind capture lifetime to the complete fault window
+before rerunning the full qualification; a fixed timer can expire too early.
 Run the full current-cut lifecycle gate, then
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as

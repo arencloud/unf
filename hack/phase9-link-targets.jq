@@ -11,7 +11,7 @@ if $journal.nodeName != $node or ($journal.activeEpoch | type) != "number"
     and .ownerAlias == $link.ifalias and .clusterId == $journal.clusterId
     and .localNodeUid == $journal.nodeUid
     and .ownerAlias == ($owner + (.epoch | tostring)))] | unique as $plans |
-  if ($plans | length) != 1 then error("live link lacks exact retained plan") else $plans[0] end as $plan |
+  (if ($plans | length) != 1 then error("live link lacks exact retained plan") else $plans[0] end) as $plan |
   if ($link.ifname | test("^unfwg[0-9a-z]{10}$") | not)
      or $link.linkinfo.info_kind != "wireguard"
      or ($link.ifindex | type) != "number" or $link.ifindex <= 0

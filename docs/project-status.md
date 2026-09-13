@@ -567,6 +567,12 @@ history transfer. ADR 0286 adds bounded transport-only retries, preserves raw
 attempts and records read outcomes without retrying content-verification
 failures. Full cl02 qualification, matching-image Kind, and the later heavy-load
 stabilization milestones remain pending.
+Qualifier `dc738f8` subsequently passed history capture, Required migration and
+Required/selective traffic, but RHCOS jq 1.6 rejected fault-selector syntax
+accepted locally by jq 1.8.1. ADR 0287 fixes compatibility, strengthens failed/
+empty netlink-read refusal, and adds actual-host preflight. The fixed-duration
+capture also expired before this failed stage completed; capture lifecycle
+coverage must be repaired and the full gate rerun before closure.
 
 ## Updating this tracker
 

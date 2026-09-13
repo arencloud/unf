@@ -495,6 +495,8 @@ for node in "${nodes[@]}"; do
         ! ip6tables-save 2>/dev/null | grep -q "^-A KUBE-SVC"
         echo host-ready')
     rg -qx host-ready <<<"${host_facts}"
+    node_exec "${node}" sh -euc "$(<"${project_root}/hack/phase9-link-selector-preflight.sh")" \
+        phase9-link-selector-preflight "$(<"${project_root}/hack/phase9-link-targets.jq")"
 done
 
 stage=immutable-runtime

@@ -148,6 +148,9 @@ for node in "${nodes[@]}"; do
         ! iptables-save 2>/dev/null | grep -q "^-A KUBE-SVC"
         ! ip6tables-save 2>/dev/null | grep -q "^-A KUBE-SVC"
     '
+    timeout 20 "${runtime[@]}" exec "${node}" sh -euc \
+        "$(<"${project_root}/hack/phase9-link-selector-preflight.sh")" \
+        phase9-link-selector-preflight "$(<"${project_root}/hack/phase9-link-targets.jq")"
 done
 
 controller_raw() {
