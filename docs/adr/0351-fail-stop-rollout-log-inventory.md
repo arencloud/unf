@@ -37,3 +37,12 @@ targets before the first agent change. Retiring log streams have no 15-second
 request timeout and must end successfully. A bounded post-rollout validation
 still needs to establish candidate distribution, traffic, preservation and
 cleanup on cl02 before matching Kind. No full Phase 9 or S1–S5 row is verified.
+
+The first resume stops before any agent mutation when a Pod-proxy check targets
+the controller's loopback-only HTTP endpoint. It is replaced by the established
+owned port-forward observer; the controller and all agents remain Ready. Log
+followers are then moved to a separate executable so inherited rollout EXIT/ERR
+traps cannot terminate other followers or emit misleading preflight messages.
+Local regression checks preserve command stdout/stderr and exit 7, independent
+follower lifetime, explicit cancellation/exit 143, and successful completion.
+Neither failed observer attempt is reported as feature qualification.
