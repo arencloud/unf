@@ -7,6 +7,7 @@ bash "${root}/hack/verify-phase9-operations-continuity.sh"
 bash "${root}/hack/verify-phase9-witness-read.sh"
 bash "${root}/hack/verify-phase9-generation-mode.sh"
 bash "${root}/hack/verify-phase9-link-fault.sh"
+bash "${root}/hack/verify-phase9-capture.sh"
 overlay=${root}/deploy/openshift-primary-cni/encryption-phase9
 release=${overlay}/release.json
 rendered=$(mktemp)

@@ -200,6 +200,9 @@ then exposed jq 1.6 syntax incompatibility at the first fault selection.
 ADR 0287 adds host-compatible selection, strict netlink-read validation and
 read-only host preflight. Bind capture lifetime to the complete fault window
 before rerunning the full qualification; a fixed timer can expire too early.
+ADR 0288 implements explicit post-fault capture closure and zero-loss checks,
+with local regressions and a cl02 capture-control smoke test. The full repaired
+gate remains pending on the unchanged `cb59e90` runtime.
 Run the full current-cut lifecycle gate, then
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as

@@ -5,6 +5,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 gate=${root}/hack/verify-kind-encryption-phase9.sh
 bash "${root}/hack/verify-phase9-operations-continuity.sh"
 bash "${root}/hack/verify-phase9-link-fault.sh"
+bash "${root}/hack/verify-phase9-capture.sh"
 overlay=${root}/deploy/kind-encryption-phase9
 
 bash -n "${gate}"

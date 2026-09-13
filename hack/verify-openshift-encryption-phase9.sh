@@ -30,6 +30,7 @@ diagnostics_collected=false
 checkpoint_persistence_checks='[]'
 source "${project_root}/hack/phase9-operations.sh"
 source "${project_root}/hack/phase9-link-fault.sh"
+source "${project_root}/hack/phase9-capture.sh"
 
 phase9_link_exec() {
     node_exec "${source_node}" "$@"
@@ -662,7 +663,7 @@ spec:
     image: ${test_tools_image}
     imagePullPolicy: IfNotPresent
     command: [/usr/bin/timeout]
-    args: ["--signal=INT", "60", "/usr/bin/tcpdump", "-U", "-ni", "br-ex", "-w", "${capture_container_path}"]
+    args: ["--signal=INT", "300", "/usr/bin/tcpdump", "-U", "-ni", "br-ex", "-w", "${capture_container_path}"]
     securityContext: {privileged: true}
     volumeMounts: [{name: capture, mountPath: /capture}]
   - name: keeper
@@ -700,14 +701,7 @@ done
 [[ ${required_blocked} == 8 && ${native_succeeded} == 8 ]]
 restore_owned_encryption_links
 link_lowered=false
-capture_exit=
-for _ in $(seq 1 90); do
-    capture_exit=$("${kc[@]}" -n "${namespace}" get pod "${capture_pod}" -o json | jq -r '
-        [.status.containerStatuses[] | select(.name == "tcpdump") | .state.terminated.exitCode][0] // empty')
-    [[ -n ${capture_exit} ]] && break
-    sleep 1
-done
-[[ ${capture_exit} == 0 || ${capture_exit} == 124 ]]
+capture_lifecycle=$(phase9_capture_finish)
 temporary_capture=$(mktemp)
 "${kc[@]}" -n "${namespace}" cp -c keeper \
     "${capture_pod}:${capture_container_path}" "${temporary_capture}"
@@ -827,6 +821,7 @@ jq -n \
     --arg testToolsImage "${test_tools_image}" --arg deployEvidence "${deploy_evidence}" \
     --arg sourceNode "${source_node}" --arg destinationNode "${destination_node}" \
     --arg capturePath "${capture_artifact}" --arg captureSha256 "${capture_sha256}" \
+    --argjson captureLifecycle "${capture_lifecycle}" \
     --argjson captureBytes "${capture_size}" --argjson wireguardFrames "${wireguard_frames}" \
     --argjson requiredPlaintextFrames "${required_plaintext_frames}" \
     --argjson nativePlaintextFrames "${native_plaintext_frames}" \
@@ -857,6 +852,7 @@ jq -n \
       selective:{result:"passed",generations:$selectiveGeneration},
       traffic:{directDualStack:"passed",serviceDualStack:"passed"},
       capture:{path:$capturePath,sha256:$captureSha256,bytes:$captureBytes,
+        lifecycle:$captureLifecycle,
         wireguardFrames:$wireguardFrames,requiredPlaintextFrames:$requiredPlaintextFrames,
         nativePlaintextFrames:$nativePlaintextFrames},
       failClosed:{requiredBlocked:$requiredBlocked,nativeSucceeded:$nativeSucceeded},

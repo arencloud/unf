@@ -573,6 +573,11 @@ accepted locally by jq 1.8.1. ADR 0287 fixes compatibility, strengthens failed/
 empty netlink-read refusal, and adds actual-host preflight. The fixed-duration
 capture also expired before this failed stage completed; capture lifecycle
 coverage must be repaired and the full gate rerun before closure.
+ADR 0288 now requires explicit capture stop after all fault probes and owned
+restoration, clean flush and zero reported kernel capture drops; timeout is no
+longer success. Shared regressions and a dedicated cl02 capture-control smoke
+test pass. This is not full ciphertext/fail-closed qualification; rerun cl02,
+then matching-image Kind, before marking Phase 9 Verified.
 
 ## Updating this tracker
 
