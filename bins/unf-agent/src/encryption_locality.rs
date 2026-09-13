@@ -2,6 +2,7 @@
 //! only for Required demand and changed applied placement/desired-plan cuts.
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use unf_common::Revision;
 use unf_encryption::{
     AdmittedNodeLocalPlan, AdmittedNodeLocalPlanDigest, EncryptionDisposition,
@@ -51,6 +52,108 @@ impl PlacementCache {
         self.candidate.as_ref().is_some_and(|(digest, evidence)| {
             *digest == plan.admitted_digest && evidence.certificate().context() == context
         })
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum PlacementPhase {
+    #[default]
+    Absent,
+    Fetching,
+    Replayed,
+    Failed,
+}
+
+/// Last event-loop observation. Never a serialized admission capability.
+#[derive(Debug, Default, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PlacementObservation {
+    phase: PlacementPhase,
+    observed_at_unix_ms: u64,
+    context: Option<EncryptionLocalityContext>,
+    plan_digest: Option<AdmittedNodeLocalPlanDigest>,
+    local_addresses: usize,
+}
+
+pub(super) fn record_observation(cache: &PlacementCache, state: &AgentState, failed: bool) {
+    let mut observation = PlacementObservation {
+        observed_at_unix_ms: super::current_unix_time_milliseconds(),
+        ..PlacementObservation::default()
+    };
+    if failed {
+        observation.phase = PlacementPhase::Failed;
+    } else if let Some((digest, evidence)) = &cache.candidate {
+        observation.phase = PlacementPhase::Replayed;
+        observation.context = Some(evidence.certificate().context().clone());
+        observation.plan_digest = Some(*digest);
+        observation.local_addresses = evidence.certificate().addresses().len();
+    } else if let Some(pending) = &cache.pending {
+        observation.phase = PlacementPhase::Fetching;
+        observation.context = Some(pending.context.clone());
+        observation.plan_digest = Some(pending.plan_digest);
+    }
+    *state
+        .locality_observation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = observation;
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+// Independent observational claims, deliberately not mutually exclusive states.
+#[allow(clippy::struct_excessive_bools)]
+pub(super) struct PlacementStatus {
+    schema_version: u16,
+    scope: &'static str,
+    observation: PlacementObservation,
+    matches_reported_identity_and_routing: bool,
+    dataplane_ready: bool,
+    kernel_admitted: bool,
+    observed_delivery: bool,
+}
+
+pub(super) async fn status(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<AgentState>>,
+) -> axum::Json<PlacementStatus> {
+    axum::Json(status_for(&state))
+}
+
+fn status_for(state: &AgentState) -> PlacementStatus {
+    let observation = state
+        .locality_observation
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let matches_reported_identity_and_routing =
+        observation.context.as_ref().is_some_and(|context| {
+            context.recipient.node_name == state.node_name
+                && context.identity_epoch != 0
+                && state.applied_identity_epoch.load(Ordering::Acquire) == context.identity_epoch
+                && state.desired_identity_epoch.load(Ordering::Acquire) == context.identity_epoch
+                && state.applied_identity_revision.load(Ordering::Acquire)
+                    == context.identity_revision.get()
+                && state.desired_identity_revision.load(Ordering::Acquire)
+                    == context.identity_revision.get()
+                && state.applied_remote_route_epoch.load(Ordering::Acquire)
+                    == context.identity_epoch
+                && state.desired_remote_route_epoch.load(Ordering::Acquire)
+                    == context.identity_epoch
+                && state.applied_remote_route_revision.load(Ordering::Acquire)
+                    == context.routing_revision.get()
+                && state.desired_remote_route_revision.load(Ordering::Acquire)
+                    == context.routing_revision.get()
+        });
+    PlacementStatus {
+        schema_version: 1,
+        scope: "localityPlacementCandidate",
+        observation,
+        matches_reported_identity_and_routing,
+        dataplane_ready: state.ready.load(Ordering::Acquire),
+        // These deliberately remain false until independent consuming and
+        // delivery evidence exists. API reads cannot establish either fact.
+        kernel_admitted: false,
+        observed_delivery: false,
     }
 }
 

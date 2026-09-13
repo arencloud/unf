@@ -637,6 +637,9 @@ ADR 0348 adds the agent's locally verified bounded background candidate fetch
 (803 passing tests, 26 ignored), with unchanged-cut reuse and one replay slot.
 Native operation does not fetch locality metadata. Candidate status and live
 distribution qualification remain next; no local packet authority is enabled.
+ADR 0349 adds candidate-only agent status (804 passing tests, 26 ignored),
+distinguishing absent/fetching/replayed/failed from kernel admission and delivery.
+Both latter claims remain false; authenticated live distribution is next.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

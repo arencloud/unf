@@ -42,8 +42,9 @@ ADR 0347 adds the locally verified nonce-bound controller/wire distribution
 boundary. Current-Pod/Node authentication, guarded placement coordinates,
 bounded wire and independent source replay do not activate locality. ADR 0348
 adds the locally verified Required-only background agent fetch, bounded stream,
-single replay slot and current-cut handoff. Candidate status and live
-cl02-before-Kind distribution qualification remain pending.
+single replay slot and current-cut handoff. ADR 0349 adds locally verified
+candidate-only status with explicit false kernel/delivery claims. Live
+cl02-before-Kind distribution qualification remains pending.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

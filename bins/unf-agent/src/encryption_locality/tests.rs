@@ -133,6 +133,18 @@ fn placement_cache_is_cut_and_plan_bound_and_explicitly_clearable() {
         ..PlacementCache::default()
     };
     assert!(cache.matches(&plan, &context));
+    let observed_state = state();
+    record_observation(&cache, &observed_state, false);
+    let report = status_for(&observed_state);
+    assert_eq!(report.observation.phase, PlacementPhase::Replayed);
+    assert!(report.matches_reported_identity_and_routing);
+    assert!(!report.kernel_admitted && !report.observed_delivery);
+    observed_state
+        .applied_remote_route_revision
+        .store(99, Ordering::Release);
+    let stale = status_for(&observed_state);
+    assert!(!stale.matches_reported_identity_and_routing);
+    assert_eq!(stale.observation.phase, PlacementPhase::Replayed);
     let mut changed = plan.clone();
     changed.admitted_digest.0[0] ^= 1;
     assert!(!cache.matches(&changed, &context));
@@ -141,6 +153,24 @@ fn placement_cache_is_cut_and_plan_bound_and_explicitly_clearable() {
     assert!(!cache.matches(&plan, &changed));
     cache.clear();
     assert!(!cache.matches(&plan, &context));
+}
+
+#[tokio::test]
+async fn locality_status_is_observational_and_never_kernel_or_delivery_authority() {
+    let state = std::sync::Arc::new(state());
+    let report = status(axum::extract::State(state.clone())).await.0;
+    let wire = serde_json::to_value(report).unwrap();
+    assert_eq!(wire["schemaVersion"], 1);
+    assert_eq!(wire["scope"], "localityPlacementCandidate");
+    assert_eq!(wire["observation"]["phase"], "absent");
+    assert_eq!(wire["kernelAdmitted"], false);
+    assert_eq!(wire["observedDelivery"], false);
+    assert_eq!(wire["matchesReportedIdentityAndRouting"], false);
+    record_observation(&PlacementCache::default(), &state, true);
+    let report = status_for(&state);
+    assert_eq!(report.observation.phase, PlacementPhase::Failed);
+    assert!(report.observation.observed_at_unix_ms > 0);
+    assert!(!report.kernel_admitted && !report.observed_delivery);
 }
 
 async fn http_response(
@@ -235,6 +265,12 @@ async fn cancelled_replay_keeps_the_single_worker_slot_until_real_completion() {
         .unwrap()
         .unwrap();
     assert!(!cache.pending.as_ref().unwrap().task.is_finished());
+    let observed_state = state();
+    record_observation(&cache, &observed_state, false);
+    assert_eq!(
+        status_for(&observed_state).observation.phase,
+        PlacementPhase::Fetching
+    );
     cache.clear();
     assert!(cache.pending.is_none());
     assert!(cache.work_slot.clone().try_acquire_owned().is_err());

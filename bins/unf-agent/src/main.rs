@@ -910,6 +910,7 @@ struct AgentState {
     node_name: String,
     pod_name: String,
     pod_uid: String,
+    locality_observation: Mutex<encryption_locality::PlacementObservation>,
     native_reachability_node_uid: Mutex<Option<String>>,
     native_reachability_owned_addresses: Mutex<BTreeSet<IpAddr>>,
     ready: AtomicBool,
@@ -2123,6 +2124,7 @@ async fn main() -> Result<()> {
         .route("/metrics", get(metrics))
         .route("/v1/version", get(version))
         .route("/v1/status", get(status))
+        .route("/v1/encryption/locality", get(encryption_locality::status))
         .route(
             "/v1/egress-reachability/probe",
             get(native_egress_reachability_probe),
@@ -6650,6 +6652,7 @@ fn new_state(
         node_name,
         pod_name,
         pod_uid,
+        locality_observation: Mutex::new(encryption_locality::PlacementObservation::default()),
         native_reachability_node_uid: Mutex::new(None),
         native_reachability_owned_addresses: Mutex::new(BTreeSet::new()),
         ready: AtomicBool::new(false),
@@ -16738,14 +16741,17 @@ async fn consume_events(
                                 "encryption plan could not consume exact Node-local key and kernel truth"
                             ),
                         }
-                        if let Err(error) = encryption_locality::synchronize(
+                        let locality_result = encryption_locality::synchronize(
                             encryption_plans, encryption_keys, state,
-                        ).await {
+                        ).await;
+                        encryption_locality::record_observation(&encryption_plans.locality, state, locality_result.is_err());
+                        if let Err(error) = locality_result {
                             warn!(%error, "locality placement fetch failed; no local packet authority admitted");
                         }
                     }
                     Err(error) => {
                         encryption_plans.locality.clear();
+                        encryption_locality::record_observation(&encryption_plans.locality, state, true);
                         warn!(%error, "encryption plan synchronization failed; retaining exact durable predecessor");
                     }
                 }
