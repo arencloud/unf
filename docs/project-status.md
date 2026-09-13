@@ -568,7 +568,9 @@ the locality consumer remain open. No Required locality or full platform row
 is closed by this gate.
 ADR 0330 adds durable, per-creation nonce recovery for an interrupted, exact
 pending veth pair. All 784 workspace tests and strict Clippy pass; expanded
-cl02/Kind recovery qualification is pending. Live installations remain unchanged.
+cl02 recovery qualification passes all four interruption states and twelve
+negative checks (ADR 0331). Matching Kind is pending; live installations remain
+unchanged.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 
