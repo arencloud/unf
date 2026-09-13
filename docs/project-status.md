@@ -569,6 +569,11 @@ key-attestation row followed by a complete public attestation cut. A bounded
 46-second resource sample leaves controller CPU (~1.27 cores) as a profiling
 target. No heavy-load, leak-free or healthy-platform claim follows.
 
+ADR 0307 adds the next live-pending continuity gate: fresh connections over
+eight Native paths during empty-namespace create/relabel/delete, with failures
+retained per sample and no retry-to-pass. Local probe regressions pass; cl02
+must pass before running this slice on Kind.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.

@@ -5,6 +5,7 @@ project_root=$root
 : "${KUBECONFIG:?exact disposable-cluster kubeconfig required}"
 : "${UNF_NATIVE_COVERAGE_RUNTIME_REVISION:?exact runtime revision required}"
 [[ $UNF_NATIVE_COVERAGE_RUNTIME_REVISION =~ ^[0-9a-f]{40}$ ]]
+[[ ${UNF_NATIVE_COVERAGE_CONTINUITY:-false} == true || ${UNF_NATIVE_COVERAGE_CONTINUITY:-false} == false ]]
 git -C "$root" diff --quiet
 git -C "$root" diff --cached --quiet
 context=${KUBE_CONTEXT:-$(kubectl --kubeconfig "$KUBECONFIG" config current-context)}
@@ -262,6 +263,13 @@ for server in local-server remote-server; do
     done < <(jq -r '.[]' <<<"$addresses")
 done
 [[ $allowed == 24 && $denied == 8 ]]
+continuity=false
+if [[ ${UNF_NATIVE_COVERAGE_CONTINUITY:-false} == true ]]; then
+    stage=namespace-churn-continuity
+    source "$root/hack/native-transport-continuity.sh"
+    native_transport_continuity
+    continuity=true
+fi
 stage=cleanup
 "${kc[@]}" delete namespace "$namespace" --wait=true --timeout=180s >/dev/null
 owned=false
@@ -278,8 +286,8 @@ while (( SECONDS < deadline )); do
 done
 [[ $converged == true ]]
 jq -n --arg revision "$UNF_NATIVE_COVERAGE_RUNTIME_REVISION" --arg qualifier "$(git -C "$root" rev-parse HEAD)" \
-    --arg context "$context" --arg source "$source_node" --arg destination "$destination_node" --argjson allowed "$allowed" --argjson denied "$denied" \
+    --arg context "$context" --arg source "$source_node" --arg destination "$destination_node" --argjson allowed "$allowed" --argjson denied "$denied" --argjson continuity "$continuity" \
     '{schemaVersion:1,result:"passed",runtimeRevision:$revision,qualificationRevision:$qualifier,context:$context,
       sourceNode:$source,destinationNode:$destination,allowedRequests:$allowed,unsolicitedDenials:$denied,
-      protocols:["TCP","UDP"],families:["IPv4","IPv6"],paths:["same-node","cross-node","PodIP","Service","translated-Service-port"],cleanup:"passed"}' > "$directory/evidence.json"
+      protocols:["TCP","UDP"],families:["IPv4","IPv6"],paths:["same-node","cross-node","PodIP","Service","translated-Service-port"],namespaceChurnContinuity:$continuity,cleanup:"passed"}' > "$directory/evidence.json"
 echo "Native local/return coverage passed: $directory/evidence.json"
