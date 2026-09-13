@@ -16,6 +16,10 @@ stage=namespace-setup
 cleanup() {
     local result=$?
     trap - EXIT
+    if (( result != 0 )) && [[ -s $directory/last-cni-response.json ]]; then
+        printf 'Last CNI response at failed boundary:\n' >&2
+        cat "$directory/last-cni-response.json" >&2
+    fi
     if [[ $pod_created == true ]]; then ip netns del "$pod_namespace" || result=1; fi
     if [[ $host_created == true ]]; then ip netns del "$host_namespace" || result=1; fi
     printf 'CNI ownership qualification exit=%s stage=%s evidence=%s\n' "$result" "$stage" "$directory"
@@ -37,7 +41,7 @@ run_cni() {
         UNF_CNI_TEST_IPV6_BLOCK=fd44:0:0:44::/120 \
         CNI_COMMAND="$command" CNI_CONTAINERID=ownership-sandbox \
         CNI_IFNAME=eth0 CNI_NETNS="/run/netns/$pod_namespace" \
-        CNI_ARGS="$args" "$binary"
+        CNI_ARGS="$args" "$binary" | tee "$directory/last-cni-response.json"
 }
 expect_denied() {
     local name=$1

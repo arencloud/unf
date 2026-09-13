@@ -35,3 +35,11 @@ no ShellCheck pass is claimed. Platform evidence will be added after execution.
 The first image build compiled the adapter but refused to copy the qualifier:
 the container context excludes `hack/`. The context now admits only this exact
 qualifier script; credentials, tools, prompts and other harnesses remain excluded.
+
+The first cl02 attempt stopped before Pod creation on pre-existing namespace
+security labels; its owned namespace was removed. The wrapper now explicitly
+updates those labels only on its newly created namespace. The next attempt
+passed legacy replay, then failed the UID-bound ADD. Its command-substitution
+boundary did not retain the CNI JSON error, so the cause is not yet attributed.
+The qualifier now retains and prints the last CNI response on failure. Both
+attempts remain failures; no Kind test or live runtime rollout has occurred.
