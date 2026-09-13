@@ -12,4 +12,5 @@ hack/*
 !hack/verify-cni-workload-ownership.sh
 !hack/verify-local-delivery-device-lifetime.sh
 !hack/local-delivery-device-gate.jq
+!hack/verify-veth-observation.sh
 tests/

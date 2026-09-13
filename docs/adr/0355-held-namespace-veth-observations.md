@@ -42,3 +42,8 @@ pending; shell syntax validation is not a kernel qualification.
 Next: build one immutable isolated fixture, run it on cl02 with before/during/
 after UNF logs, then the identical retained-Kind image. Keep continuous source/
 peer lifetime, authenticated banked consumption and Phase 9/S1–S5 open.
+
+The first isolated image build stops before publishing or cluster mutation:
+the new fixture script is absent from the explicit build-context allowlist.
+Only that script is added; ignored credentials, private prompts and qualification
+artifacts remain excluded. The corrected image must still pass both platforms.
