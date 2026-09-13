@@ -37,6 +37,8 @@ These observations guide later work; they do not mark S1–S5 complete.
 | One agent cgroup had no memory limit; the controller's configured request is below measured CPU use | Measure all agents, BPF memory and scheduler impact before choosing requests/limits; avoid OOM-triggered dataplane disruption |
 | Large policy and encryption snapshots are repeatedly materialized | Profile steady-state pulls, unchanged-input work and churn before introducing conditional delivery or caching; preserve epoch/digest and authentication checks |
 | Encryption operations retain 512 records, while a five-Node Required activation emits 5,972 path observations; cumulative `lossAffected` includes intentional historical eviction | ADR 0282 adds independent checkpoint replay and restart comparison with explicit retention and zero upstream loss. Qualify both full platform runs; never clear history or silently raise retention |
+| Current `cb59e90` lifecycle runs take several minutes at some Required/workload-change boundaries; path logs show rendezvous retries while agents retain their predecessor | Measure transition latency and proof work under equal inputs. A within-deadline lifecycle pass is not sufficient evidence of fast convergence under heavy churn |
+| Qualifier `2e20161` passed the application outage matrix but could not validate capture loss; raw statistics disappeared during cleanup | ADR 0289 retains capture evidence and filters only unrelated traffic. Require an uninterrupted complete cl02 result before Kind and S1, without inferring plaintext absence from an incomplete capture |
 
 A preliminary one-file CLI compression experiment on the captured roughly
 22-MB checkpoint produced 795,360 bytes with gzip level 6 and 332,688 bytes with

@@ -445,6 +445,7 @@ traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required
 traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
 
 qualification_stage=ciphertext-and-fail-closed
+capture_filter=$(phase9_capture_filter "${required_pod4}" "${required_pod6}" "${native_pod4}" "${native_pod6}")
 capture_node=${source_node}
 capture_pod=underlay-capture
 "${kc[@]}" apply -f - >/dev/null <<EOF
@@ -465,7 +466,7 @@ spec:
     image: ${test_tools_image}
     imagePullPolicy: Never
     command: [/usr/bin/timeout]
-    args: ["--signal=INT", "300", "/usr/bin/tcpdump", "-U", "-ni", "eth0", "-w", "${capture_container_path}"]
+    args: ["--signal=INT", "300", "/usr/bin/tcpdump", "-U", "-ni", "eth0", "-w", "${capture_container_path}", "${capture_filter}"]
     securityContext:
       privileged: true
     volumeMounts:
@@ -503,9 +504,8 @@ if [[ ${required_blocked} != 8 || ${native_succeeded} != 8 ]]; then
 fi
 restore_owned_encryption_links
 link_lowered=false
-capture_lifecycle=$(phase9_capture_finish)
-"${kc[@]}" -n "${namespace}" cp -c keeper \
-    "${capture_pod}:${capture_container_path}" "${capture_host_path}"
+capture_lifecycle=$(phase9_capture_finish "${diagnostics_dir}/capture")
+cp "${diagnostics_dir}/capture/received.pcap" "${capture_host_path}"
 capture_sha256=$(sha256sum "${capture_host_path}" | awk '{print $1}')
 wireguard_frames=$(tcpdump -nn -r "${capture_host_path}" 'udp and (port 51820 or port 51821)' 2>/dev/null | wc -l)
 required_plaintext_frames=$(tcpdump -nn -r "${capture_host_path}" \
@@ -622,6 +622,7 @@ jq -n \
     --arg captureSha256 "${capture_sha256}" \
     --arg capturePath "${capture_artifact}" \
     --argjson captureLifecycle "${capture_lifecycle}" \
+    --arg captureFilter "${capture_filter}" \
     --argjson wireguardFrames "${wireguard_frames}" \
     --argjson requiredPlaintextFrames "${required_plaintext_frames}" \
     --argjson nativePlaintextFrames "${native_plaintext_frames}" \
@@ -646,6 +647,7 @@ jq -n \
       traffic: {directDualStack:"passed", serviceDualStack:"passed"},
       capture: {path:$capturePath, sha256:$captureSha256, wireguardFrames:$wireguardFrames,
         lifecycle:$captureLifecycle,
+        filter:$captureFilter,
         requiredPlaintextFrames:$requiredPlaintextFrames,
         nativePlaintextFrames:$nativePlaintextFrames},
       failClosed: {requiredBlocked:$requiredBlocked, nativeSucceeded:$nativeSucceeded},

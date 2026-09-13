@@ -647,6 +647,7 @@ traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required
 traffic_matrix native-client "${native_pod4}" "${native_pod6}" "${native_service4}" "${native_service6}" 8081
 
 stage=ciphertext-and-fail-closed
+capture_filter=$(phase9_capture_filter "${required_pod4}" "${required_pod6}" "${native_pod4}" "${native_pod6}")
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Pod
@@ -663,7 +664,7 @@ spec:
     image: ${test_tools_image}
     imagePullPolicy: IfNotPresent
     command: [/usr/bin/timeout]
-    args: ["--signal=INT", "300", "/usr/bin/tcpdump", "-U", "-ni", "br-ex", "-w", "${capture_container_path}"]
+    args: ["--signal=INT", "300", "/usr/bin/tcpdump", "-U", "-ni", "br-ex", "-w", "${capture_container_path}", "${capture_filter}"]
     securityContext: {privileged: true}
     volumeMounts: [{name: capture, mountPath: /capture}]
   - name: keeper
@@ -701,10 +702,9 @@ done
 [[ ${required_blocked} == 8 && ${native_succeeded} == 8 ]]
 restore_owned_encryption_links
 link_lowered=false
-capture_lifecycle=$(phase9_capture_finish)
+capture_lifecycle=$(phase9_capture_finish "${diagnostics}/capture")
 temporary_capture=$(mktemp)
-"${kc[@]}" -n "${namespace}" cp -c keeper \
-    "${capture_pod}:${capture_container_path}" "${temporary_capture}"
+cp "${diagnostics}/capture/received.pcap" "${temporary_capture}"
 capture_sha256=$(sha256sum "${temporary_capture}" | awk '{print $1}')
 wireguard_frames=$(tcpdump -nn -r "${temporary_capture}" 'udp and (port 51820 or port 51821)' 2>/dev/null | wc -l)
 required_plaintext_frames=$(tcpdump -nn -r "${temporary_capture}" \
@@ -822,6 +822,7 @@ jq -n \
     --arg sourceNode "${source_node}" --arg destinationNode "${destination_node}" \
     --arg capturePath "${capture_artifact}" --arg captureSha256 "${capture_sha256}" \
     --argjson captureLifecycle "${capture_lifecycle}" \
+    --arg captureFilter "${capture_filter}" \
     --argjson captureBytes "${capture_size}" --argjson wireguardFrames "${wireguard_frames}" \
     --argjson requiredPlaintextFrames "${required_plaintext_frames}" \
     --argjson nativePlaintextFrames "${native_plaintext_frames}" \
@@ -853,6 +854,7 @@ jq -n \
       traffic:{directDualStack:"passed",serviceDualStack:"passed"},
       capture:{path:$capturePath,sha256:$captureSha256,bytes:$captureBytes,
         lifecycle:$captureLifecycle,
+        filter:$captureFilter,
         wireguardFrames:$wireguardFrames,requiredPlaintextFrames:$requiredPlaintextFrames,
         nativePlaintextFrames:$nativePlaintextFrames},
       failClosed:{requiredBlocked:$requiredBlocked,nativeSucceeded:$nativeSucceeded},

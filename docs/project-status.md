@@ -30,7 +30,7 @@ repeatable test are both present in this repository.
 | Phase 6 — LoadBalancer exposure | **Verified** | Master prompt §§20–22: provider-neutral dual-stack VIP ownership, reachability, translation, health, operations, and independent platform qualification | All milestones 6.1–6.9 are Verified. Runtime revision `830771c` passed the 280-second kube-proxy-free dual-stack Kind lifecycle and, through three immutable public Quay digests, the independent 973-second five-Node dual-stack OpenShift cl02 gate qualified by revision `ade286b`; ADRs 0093–0101 |
 | Phase 7 — advanced Service selection | **Verified** | Master prompt §§20–21 and §30: internal locality, session affinity, topology preferences, graceful draining, measured scalable selection, and opt-in DSR | All milestones 7.1–7.10 are Verified. Runtime `06fc937` passed the 463-second kube-proxy-free three-Node dual-stack Kind gate and, through immutable public Quay digests, the independent 1,670-second five-Node dual-stack OpenShift cl02 gate qualified by `018f14c`; both include cross-worker DSR, recovery, convergence, and exact cleanup; ADRs 0102–0112 |
 | Phase 8 — identity-aware egress fabric | **Verified** | Master prompt §24: EgressIP/pools, identity-scoped egress, HA gateways, deterministic failover, multiple addresses, FQDN/internet controls, NAT transparency/observability, and provider-neutral reachability | All milestones 8.1–8.11 are Verified. Runtime `2f404ed` passed the 1,013-second three-Node dual-stack Kind gate and, through immutable public images, the independent 411-second five-Node dual-stack OpenShift cl02 gate qualified by `baf2bb0`. Both include zero-churn warm-standby rejoin, recovery, exact cleanup, and kube-proxy absence; ADRs 0113–0157 |
-| Phase 9 — attested encryption fabric | **In progress** | Master prompt §25: kernel WireGuard node-to-node transport, policy-required/selective encryption, key rotation, and encryption observability as the prerequisite for §26 multi-cluster | Milestones 9.1–9.8 have historical verification. ADR 0275's replica-aware runtime passed cl02 deployment and initial Required migration but failed post-fixture convergence. ADRs 0276–0278 implement deadline-bound timeout responders, bounded/versioned checkpoint fallback and explicit persistence qualification. ADR 0279 stages successor cl02 qualification, then fresh Kind. Workload-change/rotation convergence and honest bounded operations-loss accounting remain before closure and full stabilization |
+| Phase 9 — attested encryption fabric | **In progress** | Master prompt §25: kernel WireGuard node-to-node transport, policy-required/selective encryption, key rotation, and encryption observability as the prerequisite for §26 multi-cluster | Milestones 9.1–9.8 have historical verification. Current runtime `cb59e90` passed preserved-state cl02 deployment, Required migration/persistence, Required/selective dual-stack traffic and the eight-denied/eight-Native-successful fault matrix. The full gate stopped at capture-statistics validation before rotation/replacement and exact cleanup. ADRs 0285–0289 repair qualifier evidence; rerun cl02, then matching-image fresh Kind. S1–S5 heavy-load stabilization remains pending Phase 9 closure |
 
 Sections 98–99 describe the richer first enforcement and enriched-observability
 scenario. Those scenarios span the Phase 2 gate because they require a real deny
@@ -578,6 +578,12 @@ restoration, clean flush and zero reported kernel capture drops; timeout is no
 longer success. Shared regressions and a dedicated cl02 capture-control smoke
 test pass. This is not full ciphertext/fail-closed qualification; rerun cl02,
 then matching-image Kind, before marking Phase 9 Verified.
+Qualifier `2e20161` subsequently passed the eight-denied/eight-Native-successful
+fault matrix and restored owned links, but refused missing/nonzero capture-loss
+statistics after a clean 105-second capture. Raw statistics were not retained,
+so the cause is unresolved. ADR 0289 adds query-aligned filtering and raw
+statistics/pcap retention before cleanup. Its cl02 capture-control smoke passed;
+the full lifecycle still needs an uninterrupted pass before Kind.
 
 ## Updating this tracker
 
