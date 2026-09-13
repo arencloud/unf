@@ -267,6 +267,7 @@ const SERVICE_FORWARDING_MODE_ANNOTATION: &str = "network.unf.io/service-forward
 const DSR_BACKEND_VIP_OWNERSHIP_ANNOTATION: &str = "network.unf.io/dsr-backend-vip-ownership";
 const PRIMARY_CNI_NODE_LABEL_VALUE: &str = "enabled";
 const EGRESS_GATEWAY_NODE_LABEL_VALUE: &str = "enabled";
+const HOST_NETWORK_NAMESPACE: &str = "openshift-host-network";
 
 #[derive(Debug, Parser)]
 #[command(about = "UNF Kubernetes desired-state controller")]
@@ -390,6 +391,7 @@ impl From<ControllerEncryptionBaseline> for EncryptionBaseline {
 #[derive(Default)]
 struct ControllerMetrics {
     reconciles: Counter,
+    namespace_policy_invalidations_skipped: Counter,
     errors: Counter,
     telemetry_batches: Counter,
     telemetry_observations: Counter,
@@ -2097,6 +2099,11 @@ fn new_state_with_client_and_selector(
         "unf_controller_reconcile_errors",
         "Kubernetes object reconciliation errors",
         metrics.errors.clone(),
+    );
+    registry.register(
+        "unf_controller_namespace_policy_invalidations_skipped",
+        "Namespace label changes without fabric dependencies that retained the current policy revision",
+        metrics.namespace_policy_invalidations_skipped.clone(),
     );
     registry.register(
         "unf_telemetry_batches",
@@ -4883,18 +4890,17 @@ fn apply_namespace_event(state: &ControllerState, event: Event<Namespace>) {
         Event::Apply(namespace) | Event::InitApply(namespace) => {
             let name = namespace.name_any();
             let labels = normalized_namespace_labels(&name, &namespace);
-            let previous = write_lock(&state.namespaces).insert(name, labels.clone());
+            let previous = write_lock(&state.namespaces).insert(name.clone(), labels.clone());
             state.metrics.reconciles.inc();
             if previous.as_ref() != Some(&labels) {
-                bump_policy_revision(state);
+                invalidate_namespace_policy_if_needed(state, &name);
             }
         }
         Event::Delete(namespace) => {
-            if write_lock(&state.namespaces)
-                .remove(&namespace.name_any())
-                .is_some()
-            {
-                bump_policy_revision(state);
+            let name = namespace.name_any();
+            let removed = write_lock(&state.namespaces).remove(&name).is_some();
+            if removed {
+                invalidate_namespace_policy_if_needed(state, &name);
             }
         }
         Event::Init => {
@@ -4909,6 +4915,35 @@ fn apply_namespace_event(state: &ControllerState, event: Event<Namespace>) {
             finish_initial_agent_authority_watch(state, INITIAL_WATCH_NAMESPACES);
         }
     }
+}
+
+// Caller holds the policy-state write guard, so dependency observation and
+// namespace label publication are one coherent policy input change. Preserve
+// labels even for an empty namespace: later Pod/Service events must see them.
+fn invalidate_namespace_policy_if_needed(state: &ControllerState, namespace: &str) {
+    if namespace_change_affects_fabric(state, namespace) {
+        bump_policy_revision(state);
+    } else {
+        state.metrics.namespace_policy_invalidations_skipped.inc();
+    }
+}
+
+fn namespace_change_affects_fabric(state: &ControllerState, namespace: &str) -> bool {
+    let needs_initial_authority = mutex_lock(&state.revisions).policy == Revision::INITIAL;
+    needs_initial_authority
+        // Virtual host-network peers have no corresponding Pod records.
+        || namespace == HOST_NETWORK_NAMESPACE
+        || read_lock(&state.pods)
+            .values()
+            .any(|pod| pod.namespace == namespace)
+        // Conservatively retain invalidation for Service-only and orphaned
+        // EndpointSlice namespaces, including watch-order recovery.
+        || read_lock(&state.services)
+            .values()
+            .any(|service| service.namespace == namespace)
+        || read_lock(&state.endpoint_slices)
+            .values()
+            .any(|slice| slice.compiler_source.namespace == namespace)
 }
 
 fn normalized_namespace_labels(name: &str, namespace: &Namespace) -> BTreeMap<String, String> {
@@ -16411,7 +16446,6 @@ fn ipv6_endpoints_with_namespace_labels(state: &ControllerState) -> Vec<Ipv6Endp
 fn host_network_gateway_endpoint(
     namespaces: &BTreeMap<String, BTreeMap<String, String>>,
 ) -> Endpoint {
-    const HOST_NETWORK_NAMESPACE: &str = "openshift-host-network";
     endpoint_with_namespace_labels(
         &Endpoint {
             identity: IdentityId::new(u32::MAX),
@@ -21967,6 +22001,10 @@ mod tests {
     #[test]
     fn namespace_label_changes_advance_policy_revision_without_identity_churn() {
         let state = new_state(true);
+        write_lock(&state.pods).insert(
+            "frontend/client".to_owned(),
+            pod_record(1, "frontend", "client", "client"),
+        );
         apply_namespace_event(&state, Event::Apply(namespace("production")));
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(1));
         assert_eq!(mutex_lock(&state.revisions).identity, Revision::default());
@@ -21983,6 +22021,92 @@ mod tests {
         apply_namespace_event(&state, Event::Apply(namespace("staging")));
         assert_eq!(mutex_lock(&state.revisions).policy, Revision::new(2));
         assert_eq!(mutex_lock(&state.revisions).identity, Revision::default());
+    }
+
+    #[test]
+    fn empty_namespace_churn_preserves_policy_cut_and_future_labels() {
+        let state = new_state(true);
+        apply_namespace_event(&state, Event::Apply(namespace("production")));
+        // Even an empty cold start establishes a nonzero policy authority.
+        let initial = mutex_lock(&state.revisions).policy;
+        assert_eq!(initial, Revision::new(1));
+        let original = dataplane_policy_state(&state).unwrap();
+        apply_namespace_event(&state, Event::Apply(namespace("staging")));
+        assert_eq!(mutex_lock(&state.revisions).policy, initial);
+        assert_eq!(dataplane_policy_state(&state).unwrap(), original);
+        assert_eq!(
+            read_lock(&state.namespaces)["frontend"]["environment"],
+            "staging"
+        );
+        apply_namespace_event(&state, Event::Delete(namespace("staging")));
+        assert_eq!(mutex_lock(&state.revisions).policy, initial);
+        assert!(!read_lock(&state.namespaces).contains_key("frontend"));
+        apply_namespace_event(&state, Event::Apply(namespace("future")));
+        assert_eq!(mutex_lock(&state.revisions).policy, initial);
+        assert_eq!(
+            state.metrics.namespace_policy_invalidations_skipped.get(),
+            3
+        );
+        let mut metrics = String::new();
+        prometheus_client::encoding::text::encode(&mut metrics, &mutex_lock(&state.registry))
+            .unwrap();
+        assert!(metrics.contains("unf_controller_namespace_policy_invalidations_skipped_total 3"));
+        apply_pod_event(&state, Event::Apply(scheduled_pod("worker-a")));
+        assert!(mutex_lock(&state.revisions).policy > initial);
+        let endpoints = endpoints_with_namespace_labels(&state);
+        assert_eq!(endpoints.len(), 1);
+        assert_eq!(endpoints[0].namespace_labels["environment"], "future");
+        assert_eq!(
+            endpoints[0].namespace_labels["kubernetes.io/metadata.name"],
+            "frontend"
+        );
+    }
+
+    #[test]
+    fn namespace_churn_keeps_all_fabric_dependencies_invalidating() {
+        for dependency in ["pod", "host-pod", "service", "slice", "synthetic-gateway"] {
+            let state = new_state(true);
+            let mut ns = namespace("production");
+            if dependency == "synthetic-gateway" {
+                ns.metadata.name = Some("openshift-host-network".to_owned());
+            }
+            apply_namespace_event(&state, Event::Apply(ns.clone()));
+            match dependency {
+                "pod" | "host-pod" => {
+                    let mut record = pod_record(1, "frontend", "client", "client");
+                    record.host_network = dependency == "host-pod";
+                    write_lock(&state.pods).insert("frontend/client".to_owned(), record);
+                }
+                "service" => apply_service_event(&state, Event::Apply(service())),
+                "slice" => apply_endpoint_slice_event(&state, Event::Apply(endpoint_slice(true))),
+                "synthetic-gateway" => {}
+                _ => unreachable!(),
+            }
+            let before = mutex_lock(&state.revisions).policy;
+            let identity = mutex_lock(&state.revisions).identity;
+            ns.metadata
+                .labels
+                .as_mut()
+                .unwrap()
+                .insert("environment".to_owned(), "staging".to_owned());
+            apply_namespace_event(&state, Event::Apply(ns.clone()));
+            assert_eq!(
+                mutex_lock(&state.revisions).policy,
+                before.next(),
+                "{dependency}"
+            );
+            apply_namespace_event(&state, Event::Delete(ns));
+            assert_eq!(
+                mutex_lock(&state.revisions).policy,
+                before.next().next(),
+                "{dependency}"
+            );
+            assert_eq!(
+                mutex_lock(&state.revisions).identity,
+                identity,
+                "{dependency}"
+            );
+        }
     }
 
     fn converged_agent_report(epoch: u64) -> AgentStateReport {

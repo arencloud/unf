@@ -580,6 +580,13 @@ advanced while identity/Service/topology revisions remained unchanged. All
 agents reported converged and no runtime restarted. Namespace no-op handling
 is the next regression-backed repair; this slice has not run on Kind.
 
+ADR 0309 implements dependency-aware namespace invalidation with a
+fixed-cardinality skipped-work counter: empty namespaces retain labels without
+changing an already initialized policy revision; all occupied/synthetic
+dependencies remain fenced. Local verification is 747 workspace tests plus
+strict Clippy/format checks. Immutable cl02-first continuity qualification is
+pending; no resource-saving or Phase 9 completion claim is made yet.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.

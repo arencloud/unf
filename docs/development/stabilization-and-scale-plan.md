@@ -11,6 +11,11 @@ without a state reset and the matching-image gate (each: 24 allows, eight
 denials, cleanup). Controlled continuity and Required coverage are next; full
 Phase 9 lifecycle and heavy-load stabilization are still unverified.
 
+The next continuity slice failed on cl02 (ADR 0308: 10/208 fresh connections).
+ADR 0309 implements dependency-aware namespace invalidation and an observable
+skipped-work counter; local regressions pass, live qualification is pending.
+Do not run this repaired slice on Kind before cl02 passes.
+
 ADR 0303 rejects the first key-independent candidate's embedded provenance and
 repairs fail-open conditional deployment checks; rebuilding and cl02-first
 qualification remain required. Retained Kind has not been reset or upgraded.

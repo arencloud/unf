@@ -18,6 +18,9 @@ native_transport_continuity() (
         | {label:($item.metadata.name+"/"+$item.kind+"/"+(if contains(":") then "ipv6" else "ipv4" end)),
            address:.,port:(if $item.kind=="Pod" then 8080 else 18080 end)}] | select(length==8)' "$directory/fixture.json")
     controller_raw /v1/status > "$evidence/before-status.json"
+    controller_raw /metrics > "$evidence/before-metrics.txt"
+    skipped_before=$(awk '$1=="unf_controller_namespace_policy_invalidations_skipped_total" {print $2}' "$evidence/before-metrics.txt")
+    [[ $skipped_before =~ ^[0-9]+$ ]]
     # Bound the complete streaming observation externally; do not give the
     # 45-second remote probe the ordinary 15-second API request deadline.
     timeout 75 kubectl --kubeconfig "$KUBECONFIG" --context "$context" -n "$namespace" exec -i client -- sh -s -- "$targets" 45 \
@@ -47,13 +50,22 @@ native_transport_continuity() (
     wait "$probe_pid"
     probe_pid=
     controller_raw /v1/status > "$evidence/after-status.json"
+    controller_raw /metrics > "$evidence/after-metrics.txt"
+    skipped_after=$(awk '$1=="unf_controller_namespace_policy_invalidations_skipped_total" {print $2}' "$evidence/after-metrics.txt")
+    [[ $skipped_after =~ ^[0-9]+$ ]]
     "${kc[@]}" get namespaces -o json | jq -e --arg ns "$churn_namespace" 'all(.items[];.metadata.name!=$ns)' >/dev/null
-    jq -s --slurpfile events "$evidence/events.jsonl" '
+    jq -s --slurpfile events "$evidence/events.jsonl" \
+        --slurpfile before "$evidence/before-status.json" --slurpfile after "$evidence/after-status.json" \
+        --argjson skipped_before "$skipped_before" --argjson skipped_after "$skipped_after" '
         . as $records | [.[]|select(.type=="sample")] as $samples
         | {samples:($samples|length),failures:([$samples[]|select(.ok!=true)]|length),
            targets:($samples|group_by(.label)|map({label:.[0].label,samples:length,failures:([.[]|select(.ok!=true)]|length)})),
-           complete:([$records[]|select(.type=="complete")]|length==1),events:$events}' "$evidence/probes.jsonl" > "$evidence/summary.json"
-    jq -e '.complete==true and .failures==0 and (.targets|length)==8 and all(.targets[];.samples>=3)' "$evidence/summary.json" >/dev/null
+           complete:([$records[]|select(.type=="complete")]|length==1),events:$events,
+           policyRevisionBefore:$before[0].revisions.policy,policyRevisionAfter:$after[0].revisions.policy,
+           skippedInvalidations:($skipped_after-$skipped_before)}' "$evidence/probes.jsonl" > "$evidence/summary.json"
+    jq -e '.complete==true and .failures==0 and (.targets|length)==8 and all(.targets[];.samples>=3)
+        and (.policyRevisionBefore|type)=="number" and .policyRevisionBefore>0
+        and .policyRevisionBefore==.policyRevisionAfter and .skippedInvalidations>=3' "$evidence/summary.json" >/dev/null
     jq -se '.[0].type=="started" and .[-1].type=="complete"
         and .[-1].failures==0 and .[-1].samples==([.[]|select(.type=="sample")]|length)
         and all(.[]; .type=="started" or .type=="complete" or (.type=="sample" and .ok==true))' "$evidence/probes.jsonl" >/dev/null
