@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 # Sourced by the reply gate. One tokenless host-network capture, no host mounts.
+required_reply_preserve_failure_capture() {
+    phase9_capture_finish "$directory/failed-capture" |
+      jq -ce 'del(.explicitStopAfterFault) + {explicitStopAfterTraffic:true}'
+}
+
 required_reply_capture_start() {
     local family
     capture_pod=underlay-capture

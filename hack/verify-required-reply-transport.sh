@@ -20,6 +20,8 @@ directory=${UNF_REQUIRED_REPLY_DIAGNOSTICS:?new evidence directory required}
 [[ ! -e $directory ]]
 install -d -m 0700 "$directory"
 owned=false
+capture_started=false
+capture_finished=false
 forward_pid=
 stage=preflight
 source "$project_root/hack/phase9-http-probe.sh"
@@ -38,7 +40,15 @@ cleanup() {
 }
 failure() {
     local status=$?
+    if [[ $capture_started == true && $capture_finished == false ]]; then
+        # Retain failure evidence before deleting the owned Namespace. This
+        # does not turn a failed traffic run into plaintext-absence evidence.
+        if ! required_reply_preserve_failure_capture > "$directory/failed-capture-lifecycle.json" 2> "$directory/failed-capture-observer.log"; then
+            echo 'Failure capture incomplete; do not infer plaintext absence' >&2
+        fi
+    fi
     "${read_api[@]}" -n "$namespace" get pods,services,networkpolicies,encryptionpolicies -o json > "$directory/failed-fixture.json" 2>&1 || true
+    jq -n --arg stage "$stage" --argjson status "$status" '{result:"failed",stage:$stage,exitCode:$status}' > "$directory/failure.json"
     printf 'Required reply qualification failed at %s; retain %s\n' "$stage" "$directory" >&2
     return "$status"
 }
@@ -154,8 +164,17 @@ udp_probe() {
     case $result in udp-ok) return 0;; network-denied) return 1;; *) return 2;; esac
 }
 probe() {
+    local status=0
     printf 'Probe %s from %s to %s:%s\n' "$1" "$2" "$3" "$4"
-    case $1 in tcp) phase9_http_probe_once "$2" "$3" "$4";; udp) udp_probe "$2" "$3" "$4";; *) return 2;; esac
+    case $1 in
+        tcp) phase9_http_probe_once "$2" "$3" "$4" || status=$?;;
+        udp) udp_probe "$2" "$3" "$4" || status=$?;;
+        *) status=2;;
+    esac
+    jq -cn --arg protocol "$1" --arg pod "$2" --arg address "$3" --argjson port "$4" --argjson status "$status" \
+      --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '{at:$at,protocol:$protocol,pod:$pod,address:$address,port:$port,exitCode:$status}' >> "$directory/probes.jsonl"
+    return "$status"
 }
 listener_ready() {
     local deadline=$((SECONDS+30))
@@ -190,6 +209,7 @@ required_reply_wait_generation required
 stage=capture-and-traffic
 source "$project_root/hack/required-reply-capture.sh"
 required_reply_capture_start
+capture_started=true
 allowed=0
 for client in required-client native-client; do
     for kind in Pod Service; do
@@ -221,6 +241,7 @@ for client in required-client native-client; do
 done
 [[ $allowed == 24 && $denied == 8 ]]
 required_reply_capture_finish
+capture_finished=true
 stage=cleanup
 "${kc[@]}" delete namespace "$namespace" --wait=true --timeout=180s >/dev/null
 owned=false

@@ -31,4 +31,20 @@ jq -L "$root/hack" -ne '
 ' >/dev/null
 bash "$root/hack/verify-phase9-capture.sh"
 rg -Fq 'del(.explicitStopAfterFault) + {explicitStopAfterTraffic:true}' "$root/hack/required-reply-capture.sh"
+rg -Fq 'required_reply_preserve_failure_capture >' "$root/hack/verify-required-reply-transport.sh"
+rg -Fq '"$directory/probes.jsonl"' "$root/hack/verify-required-reply-transport.sh"
+source "$root/hack/required-reply-capture.sh"
+directory=$(mktemp -d)
+trap 'rm -r -- "$directory"' EXIT
+phase9_capture_finish() {
+    mkdir -p "$1"
+    printf 'retained-failed-run-pcap\n' > "$1/received.pcap"
+    jq -n '{explicitStopAfterFault:true,exitCode:0,packetsDroppedByKernel:0}'
+}
+required_reply_preserve_failure_capture | jq -e '.explicitStopAfterTraffic and (has("explicitStopAfterFault")|not)' >/dev/null
+[[ -s $directory/failed-capture/received.pcap ]]
+phase9_capture_finish() { return 1; }
+if required_reply_preserve_failure_capture >/dev/null 2>&1; then
+    echo 'Failed capture observation must not be accepted' >&2; exit 1
+fi
 echo 'Required reply gate rejects incomplete/stale/foreign cuts and unbound reply provenance'
