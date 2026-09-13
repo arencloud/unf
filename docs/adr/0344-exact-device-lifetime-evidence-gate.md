@@ -34,3 +34,10 @@ the kernel slice; then commit/push before identical-image Kind. The pending
 live locality consumer still needs authenticated placement, immutable source
 attachment authority, banked publication, post-policy/post-Service integration,
 restart/recovery and measured costs. L3, L4/L5, Q and S1–S5 remain open.
+
+The first corrected cl02 run (`bf495ca`) fails before traffic: its software-only
+flower filter references a separately created action without matching offload
+flags. The kernel explicitly rejects the mismatch. Both action creations now
+also specify `skip_hw`, as supported by the pinned tc command's action syntax.
+The failed fixture is retained and cleaned up; no denial/continuity evidence
+is inferred from this setup failure. The complete cl02 rerun remains required.

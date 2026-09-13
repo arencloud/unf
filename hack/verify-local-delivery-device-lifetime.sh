@@ -94,7 +94,7 @@ create_target "$destination"
 start_receivers "$destination" genuine
 start_receivers "$replacement" replacement
 fabric_tc qdisc add dev source clsact
-fabric_tc actions add action mirred egress redirect dev target index 101
+fabric_tc actions add action mirred egress redirect dev target index 101 skip_hw
 for family in ip ipv6; do
     priority=10; address=10.244.46.2; port=17777
     [[ $family != ipv6 ]] || { priority=11; address=fd46::2; port=17778; }
@@ -142,7 +142,7 @@ read_action 101 reused-action
 [[ ! -s $directory/replacement-v4.payload && ! -s $directory/replacement-v6.payload ]]
 
 stage=explicit-fresh-device-binding
-fabric_tc actions add action mirred egress redirect dev target index 102
+fabric_tc actions add action mirred egress redirect dev target index 102 skip_hw
 read_action 102 candidate-action
 fabric_tc -j filter show dev source ingress > "$directory/pre-rebind-filters.json"
 for family in ip ipv6; do
