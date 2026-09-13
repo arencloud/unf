@@ -13,15 +13,6 @@ socket=/host/run/unf/cni.sock
 desired_binary_sha256=$(sha256sum "${binary_source}" | cut -d ' ' -f 1)
 desired_config_sha256=$(sha256sum "${config_source}" | cut -d ' ' -f 1)
 
-for _ in $(seq 1 180); do
-    [ -S "${socket}" ] && break
-    sleep 1
-done
-if [ ! -S "${socket}" ]; then
-    echo "refusing primary-CNI installation before the local agent socket is ready" >&2
-    exit 1
-fi
-
 for directory in /host/var/lib/cni/bin /host/etc/kubernetes/cni/net.d; do
     if [ ! -d "${directory}" ] || [ -L "${directory}" ]; then
         echo "refusing missing or symbolic-link OpenShift CNI directory ${directory}" >&2
@@ -87,6 +78,32 @@ else
         fi
     fi
 fi
+
+# A socket pathname can outlive the old agent. Probe with the candidate CNI
+# client before replacing any owned artifact; a cached readiness lease must
+# never admit an incompatible or unavailable transaction server.
+probe_wait=${UNF_INSTALL_AGENT_WAIT_SECONDS:-180}
+case ${probe_wait} in
+    [1-9]|[1-9][0-9]|1[0-7][0-9]|180) ;;
+    *) echo 'CNI installer protocol wait must be between 1 and 180 seconds' >&2; exit 1 ;;
+esac
+probe_deadline=$(( $(date +%s) + probe_wait ))
+probe_attempt=0
+while :; do
+    probe_attempt=$(( probe_attempt + 1 ))
+    if [ -S "${socket}" ] && probe_result=$(timeout 5 env CNI_COMMAND=STATUS "${binary_source}" <<'JSON'
+{"cniVersion":"1.1.0","name":"unf-primary-install-probe","type":"unf","agentSocket":"/host/run/unf/cni.sock","statusLeasePath":"/host/run/unf/cni-status.lease","statusGracePeriodSeconds":0,"ipam":{"type":"unf"}}
+JSON
+    ); then
+        break
+    fi
+    if [ "$(date +%s)" -ge "${probe_deadline}" ] || [ "${probe_attempt}" -ge "${probe_wait}" ]; then
+        echo 'refusing primary-CNI installation before a protocol-compatible local agent responds' >&2
+        printf '%s\n' "${probe_result:-local agent socket is absent}" >&2
+        exit 1
+    fi
+    sleep 1
+done
 
 binary_tmp=${binary_target}.tmp.$$
 config_tmp=${config_target}.tmp.$$

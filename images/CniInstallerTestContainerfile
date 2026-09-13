@@ -1,0 +1,21 @@
+ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
+ARG TEST_TOOLS_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:e9cce439d92d0f7d3d6751f234e397a7efc29f9983bc0ae8fc318432c4ff2352
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY bins ./bins
+COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
+COPY deploy/openshift-primary-cni/runtime ./deploy/openshift-primary-cni/runtime
+RUN cargo test --locked --release --package unf-cni --test installer_protocol --no-run \
+    && test "$(find target/release/deps -maxdepth 1 -type f -name 'installer_protocol-*' -executable | wc -l)" -eq 1 \
+    && find target/release/deps -maxdepth 1 -type f -name 'installer_protocol-*' -executable \
+       -exec install -m 0755 '{}' /tmp/installer-protocol-tests ';'
+
+FROM ${TEST_TOOLS_IMAGE}
+ARG UNF_SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
+COPY --from=builder /src/target/release/unf-cni /usr/local/bin/unf-cni
+COPY --from=builder /tmp/installer-protocol-tests /usr/local/bin/installer-protocol-tests
+ENV UNF_CNI_INSTALLER_TEST_BINARY=/usr/local/bin/unf-cni
+ENTRYPOINT ["/usr/local/bin/installer-protocol-tests", "--test-threads=1", "--nocapture"]

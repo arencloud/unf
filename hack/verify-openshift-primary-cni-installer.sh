@@ -14,7 +14,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for command in podman skopeo socat; do
+for command in podman skopeo socat jq; do
     command -v "${command}" >/dev/null || {
         echo "OpenShift primary-CNI installer test prerequisite is missing: ${command}" >&2
         exit 1
@@ -38,7 +38,8 @@ install -m 0444 \
     "${project_root}/deploy/openshift-primary-cni/runtime/10-unf.conflist" \
     "${fixture}/install/10-unf.conflist"
 
-socat "UNIX-LISTEN:${fixture}/host/run/unf/cni.sock,fork" EXEC:/bin/true &
+socat "UNIX-LISTEN:${fixture}/host/run/unf/cni.sock,fork" \
+    "EXEC:/bin/sh '${project_root}/hack/cni-installer-test-peer.sh'" &
 socket_pid=$!
 for _ in $(seq 1 50); do
     [[ -S ${fixture}/host/run/unf/cni.sock ]] && break

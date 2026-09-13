@@ -54,6 +54,9 @@ ADR 0331 verifies all four interrupted-creation states and twelve negative
 checks on isolated cl02; ADR 0332 verifies the identical image on retained Kind.
 Both live fleets remain unchanged. Protocol-compatible live rollout and the
 actual locality consumer remain pending.
+ADR 0333 adds a locally verified OpenShift candidate-protocol installation gate:
+787 workspace tests pass. Its isolated cl02/Kind packaging qualification and
+the Kind live upgrade ordering remain open; no live installation has changed.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,
