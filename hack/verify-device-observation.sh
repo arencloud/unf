@@ -68,8 +68,8 @@ if [[ -e /sys/kernel/btf/veth ]]; then
 else
     jq -n '{types:[]}' > "$directory/veth.json"
 fi
-jq -n -L /usr/local/share/unf-qualification --slurpfile vm "$directory/vmlinux.json" --slurpfile module "$directory/veth.json" \
-    'include "device-observation-layout"; [$vm[0],$module[0]]|device_observation_layout' > "$directory/layout.json"
+jq -n -L /usr/local/share/unf-qualification --slurpfile vm "$directory/vmlinux.json" --slurpfile veth_types "$directory/veth.json" \
+    'include "device-observation-layout"; [$vm[0],$veth_types[0]]|device_observation_layout' > "$directory/layout.json"
 stage=verifier-load
 install -d -m 0700 "$directory/bpffs"
 mount -t bpf bpf "$directory/bpffs"

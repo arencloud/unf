@@ -58,3 +58,12 @@ serial counters, not concurrent/lossless telemetry. Full delivery lifetime,
 concurrent movement, source/target ownership, banked generation/policy/Service/
 egress composition, verifier portability and performance remain separate work.
 Run cl02 first, then the identical immutable image on retained Kind.
+
+The first cl02 attempt on source `e47af7f`, image
+`quay.io/arencloud/unf-test-tools-dev@sha256:400127e6092d2d1504070cf911afdac5a108a4ddcb9ade1ac904e9ffb2d9360f`,
+fails before verifier load: the fixture's older jq reserves `$module`, whereas
+the workstation parser accepted it. The wrapper variable is renamed to
+`$veth_types` and checked against the image's parser. Raw BTF and failure
+evidence remain under `.artifacts/p9-device-observation-e47af7f-cl02`; private
+and Kubernetes namespaces are cleaned up. No diagnostic BPF was loaded, no
+live UNF program changed, and Kind is not advanced from this failed attempt.
