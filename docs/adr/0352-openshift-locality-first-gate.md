@@ -28,7 +28,8 @@ The first expanded gate on qualifier `41e9563` establishes:
   address records, joined to public plans and fresh reported coordinates.
 - 24 allowed requests and eight unsolicited reverse denials across IPv4/IPv6
   TCP/UDP, cross-worker PodIP, Service and translated Service ports.
-- An explicitly stopped capture, 22:37:30–22:41:12 UTC on September 13:
+- An explicitly stopped capture (capture container lifetime
+  22:37:30–22:41:12 UTC on September 13, including its start-marker wait):
   175 WireGuard frames, zero captured Required plaintext, 72 Native plaintext
   frames, and zero kernel capture loss. Capture SHA-256:
   `861005dae972c97f17f2cba9907c81d8a3258b100e351a1ce0b61ce61534dd80`.

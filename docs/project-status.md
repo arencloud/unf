@@ -654,6 +654,11 @@ The first new gate proves candidate replay and passes its 24-allow/eight-denial
 traffic/ciphertext portion, but fails an API TLS read during Native cleanup.
 Independent cleanup/convergence checks succeed; a fresh full cl02 gate is
 required before matching Kind. No Phase 9/stabilization row is promoted.
+ADR 0353 verifies that fresh complete cl02 gate on the same `f984db9` images:
+two placement replays/retirements, three CNI UID/nonce bindings/retirements,
+24 allowed/eight denied requests, 188 WireGuard frames, zero captured Required
+plaintext and zero capture loss. Final logs and state are reviewed; matching
+Kind is next. This remains candidate-only, not a verified L3 packet consumer.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
