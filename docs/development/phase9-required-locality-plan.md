@@ -83,6 +83,10 @@ next; live binaries remain unchanged.
 ADR 0342 verifies the identical isolated Kind image and complete red/green
 matrix, with retained rotated-log review. Both platform snapshot gates pass;
 continuous device-lifetime fencing and authenticated consumption remain open.
+ADR 0343 starts an isolated device-reference delivery investigation for that
+lifetime gap. The fixture is implemented but emits no verified result until
+positive delivery, target invalidation and attempt/drop evidence pass a strict
+gate on cl02 before Kind. It is not a live plaintext exception.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

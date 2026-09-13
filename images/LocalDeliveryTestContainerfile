@@ -1,0 +1,6 @@
+ARG TEST_TOOLS_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:e9cce439d92d0f7d3d6751f234e397a7efc29f9983bc0ae8fc318432c4ff2352
+FROM ${TEST_TOOLS_IMAGE}
+ARG UNF_SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
+COPY hack/verify-local-delivery-device-lifetime.sh /usr/local/bin/verify-local-delivery-device-lifetime
+ENTRYPOINT ["bash", "/usr/local/bin/verify-local-delivery-device-lifetime"]

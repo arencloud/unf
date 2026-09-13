@@ -8,4 +8,5 @@ ebpf/unf-ebpf-tc/target/
 docs/
 hack/*
 !hack/verify-cni-workload-ownership.sh
+!hack/verify-local-delivery-device-lifetime.sh
 tests/

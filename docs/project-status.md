@@ -604,6 +604,9 @@ ADR 0342 verifies the matching isolated Kind namespace-impostor regression
 and cleanup. Both kernel snapshot gates pass; live runtime stays `450de80`.
 Continuous device-lifetime fencing and authenticated locality consumption are
 still required; no full Phase 9 or stabilization row is promoted.
+ADR 0343 adds an isolated TC device-reference lifecycle investigation fixture
+for L3's continuous-lifetime gap. Kernel qualification and the strict positive
+attempt/drop evidence gate remain pending; no live dataplane changes are made.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
