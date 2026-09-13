@@ -598,6 +598,11 @@ and exact namespace ownership. Shared regressions pass under jq 1.6/1.8.1.
 Focused cl02 checks distinguish real healthy/refused connections, detect live
 encryption state, and positively confirm post-gate absence on all five hosts.
 Run the stricter full cl02 gate before fresh Kind; Phase 9 remains In progress.
+The first strict run (`c076962`) timed out during Required migration with an
+incomplete four-Node snapshot and one observed pending predecessor. Kind image
+downloads were concurrent and are now stopped to remove observer-link contention
+as a variable, not as an asserted root cause. Repeat without those transfers;
+the new outage/cleanup assertions and Kind remain live-pending (ADR 0290).
 
 ## Updating this tracker
 

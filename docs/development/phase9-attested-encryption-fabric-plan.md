@@ -188,6 +188,10 @@ bounded persistence/operations, the 2-GiB controller limit, final convergence
 and before/after operator state. Then qualify the same immutable images on
 fresh Kind. The six unhealthy cl02 operators remain a stabilization concern;
 no newly unhealthy delta is not whole-cluster health.
+The first stricter run timed out during Required migration with one missing
+Node snapshot and another pending predecessor. Repeat without the concurrent
+workstation image transfers before attributing the failure; preserve the same
+runtime, invariants and deadlines (ADR 0290).
 
 After Phase 9 closes, follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate

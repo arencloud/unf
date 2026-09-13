@@ -63,3 +63,23 @@ firewall check and reported zero encryption links, rules and routes in both
 families. Temporary debug Pods were removed. These focused checks are not a
 replacement for the stricter uninterrupted full run, which must pass on cl02
 before the identical pinned runtime is qualified on fresh Kind.
+
+## First stricter run
+
+Qualifier `c076962` passed all five firewall/jq preflights, but timed out during
+Required migration on the unchanged `cb59e90` runtime. Its last snapshot
+contained only four Nodes: three reported generation 1789263303363/epoch 467;
+one retained generation 1789263229881/epoch 466 with that newer cut pending.
+The source worker snapshot was absent. This run did not reach the new outage
+probe or final cleanup assertions and does not supersede the prior passing
+gate's exact scope. Diagnostics are retained under
+`.artifacts/phase9-cb59e90-strict-evidence-openshift-diagnostics`.
+
+Concurrent workstation registry image downloads were active during this run.
+They were stopped before further diagnosis to remove observer-link contention
+as a variable; they are not a proven cause of the timeout. No Kind cluster or
+feature test was started. The failure handler restored Native intent and the
+replacement controller became Ready with zero restarts; all five Nodes were
+Ready. Actual cleanup is not inferred from intent/readiness alone. Repeat the
+strict gate without parallel image transfers before attributing the failure or
+moving to Kind; no convergence deadline is increased.
