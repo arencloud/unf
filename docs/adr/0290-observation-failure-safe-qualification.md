@@ -2,7 +2,7 @@
 
 Date: 2026-09-13
 
-Status: assertion audit implemented; stricter full cl02/Kind runs pending
+Status: assertion audit and stricter full cl02 verified; matching-image Kind pending
 
 ## Findings
 
@@ -83,3 +83,40 @@ replacement controller became Ready with zero restarts; all five Nodes were
 Ready. Actual cleanup is not inferred from intent/readiness alone. Repeat the
 strict gate without parallel image transfers before attributing the failure or
 moving to Kind; no convergence deadline is increased.
+
+## Stricter cl02 control run passed
+
+Runtime `cb59e9080a4cce5544c1ae3c69974233d53d8c52`, qualifier
+`dbefd3e41257a6c801523967bcc29e15236b40a9`, passed the full gate at
+2026-09-13 02:04:15 UTC in 1,420 seconds, without parallel registry downloads.
+This removes that variable from this passing run; it does not establish the
+cause of the preceding timeout or prove repeated-run reliability.
+
+- Eight strict Required network-denial results and eight healthy Native results;
+  command/observation errors cannot satisfy denial.
+- Capture ran 01:52:28–01:54:10 UTC, stopped explicitly after the fault window,
+  exited zero and reported zero kernel drops. Offline counts: 563 WireGuard,
+  zero Required plaintext, and 200 Native plaintext frames.
+- Source-agent replacement, natural key rotation and controller replacement
+  passed. All eight persistence checkpoints reported positive writes, zero
+  errors/restarts, and the 2-GiB controller ceiling. Maximum stored state was
+  881,608 bytes; all sampled codecs were gzip, not a live zstd-transition test.
+- Independent history replay covered revisions 3,226,000–3,674,836 with 512
+  retained records and zero reported upstream loss. Retention evicted 448,836
+  observations across the comparison; the claim is retained-window-only.
+- All five Nodes converged to Native generation 1789264948131 with no pending
+  generation or encryption epochs. Every successful host snapshot positively
+  reported zero owned links, IPv4/IPv6 rules and routes. Final agents converged.
+- The same six operators remained unhealthy; none newly unhealthy. Internal
+  DNS and direct Pod-endpoint timeouts remain unresolved stabilization work,
+  not an external-DNS-only issue or evidence of whole-cluster health.
+
+Private evidence is archived as
+`.artifacts/phase9-cb59e90-dbefd3e-openshift.json` (SHA-256
+`5950ed9152825209424c3203eeb0cec1d2fe4df5e0b90228ac2893b89bd3a942`)
+and the corresponding `.pcap` (SHA-256
+`c7b7c44a701840385dc8ab08cd34d46bca0ff85580d92617ca33ea8ec2500304`).
+Raw capture, history and per-Node cleanup observations remain under
+`.artifacts/phase9-cb59e90-isolated-observer-openshift-diagnostics`.
+Qualify these exact immutable runtime images on fresh Kind next. Phase 9 and
+S1–S5 are not declared complete by this cl02 result.

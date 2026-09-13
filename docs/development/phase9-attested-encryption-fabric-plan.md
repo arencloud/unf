@@ -189,9 +189,13 @@ and before/after operator state. Then qualify the same immutable images on
 fresh Kind. The six unhealthy cl02 operators remain a stabilization concern;
 no newly unhealthy delta is not whole-cluster health.
 The first stricter run timed out during Required migration with one missing
-Node snapshot and another pending predecessor. Repeat without the concurrent
-workstation image transfers before attributing the failure; preserve the same
-runtime, invariants and deadlines (ADR 0290).
+Node snapshot and another pending predecessor. The unchanged-runtime control
+run without registry transfers passed the full stricter gate in 1,420 seconds
+at 2026-09-13 02:04:15 UTC (qualifier `dbefd3e`, ADR 0290). It includes all eight
+strict denials, zero-loss ciphertext capture, recovery/rotation and positive
+all-zero cleanup snapshots on every Node. This does not attribute the prior
+timeout to registry contention. Matching-image fresh Kind is now next; internal
+DNS/Pod-endpoint failures remain an explicit stabilization dependency.
 
 After Phase 9 closes, follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
