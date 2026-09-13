@@ -13,23 +13,23 @@ are claimed.
 
 ADR 0318 adds locally verified Required policy-tracked reply contracts with
 explicit initiating-pair provenance and fail-closed schema-2 compatibility.
-cl02 now runs candidate `67c2772` with a Native baseline; retained Kind remains
-on `5ea1bd2`. Required reply traffic has not yet been qualified on either
-platform. ADR 0319 publishes
-candidate `67c2772` and a scoped cl02-first reply/ciphertext gate, with exact
-policy/generation adoption and public reply-provenance checks.
+Both cl02 and retained Kind now run `67c2772` with a Native baseline.
+ADRs 0319–0324 implement and qualify the scoped selective Required reply gate
+on cl02 first, then identical-image Kind, with exact policy/generation adoption,
+public reply provenance, ciphertext and cleanup checks.
 ADR 0320 records the first cl02 reply gate failing its IPv6 translated UDP
 probe after admission and 11 preceding probes. Failed-capture retention is
 repaired; root cause remains under investigation. Native cleanup is positively
-verified; Kind is not advanced past the failed cl02 gate.
+verified; Kind was not advanced past that failed cl02 gate.
 ADR 0321 records a later destination-side revision mismatch during a failed
 Native TCP control and moves capture-object preparation before admission.
 This corrects a moving-fixture qualifier, not S4's policy/Service update
 continuity requirement. ADR 0322 verifies the corrected scoped cl02 reply
 gate (12 Required requests, 12 Native controls, eight reverse denials,
-ciphertext and Native cleanup); matching-image retained Kind is next.
+ciphertext and Native cleanup). ADRs 0323–0324 then verify the live-revision
+observer on cl02 first and matching retained Kind, closing this reply slice.
 
-Next: qualify Required replies on cl02 before Kind, finish Required locality/replica coverage and full current
+Next: finish Required locality/replica coverage and full current
 runtime lifecycle qualification, cl02 before Kind. Empty-Namespace no-op
 continuity does not establish arbitrary policy/Service update atomicity. Active
 tuple collisions and LRU capacity behavior remain load-envelope boundaries.
@@ -64,7 +64,7 @@ remain in ignored, owner-only local files and never enter evidence or Git.
 
 | Step | State | Required exit evidence |
 |---|---|---|
-| P9 coverage repair | In progress | ADRs 0316–0317: runtime `5ea1bd2` passes Native/empty-Namespace continuity and cleanup on cl02 then matching-image retained Kind. Required locality/replica/reply coverage and full lifecycle qualification remain open |
+| P9 coverage repair | In progress | ADRs 0316–0317 qualify Native/empty-Namespace continuity. ADRs 0323–0324 qualify scoped Required replies/ciphertext/cleanup on identical `67c2772` images, cl02 first then retained Kind. Required locality/replicas and full lifecycle qualification remain open |
 | S1 baseline and budgets | In progress | Attribute internal DNS/Pod-endpoint failures and operator health first; feature/limit inventory; hardware/kernel/MTU/offloads, endpoints/policies/services/flows; idle/loaded CPU, RSS/cgroup peak, BPF memory, throughput, latency percentiles, convergence |
 | S2 control-plane scale | Pending | Profile policy compilation, snapshots, informer churn and agent pulls; remove measured repeated work; bound queues/caches; compare equal input and churn fixtures before/after |
 | S3 agent and dataplane efficiency | Pending | Map occupancy/update work, connection creation/expiry, telemetry backpressure, Service selection, encryption and egress under mixed dual-stack load; policy correctness and bounded recovery |
@@ -84,6 +84,8 @@ These observations guide later work; they do not mark S1–S5 complete.
 
 | Observation | Required follow-up |
 |---|---|
+| Capture-object creation after adoption exposes a destination policy/encryption revision fence; corrected steady-state reply gates pass both platforms | ADRs 0321–0324: keep observer setup before admission; S4 must separately qualify real policy/Service churn continuity without relaxing authority checks |
+| Kind's three agent log tails reach the 2-MiB cap; retained current/rotated logs total 20,788,148 bytes in the reply audit; telemetry/egress requests time out before the test | ADR 0324: S1/S3 measure and reduce per-packet log amplification; S4 attribute controller-request continuity. Retained logs have no ERROR/restart; do not infer lossless history or zero operational failures |
 | Runtime `571379d` passes expanded cl02 Native isolation/translated-port coverage; DNS/OAuth later recover after initial timeouts | ADRs 0295–0296: fresh matching-image Kind, then controlled traffic continuity during reconciliation/churn; do not turn a steady-state pass into an uninterrupted-service claim |
 | Short pre-repair sample: controller 1.335 CPU cores; agents 0.155–0.253 cores with 343–663 MiB cgroup memory; original agent RSS figures withdrawn | ADR 0295 correction: `/proc/1` was host systemd because agents use hostPID. Match the UNF executable within its container cgroup before sampling RSS. Repeat controlled healthy workloads with pinned/shared/file accounting and longer windows; do not compare freshly restarted cgroups as equal workloads |
 | S1 synchronized capture and kernel readback show missing same-Node Native and policy-isolated-return decisions despite policy-allowed requests | ADR 0293: reproduce, repair explicit transport coverage without weakening Required/policy checks, measure state/CPU impact, then cl02-first/Kind qualification; assess Required locality/replica/return cases separately |

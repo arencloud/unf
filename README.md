@@ -742,12 +742,11 @@ transport failures, so affected qualification is reopened for repair
 Phase 9 remains open for Required coverage and lifecycle requalification.
 Runtime `5ea1bd2` passes the expanded Native expiry/churn gate on cl02, then
 matching-image retained Kind (ADRs 0316–0317). Required reply contracts now
-have explicit initiating-policy provenance and local regression coverage;
-live Required replies and locality remain pending. The cl02 reply gate exposed
-a destination revision fence; observer setup now precedes adoption, with
-the corrected scoped cl02 gate now passes all 24 requests, eight reverse
-denials, ciphertext and cleanup checks. Matching Kind remains next
-(ADRs 0318, 0320–0322).
+have explicit initiating-policy provenance. Runtime `67c2772` passes the scoped
+Required reply gate on cl02, then matching-image retained Kind: 12 Required
+requests, 12 Native controls, eight reverse denials, ciphertext and exact
+cleanup. Required locality/replicas and full lifecycle requalification remain
+open (ADRs 0318, 0320–0324).
 The [stabilization and scale plan](docs/development/stabilization-and-scale-plan.md)
 tracks operator/reachability findings, log volume, feature interactions and
 resource-versus-load measurements. Bounded qualification does not mean

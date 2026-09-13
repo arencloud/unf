@@ -30,7 +30,9 @@ Current repair checkpoint (ADRs 0316–0318): Native expiry/empty-Namespace
 continuity passes cl02 then matching-image retained Kind on runtime `5ea1bd2`.
 Required policy-tracked reply contracts are locally verified with explicit
 initiating-pair provenance and schema 2. ADR 0322 qualifies the scoped live
-reply gate on cl02 with ciphertext and exact cleanup; matching Kind is next.
+reply gate on cl02 with ciphertext and exact cleanup. ADRs 0323–0324 verify
+the strict live-revision observer on cl02 first, then matching-image retained
+Kind. Both platforms run `67c2772`; the scoped Required reply slice is closed.
 Required locality/replica coverage and complete lifecycle requalification
 remain open. Historical platform results above do not close these gaps.
 
