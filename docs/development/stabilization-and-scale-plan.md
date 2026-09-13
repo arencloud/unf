@@ -60,6 +60,12 @@ normal retirements, 24 allowed/eight denied probes, ciphertext and exact cleanup
 Current and rotated CRI logs retain proof/plan/activation warnings and significant
 per-packet INFO volume. Both fleets are Native/converged with zero current UNF
 container restarts. Required locality consumption and S1–S5 remain open.
+ADRs 0340–0342 strengthen reciprocal veth readback with descriptor-bound
+namespace identity and verify the cloned-peer red/green regression on cl02
+then identical-image Kind. All 790 local tests pass. Live binaries stay
+`450de80`; this is an attachment snapshot prerequisite, not locality admission.
+Kind's post-test rotated-log review spans 129,848,221 bytes, retaining the
+per-packet INFO resource finding for S3.
 
 Repair evidence is retained chronologically in the ADRs:
 

@@ -600,6 +600,10 @@ cl02 then matching Kind execution remains pending. Live fleets stay `450de80`.
 ADR 0341 verifies isolated cl02 namespace-impostor red/green behavior and all
 fourteen ownership negatives with cleanup; matching Kind is next. Current
 controller/agent/installer logs are reviewed; runtime remains `450de80`.
+ADR 0342 verifies the matching isolated Kind namespace-impostor regression
+and cleanup. Both kernel snapshot gates pass; live runtime stays `450de80`.
+Continuous device-lifetime fencing and authenticated locality consumption are
+still required; no full Phase 9 or stabilization row is promoted.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

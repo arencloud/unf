@@ -80,6 +80,9 @@ This remains snapshot evidence, not a packet-time device-lifetime capability.
 ADR 0341 verifies the expanded isolated cl02 gate, including old-accept/new-reject
 namespace impostors with matching reciprocal index numbers. Matching Kind is
 next; live binaries remain unchanged.
+ADR 0342 verifies the identical isolated Kind image and complete red/green
+matrix, with retained rotated-log review. Both platform snapshot gates pass;
+continuous device-lifetime fencing and authenticated consumption remain open.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,
