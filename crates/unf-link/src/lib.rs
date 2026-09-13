@@ -346,6 +346,9 @@ impl VethPlan {
                     operation: "create veth",
                     source,
                 })?;
+            if self.host_alias.starts_with("unf:cni:v2:") {
+                self.seal_just_created_pair(handle).await?;
+            }
         }
 
         let host = require_link(handle, &self.host_name).await?;
@@ -371,6 +374,54 @@ impl VethPlan {
                 operation: "configure host endpoint",
                 source,
             })
+    }
+
+    // Some kernels do not retain IFLA_IFALIAS from RTM_NEWLINK. Only the
+    // successful exclusive creator may seal that initially unaliased pair.
+    // Existing-link recovery must never call this path or infer this receipt.
+    async fn seal_just_created_pair(&self, handle: &Handle) -> Result<(), LinkError> {
+        let host = require_link(handle, &self.host_name).await?;
+        let peer = require_link(handle, &self.temporary_peer_name).await?;
+        validate_created_pair(self, &host, &peer)?;
+        for (index, alias) in [
+            (peer.header.index, &self.peer_alias),
+            (host.header.index, &self.host_alias),
+        ] {
+            handle
+                .link()
+                .set(LinkUnspec::new_with_index(index).alias(alias).build())
+                .execute()
+                .await
+                .map_err(|source| LinkError::Netlink {
+                    operation: "seal exclusively created workload endpoint",
+                    source,
+                })?;
+        }
+        let sealed_host = require_link(handle, &self.host_name).await?;
+        let sealed_peer = require_link(handle, &self.temporary_peer_name).await?;
+        if sealed_host.header.index != host.header.index
+            || sealed_peer.header.index != peer.header.index
+        {
+            return Err(conflict(
+                &self.host_name,
+                "created pair changed while sealing ownership",
+            ));
+        }
+        validate_created_pair(self, &sealed_host, &sealed_peer)?;
+        validate_owned_link(
+            &sealed_host,
+            &self.host_name,
+            &self.host_alias,
+            self.mtu,
+            self.host_address,
+        )?;
+        validate_owned_link(
+            &sealed_peer,
+            &self.temporary_peer_name,
+            &self.peer_alias,
+            self.mtu,
+            self.peer_address,
+        )
     }
 
     async fn move_temporary_peer(
@@ -1667,6 +1718,51 @@ fn validate_owned_link(
     Ok(())
 }
 
+fn validate_created_pair(
+    plan: &VethPlan,
+    host: &LinkMessage,
+    peer: &LinkMessage,
+) -> Result<(), LinkError> {
+    if host.header.index == 0
+        || peer.header.index == 0
+        || host.header.index == peer.header.index
+        || !host
+            .attributes
+            .contains(&LinkAttribute::Link(peer.header.index))
+        || !peer
+            .attributes
+            .contains(&LinkAttribute::Link(host.header.index))
+    {
+        return Err(conflict(
+            &plan.host_name,
+            "exclusive creation did not yield the exact reciprocal veth pair",
+        ));
+    }
+    for (link, name, alias, address) in [
+        (host, &plan.host_name, &plan.host_alias, plan.host_address),
+        (
+            peer,
+            &plan.temporary_peer_name,
+            &plan.peer_alias,
+            plan.peer_address,
+        ),
+    ] {
+        validate_veth_kind(link, name)?;
+        if link_name(link) != Some(name.as_str())
+            || link_mtu(link) != Some(plan.mtu)
+            || link_address(link) != Some(address.as_slice())
+            || link.header.flags.contains(LinkFlags::Up)
+            || link_alias(link).is_some_and(|actual| actual != alias)
+        {
+            return Err(conflict(
+                name,
+                "exclusively created endpoint changed before ownership sealing",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_recoverable_link(
     link: &LinkMessage,
     expected_name: &str,
@@ -2000,6 +2096,65 @@ mod tests {
         }
         record.spec.workload_uid = Some("invalid/uid".into());
         assert!(VethPlan::from_attachment(&record).is_err());
+    }
+
+    #[test]
+    fn creation_sealing_requires_a_down_exact_reciprocal_pair() {
+        let mut record = attachment();
+        record.spec.workload_uid = Some("pod-a".into());
+        let plan = VethPlan::from_attachment(&record).unwrap();
+        let mut host = LinkVeth::new(&plan.host_name, &plan.temporary_peer_name)
+            .mtu(plan.mtu)
+            .address(plan.host_address.to_vec())
+            .build();
+        let mut peer = LinkVeth::new(&plan.temporary_peer_name, &plan.host_name)
+            .mtu(plan.mtu)
+            .address(plan.peer_address.to_vec())
+            .build();
+        host.header.index = 5;
+        peer.header.index = 6;
+        host.attributes.push(LinkAttribute::Link(6));
+        peer.attributes.push(LinkAttribute::Link(5));
+        assert!(validate_created_pair(&plan, &host, &peer).is_ok());
+        assert!(
+            validate_recoverable_link(
+                &host,
+                &plan.host_name,
+                &plan.host_alias,
+                plan.mtu,
+                plan.host_address
+            )
+            .is_err(),
+            "creation permission must not become recovery permission"
+        );
+        for mutation in 0..6 {
+            let mut changed = host.clone();
+            match mutation {
+                0 => changed.header.index = 0,
+                1 => changed.header.index = peer.header.index,
+                2 => changed.header.flags.insert(LinkFlags::Up),
+                3 => changed
+                    .attributes
+                    .retain(|attribute| !matches!(attribute, LinkAttribute::Link(_))),
+                4 => changed
+                    .attributes
+                    .push(LinkAttribute::IfAlias("foreign".to_owned())),
+                _ => changed
+                    .attributes
+                    .retain(|attribute| !matches!(attribute, LinkAttribute::Address(_))),
+            }
+            assert!(validate_created_pair(&plan, &changed, &peer).is_err());
+        }
+        let mut changed_peer = peer.clone();
+        changed_peer
+            .attributes
+            .retain(|attribute| !matches!(attribute, LinkAttribute::Link(_)));
+        assert!(validate_created_pair(&plan, &host, &changed_peer).is_err());
+        host.attributes
+            .push(LinkAttribute::IfAlias(plan.host_alias.clone()));
+        peer.attributes
+            .push(LinkAttribute::IfAlias(plan.peer_alias.clone()));
+        assert!(validate_created_pair(&plan, &host, &peer).is_ok());
     }
 
     #[test]

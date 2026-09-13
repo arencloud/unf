@@ -50,7 +50,17 @@ expect_denied() {
         printf 'Expected rejection unexpectedly passed: %s\n' "$name" >&2
         return 1
     fi
-    jq -e '.code == 11 or .code == 4' "$directory/$name.json" >/dev/null
+    case $name in
+        changed-uid-*|omitted-uid-*|prior-incarnation)
+            jq -e '.code==11 and (.details|contains("workload UID") or contains("durable attachment specification"))' "$directory/$name.json" >/dev/null;;
+        duplicate-uid)
+            jq -e '.code==4 and (.details|contains("K8S_POD_UID"))' "$directory/$name.json" >/dev/null;;
+        *alias*)
+            jq -e '.code==11 and (.details|contains("alias"))' "$directory/$name.json" >/dev/null;;
+        missing-*-route)
+            jq -e '.code==11 and (.details|contains("Host state is incomplete"))' "$directory/$name.json" >/dev/null;;
+        *) return 1;;
+    esac
 }
 check_config() { jq -c --argjson previous "$1" '. + {prevResult:$previous}' <<< "$config"; }
 alias_for() { ip -n "$host_namespace" -j link show dev "$interface" | jq -er '.[0].ifalias'; }

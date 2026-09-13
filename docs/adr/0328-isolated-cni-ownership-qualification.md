@@ -43,3 +43,16 @@ passed legacy replay, then failed the UID-bound ADD. Its command-substitution
 boundary did not retain the CNI JSON error, so the cause is not yet attributed.
 The qualifier now retains and prints the last CNI response on failure. Both
 attempts remain failures; no Kind test or live runtime rollout has occurred.
+
+The retained rerun (`80335a1`) attributes the failure to missing host
+`IFLA_IFALIAS` immediately after successful veth creation. Strict alias fencing
+correctly refuses both adoption and generic rollback. The repair adds a
+creation-only seal after successful exclusive `RTM_NEWLINK`: read back the
+down, exact reciprocal host/peer pair, set both aliases, read them back again
+and require stable indices. Existing-link recovery cannot use that permission.
+Zero/reused indices, broken reciprocity, changed addresses, an up endpoint or
+foreign aliases fail the creation checks. A crash before sealing still leaves
+unproven state fenced; automatic recovery of that boundary is not claimed.
+Focused CNI/link tests and strict Clippy pass for the seal repair. Negative
+qualifier checks additionally require the expected UID, alias or incomplete
+host-route diagnostic, not just a generic CNI failure code.
