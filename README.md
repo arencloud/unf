@@ -732,8 +732,14 @@ exact cleanup, five-agent convergence, and an unchanged `network` unhealthy
 baseline. Evidence SHA-256 is
 `a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3`;
 ADR 0157. These independent Kind and OpenShift results close Phase 8.
-Phase 9 begins the attested encryption fabric. Milestones 9.1–9.8 are verified;
-the independent OpenShift milestone 9.9 remains in progress.
+Phase 9's attested encryption fabric is verified through milestone 9.9 for its
+documented lab scope. Runtime `cb59e90` passed strict cl02 qualification first,
+then fresh matching-image Kind, including fail-closed traffic, recovery,
+rotation and cleanup ([ADR 0292](docs/adr/0292-phase9-closure-and-stabilization-handoff.md)).
+The next work is [stabilization and scale qualification](docs/development/stabilization-and-scale-plan.md):
+cl02 still has six unhealthy operators and unresolved internal reachability
+issues. Phase closure does not mean production readiness or proven heavy-load
+CPU/memory efficiency.
 The architecture requires that source policy and Service/egress ownership precede
 encryption; kernel WireGuard owns all cryptography; private keys remain on their
 Node; and an independently replayed Attested Encryption Path Contract requires

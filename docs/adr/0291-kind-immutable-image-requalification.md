@@ -2,7 +2,7 @@
 
 Date: 2026-09-13
 
-Status: isolated environment and identity assertions prepared; full Kind pending
+Status: verified; complete matching-image Kind result recorded in ADR 0292
 
 ## Context and decision
 

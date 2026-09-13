@@ -1,6 +1,7 @@
 # Stabilization and scale qualification
 
-Requested 2026-09-12. Status: planned after Phase 9 closure.
+Requested 2026-09-12. Phase 9 closed 2026-09-13 (ADR 0292); stabilization starts
+with S1. S1–S5 are not yet verified.
 
 Commit and push each completed step before the next. Platform feature tests run
 on OpenShift cl02 first, then isolated Kind; local checks precede deployment.
@@ -9,8 +10,8 @@ remain in ignored, owner-only local files and never enter evidence or Git.
 
 | Step | State | Required exit evidence |
 |---|---|---|
-| P9 closure | In progress | Compact proof authority, cl02 migration, ciphertext/fail-closed tests, rotation/replacement, cleanup, controller within 2 GiB, then fresh Kind lifecycle |
-| S1 baseline and budgets | Pending P9 | Feature/limit inventory; hardware/kernel/MTU/offloads, endpoints/policies/services/flows; idle/loaded CPU, RSS/cgroup peak, BPF memory, throughput, latency percentiles, convergence |
+| P9 closure | Verified | Exact `cb59e90` runtime passed strict cl02 first, then matching-image fresh Kind; ciphertext/denial, rotation/replacement, bounded history, positive cleanup, egress coexistence and rollback. ADR 0292 records hashes and scope |
+| S1 baseline and budgets | In progress | Attribute internal DNS/Pod-endpoint failures and operator health first; feature/limit inventory; hardware/kernel/MTU/offloads, endpoints/policies/services/flows; idle/loaded CPU, RSS/cgroup peak, BPF memory, throughput, latency percentiles, convergence |
 | S2 control-plane scale | Pending | Profile policy compilation, snapshots, informer churn and agent pulls; remove measured repeated work; bound queues/caches; compare equal input and churn fixtures before/after |
 | S3 agent and dataplane efficiency | Pending | Map occupancy/update work, connection creation/expiry, telemetry backpressure, Service selection, encryption and egress under mixed dual-stack load; policy correctness and bounded recovery |
 | S4 interactions and soak | Pending | Increasing-load tests for policy, Services, selection/DSR, egress/FQDN/HA, encryption/rotation and observability; outages/replacements under load; no unexplained leaks, drops or growth |

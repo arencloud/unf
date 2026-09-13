@@ -7,7 +7,11 @@
     "schemaVersion": 1,
     "milestone": "9.8",
     "runtimeRevision": "cb59e9080a4cce5544c1ae3c69974233d53d8c52",
-    "result": "pending"
+    "result": "passed",
+    "qualificationRevision": "8fa15a1bcd8e3a0853c090474c9a9e97832468d5",
+    "evidenceSha256": "04e9d300396bf88a717723b477f71e30af082e12d34fcb1cf338941115fa839f",
+    "captureSha256": "c342805731911eaf75982b95c98812541c9297e68bf378b09fa3d36310fe3d11",
+    "kubeProxyPresent": false
   },
   "contracts": {
     "compatibilitySchemaVersion": 2,

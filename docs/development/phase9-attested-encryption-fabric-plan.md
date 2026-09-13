@@ -21,8 +21,8 @@ separately revisioned. The authoritative state remains in
 | 9.5 | Intent-Coalesced Cryptographic Fast Path | **Verified** | Phase 9.5a adds the canonical compiler and Causal Epoch Lease; Phase 9.5b adds the Causal Commit Vector. Later slices connect proof-carrying maps/routes, authenticated complete-cut distribution, local Linux/key proof, quiescent generations, the policy-first dual-stack TC consumer, and Flow-Adaptive Secure DSR. Phase 9.5af closes the chain with independently captured real-kernel IPv4/IPv6 WireGuard ciphertext, positive transfer counters, peer-removal denial, exact recovery, and scoped cleanup under `make encryption-ciphertext-live-test`; ADRs 0162–0193 |
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
-| 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `30266627f42321cd90613c00cb5ba71ac648e02f` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0267. Default-Required and explicit-selective PodIP/Service traffic, 404 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 295 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `7801aa7d…0775`; packet-capture SHA-256 is `aff51bb9…f03` |
-| 9.9 | OpenShift qualification | **In progress** | Runtime `cb59e90`, qualifier `dbefd3e`, passed the stricter full cl02 gate in 1,420 seconds (ADR 0290). Exact images are loaded into fresh dual-stack Kind; ADR 0291 repairs qualified image-ID validation and matches cl02 controller limits. Full Kind lifecycle remains pending before closure |
+| 9.8 | Kube-proxy-free Kind qualification | **Verified** | Runtime `cb59e90`, qualifier `8fa15a1`, passed the complete fresh three-Node dual-stack Kubernetes 1.35.0 gate after cl02: strict denial, ciphertext, rotation/replacements, bounded history, egress coexistence, positive cleanup and no-CNI rollback. JSON `04e9d300…839f`; capture `c3428057…3d11`. ADR 0292; historical ADR 0267 retained |
+| 9.9 | OpenShift qualification | **Verified** | Runtime `cb59e90`, qualifier `dbefd3e`, passed the stricter full cl02 gate in 1,420 seconds before matching-image Kind. ADRs 0290–0292 record exact hashes, persistence/history, positive cleanup and scope. Six unhealthy operators and internal reachability issues remain S1 stabilization work |
 
 ## Accepted Phase 9 gate
 
@@ -175,28 +175,15 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Platform verification follows the user's cl02-first, then fresh-Kind order.
-The pinned runtime is `cb59e90`; its existing full cl02 gate passed in 1,532
-seconds under qualifier `f96aec2` (ADR 0289). Preserve that exact evidence;
-earlier failures and repairs remain documented in ADRs 0279–0289.
+Phase 9 closed on runtime `cb59e90`, cl02 first (`dbefd3e`), then matching-image
+fresh Kind (`8fa15a1`). ADR 0292 records exact hashes and bounded claims. Earlier
+failed attempts, intermittent migration timeout and startup exits remain in the
+record; they are not erased by a passing gate.
 
-ADR 0290 finishes the negative-assertion audit: command failure cannot mean
-network denial or absent state, and cleanup covers rotated tables, protocol-owned
-fences, and both IP families. Focused cl02 checks pass. Run the stricter full
-cl02 lifecycle next, preserving capture, migration, rotation/replacement,
-bounded persistence/operations, the 2-GiB controller limit, final convergence
-and before/after operator state. Then qualify the same immutable images on
-fresh Kind. The six unhealthy cl02 operators remain a stabilization concern;
-no newly unhealthy delta is not whole-cluster health.
-The first stricter run timed out during Required migration with one missing
-Node snapshot and another pending predecessor. The unchanged-runtime control
-run without registry transfers passed the full stricter gate in 1,420 seconds
-at 2026-09-13 02:04:15 UTC (qualifier `dbefd3e`, ADR 0290). It includes all eight
-strict denials, zero-loss ciphertext capture, recovery/rotation and positive
-all-zero cleanup snapshots on every Node. This does not attribute the prior
-timeout to registry contention. Matching-image fresh Kind is now next; internal
-DNS/Pod-endpoint failures remain an explicit stabilization dependency.
-
-After Phase 9 closes, follow the committed
+Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
-commit and evidence record for every step.
+commit/push and evidence record for every step. S1 first investigates six
+unhealthy cl02 operators and internal DNS/Pod-endpoint failures, then establishes
+resource and feature-limit baselines. S2–S5 profile and qualify heavy-load
+behavior. Continue testing cl02 before Kind; no unlimited-scale or
+production-readiness claim follows from Phase 9 closure.
