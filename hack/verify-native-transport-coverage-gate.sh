@@ -4,6 +4,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 gate=$root/hack/verify-native-transport-coverage.sh
 bash -n "$gate"
 bash "$root/hack/verify-phase9-negative-evidence.sh"
+bash "$root/hack/verify-native-transport-adoption.sh"
 # Exercise the actual orchestration boundary: only an explicit successful
 # remote network-denial observation may count as denial, never failed exec.
 eval "$(sed -n '/^udp_probe()/,/^}/p' "$gate")"
@@ -34,4 +35,5 @@ for invariant in 'policyTypes: \[Ingress, Egress\]' 'same-node' 'cross-node' \
     'UNF_NATIVE_COVERAGE_INFRASTRUCTURE' 'all_converged==true' 'project_root=\$root'; do
     rg -q "$invariant" "$gate"
 done
+awk '/^wait_fixture_adoption$/ {adoption=NR} /^stage=allowed-request-and-stateful-return$/ {traffic=NR} END {exit !(adoption>0 && traffic>adoption)}' "$gate"
 echo 'Native coverage gate preserves observation-safe TCP/UDP denial and both locality/family boundaries'

@@ -62,6 +62,11 @@ controller_raw() {
     kill -0 "$forward_pid" || return 1
     curl --fail --silent --show-error --max-time 15 "http://127.0.0.1:$controller_port$1"
 }
+controller_explain() {
+    kill -0 "$forward_pid" || return 1
+    curl --fail --silent --show-error --max-time 15 -H 'Content-Type: application/json' \
+        --data-binary "$1" "http://127.0.0.1:$controller_port/v1/explain"
+}
 controller_raw /v1/version > "$directory/controller-version.json"
 jq -e --arg revision "$UNF_NATIVE_COVERAGE_RUNTIME_REVISION" '.build_revision==$revision' "$directory/controller-version.json" >/dev/null
 "${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-agent -o json > "$directory/agent-pods.json"
@@ -164,8 +169,64 @@ for pod in client local-server remote-server; do
         for protocol in tcp udp; do wait_probe "$protocol" "$pod" "$address"; done
     done
 done
-stage=allowed-request-and-stateful-return
+wait_fixture_adoption() {
+    local deadline=$((SECONDS+180)) attempt=0 attempt_dir policy from to verdict expected_direction request
+    local server direction family protocol port reverse valid
+    while (( SECONDS < deadline )); do
+        attempt=$((attempt+1))
+        attempt_dir=$directory/adoption-$attempt
+        install -d -m 0700 "$attempt_dir"
+        if ! controller_raw /v1/topology > "$attempt_dir/topology.json" \
+            || ! jq -L "$root/hack" -e --arg ns "$namespace" --slurpfile fixture "$directory/fixture.json" \
+                'include "native-transport-adoption"; native_fixture_observed($ns; $fixture[0])' "$attempt_dir/topology.json" >/dev/null; then
+            sleep 2
+            continue
+        fi
+        valid=true
+        for server in local-server remote-server; do
+            for direction in ingress egress; do
+                expected_direction=Ingress
+                [[ $direction != egress ]] || expected_direction=Egress
+                for family in ipv4 ipv6; do
+                    for protocol in tcp udp; do
+                        port=8080
+                        [[ $protocol != udp ]] || port=5353
+                        for reverse in false true; do
+                            (( SECONDS < deadline )) || return 1
+                            from=client; to=$server; verdict=Allow
+                            [[ $reverse == false ]] || { from=$server; to=client; verdict=Deny; }
+                            request=$(jq -cn --arg from "$namespace/$from" --arg to "$namespace/$to" \
+                                --arg direction "$direction" --arg family "$family" --arg protocol "$protocol" --argjson port "$port" \
+                                '{from:$from,to:$to,direction:$direction,ip_family:$family,protocol:$protocol,port:$port}')
+                            if ! controller_explain "$request" > "$attempt_dir/$server-$direction-$family-$protocol-$reverse.json" \
+                                || ! jq -L "$root/hack" -e --arg verdict "$verdict" --arg direction "$expected_direction" --arg family "$family" \
+                                    'include "native-transport-adoption"; native_policy_observed($verdict; $direction; $family)' \
+                                    "$attempt_dir/$server-$direction-$family-$protocol-$reverse.json" >/dev/null; then
+                                valid=false
+                                break 5
+                            fi
+                        done
+                    done
+                done
+            done
+        done
+        if [[ $valid == true ]]; then
+            policy=$(jq -se '[.[].policy_revision] | unique | select(length==1) | .[0]' "$attempt_dir"/local-server-*.json "$attempt_dir"/remote-server-*.json) || valid=false
+            if [[ $valid == true ]] && controller_raw /v1/state/agents > "$attempt_dir/agents.json" \
+                && jq -L "$root/hack" -e --argjson policy "$policy" --slurpfile topology "$attempt_dir/topology.json" \
+                    'include "native-transport-adoption"; native_agent_cut_applied($policy; $topology[0])' "$attempt_dir/agents.json" >/dev/null; then
+                printf 'Fixture identities, Services and all 32 policy decisions adopted at revision %s\n' "$policy"
+                return 0
+            fi
+        fi
+        sleep 2
+    done
+    return 1
+}
+stage=fixture-adoption
 "${kc[@]}" -n "$namespace" get pods,services,networkpolicies -o json > "$directory/fixture.json"
+wait_fixture_adoption
+stage=allowed-request-and-stateful-return
 allowed=0
 for server in local-server remote-server; do
     for kind in pod service; do
