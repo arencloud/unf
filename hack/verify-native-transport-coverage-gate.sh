@@ -5,7 +5,7 @@ gate=$root/hack/verify-native-transport-coverage.sh
 bash -n "$gate"
 bash "$root/hack/verify-phase9-negative-evidence.sh"
 bash "$root/hack/verify-native-transport-adoption.sh"
-PYTHONDONTWRITEBYTECODE=1 python3 "$root/hack/test_native_continuity_probe.py"
+bash "$root/hack/verify-native-continuity-probe.sh"
 bash -n "$root/hack/native-transport-continuity.sh"
 # Exercise the actual orchestration boundary: only an explicit successful
 # remote network-denial observation may count as denial, never failed exec.

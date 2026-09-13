@@ -2,12 +2,14 @@
 # Sourced only by the already preflighted, adopted Native coverage fixture.
 native_transport_continuity() (
     set -Eeuo pipefail
-    local churn_namespace=unf-native-continuity-churn churn_owned=false probe_pid= targets ready=false
-    local evidence=$directory/continuity
+    # This body is already a subshell. Keep trap variables alive through EXIT;
+    # function-local variables are out of scope when that EXIT trap executes.
+    churn_namespace=unf-native-continuity-churn churn_owned=false probe_pid= targets= ready=false
+    evidence=$directory/continuity
     install -d -m 0700 "$evidence"
     cleanup_continuity() {
-        if [[ -n $probe_pid ]]; then kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true; fi
-        if [[ $churn_owned == true ]]; then "${kc[@]}" delete namespace "$churn_namespace" --wait=false >/dev/null 2>&1 || true; fi
+        if [[ -n ${probe_pid:-} ]]; then kill "$probe_pid" 2>/dev/null || true; wait "$probe_pid" 2>/dev/null || true; fi
+        if [[ ${churn_owned:-false} == true ]]; then "${kc[@]}" delete namespace "$churn_namespace" --wait=false >/dev/null 2>&1 || true; fi
     }
     trap cleanup_continuity EXIT
     "${kc[@]}" get namespaces -o json | jq -e --arg ns "$churn_namespace" 'all(.items[];.metadata.name!=$ns)' >/dev/null
@@ -18,8 +20,8 @@ native_transport_continuity() (
     controller_raw /v1/status > "$evidence/before-status.json"
     # Bound the complete streaming observation externally; do not give the
     # 45-second remote probe the ordinary 15-second API request deadline.
-    timeout 75 kubectl --kubeconfig "$KUBECONFIG" --context "$context" -n "$namespace" exec -i client -- python3 - --targets "$targets" --seconds 45 \
-        < "$root/hack/native_continuity_probe.py" > "$evidence/probes.jsonl" 2> "$evidence/probe-observer.log" &
+    timeout 75 kubectl --kubeconfig "$KUBECONFIG" --context "$context" -n "$namespace" exec -i client -- sh -s -- "$targets" 45 \
+        < "$root/hack/native-continuity-probe-remote.sh" > "$evidence/probes.jsonl" 2> "$evidence/probe-observer.log" &
     probe_pid=$!
     for _ in $(seq 1 10); do
         kill -0 "$probe_pid"

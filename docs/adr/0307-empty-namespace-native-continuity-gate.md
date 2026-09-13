@@ -29,8 +29,20 @@ before/after controller status. This is a light continuity probe, not a
 throughput benchmark, latency SLO or heavy-load qualification. Clock skew can
 invalidate cross-host window checks; an incomplete window must fail.
 
-Five local tests cover successful and fragmented HTTP status, malformed/closed
-responses, connection timeout without retry, unexpected observer errors, and
-invalid fixture targets. The Native gate's existing adoption/denial tests pass.
-Commit the qualifier before running cl02. Only a complete cl02 pass permits
-the same continuity test on Kind. Preserve any failed window and its logs.
+The initial Python-only unit tests passed, but cl02 qualifier `e3337f0` stopped
+before any namespace mutations because the immutable test-tools image does not
+contain Python. The original 24 allowed/eight denied cases passed first. An
+EXIT-trap variable-scope error was also observed; the fixture was removed by
+the outer gate. Preserve this as an observer failure, not a continuity result.
+
+Replace the probe with POSIX shell, jq and wget already present in the image,
+using the fixture's actual `/health` endpoint. Each connection has a two-second
+outer bound and one wget attempt; the parent still rejects every failed sample.
+Keep trap variables in the existing subshell rather than function-local scope.
+Local tests invoke the actual remote shell with a deterministic wget fixture:
+HTTP 200, wrong status, malformed response, timeout and network error; each
+sample performs exactly one attempt. Invalid targets and early observer-failure
+cleanup are tested too. No test-tools or runtime image change is required.
+
+Commit the repaired qualifier before repeating cl02. Only a complete cl02 pass
+permits the same continuity test on Kind. Preserve failed windows and logs.
