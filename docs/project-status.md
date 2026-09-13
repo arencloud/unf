@@ -575,6 +575,8 @@ protocol-compatible rollout and the locality consumer remain pending.
 ADR 0333 verifies the OpenShift candidate-CNI protocol readiness guard locally
 with 787 passing workspace tests. Isolated packaging validation and live upgrade
 ordering are next; no installed binary is replaced by this source milestone.
+ADR 0334 verifies the isolated real-CNI installer protocol tests on cl02;
+matching Kind is pending. Both live runtime fleets remain `67c2772`.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 
