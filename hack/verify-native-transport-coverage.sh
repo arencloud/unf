@@ -78,6 +78,11 @@ destination_node=${workers[1]}
 "${kc[@]}" create namespace "$namespace" --save-config >/dev/null
 owned=true
 stage=fixture
+fixture_uid=65532
+if [[ $context != kind-* ]]; then
+    fixture_uid=$("${kc[@]}" get namespace "$namespace" -o json |
+        jq -er '.metadata.annotations["openshift.io/sa.scc.uid-range"]|split("/")[0]|tonumber|select(.>0)')
+fi
 # The API server still performs normal resource validation and admission.
 # Avoid the failing cluster-wide OpenAPI download for this fixed fixture; SSA
 # owns only newly created objects and must never force an ownership conflict.
@@ -87,9 +92,12 @@ for pod in client local-server remote-server; do
     role=server
     [[ $pod != remote-server ]] || node=$destination_node
     [[ $pod != client ]] || role=client
-    jq -cn --arg namespace "$namespace" --arg pod "$pod" --arg node "$node" --arg role "$role" --arg image "$test_tools_image" '
+    jq -cn --arg namespace "$namespace" --arg pod "$pod" --arg node "$node" --arg role "$role" --arg image "$test_tools_image" --argjson uid "$fixture_uid" '
       {apiVersion:"v1",kind:"Pod",metadata:{name:$pod,namespace:$namespace,labels:{app:$pod,role:$role}},spec:{
+        securityContext:{runAsNonRoot:true,runAsUser:$uid,seccompProfile:{type:"RuntimeDefault"}},
         nodeSelector:{"kubernetes.io/hostname":$node},containers:[{name:"probe",image:$image,imagePullPolicy:"IfNotPresent",
+          securityContext:{allowPrivilegeEscalation:false,capabilities:{drop:["ALL"]}},
+          resources:{requests:{cpu:"10m",memory:"16Mi"},limits:{cpu:"500m",memory:"128Mi"}},
           command:["sh","-ec","/usr/local/bin/unf-udp-echo 4 5353 & /usr/local/bin/unf-udp-echo 6 5353 & exec /usr/local/bin/unf-flow-receiver 8080"]}]}}' |
       "${fixture_apply[@]}" >/dev/null
     if [[ $role == server ]]; then
@@ -140,6 +148,7 @@ probe() {
 }
 wait_probe() {
     local protocol=$1 pod=$2 address=$3
+    printf 'Checking allowed %s from %s to %s\n' "$protocol" "$pod" "$address"
     for _ in $(seq 1 30); do
         if probe "$protocol" "$pod" "$address"; then return 0; fi
         sleep 1
@@ -179,6 +188,7 @@ for server in local-server remote-server; do
             status=0
             probe "$protocol" "$server" "$address" || status=$?
             [[ $status == 1 ]] || { echo "expected real network denial, got status $status" >&2; false; }
+            printf 'Confirmed unsolicited %s denial from %s to %s\n' "$protocol" "$server" "$address"
             denied=$((denied+1))
         done
     done < <(jq -r '.[]' <<<"$addresses")

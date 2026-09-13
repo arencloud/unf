@@ -59,6 +59,16 @@ ordinary API resource validation, admission and field ownership still apply,
 and ownership conflicts are never forced. This observer/setup failure is not
 evidence of either allowed or denied traffic.
 
+The subsequent live run on old runtime `cb59e90`, qualifier `d4eed22`, passes
+all local listener checks, then fails the first allowed same-Node TCP request
+to `10.128.0.13:8080`. A concurrent public state snapshot reports all five
+agents converged. The owned Namespace is removed. Evidence remains under
+`.artifacts/s1-native-coverage-old-cl02-ssa*`; this is the live red regression,
+not a candidate pass. The fixture now also declares restricted Pod security,
+uses the Namespace-assigned OpenShift UID (non-root UID on Kind), drops all
+capabilities, and bounds each tools container at 500m CPU/128Mi memory. No SCC
+grant or security-policy exemption is introduced.
+
 ## Open boundaries
 
 Required locality with identities replicated across local and remote Nodes,
