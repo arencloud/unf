@@ -32,3 +32,6 @@ runtime image is rolled forward by this isolated qualifier.
 
 Bash syntax validation passes. ShellCheck is not installed on the workstation;
 no ShellCheck pass is claimed. Platform evidence will be added after execution.
+The first image build compiled the adapter but refused to copy the qualifier:
+the container context excludes `hack/`. The context now admits only this exact
+qualifier script; credentials, tools, prompts and other harnesses remain excluded.

@@ -6,5 +6,6 @@
 target/
 ebpf/unf-ebpf-tc/target/
 docs/
-hack/
+hack/*
+!hack/verify-cni-workload-ownership.sh
 tests/
