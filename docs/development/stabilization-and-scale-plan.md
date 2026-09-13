@@ -81,6 +81,12 @@ ADR 0348 then adds Required-only background candidate fetching with unchanged-cu
 reuse, bounded streaming and a single worker slot retained through cancelled
 CPU replay. All 803 local tests pass. Resource savings and live distribution
 still need platform measurement; no packet admission is enabled by this cache.
+ADRs 0349–0352 add candidate-only status and its qualifier, then roll out cl02
+on `f984db9`. The first full attempt fails an API TLS cleanup observer after
+successful candidate/traffic/ciphertext checks. Cleanup is independently proven;
+Kind has not advanced. The controller-restart HTTP 503 retry burst, clsact EEXIST
+warning volume and API-server timeout observations are retained for S3/S4, with
+no claim that the exact handshake cause or measured resource cost is known.
 
 Repair evidence is retained chronologically in the ADRs:
 
