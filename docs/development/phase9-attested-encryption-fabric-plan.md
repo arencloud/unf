@@ -190,6 +190,11 @@ atomic complete-column persistence; qualify that repair on preserved cl02 state.
 Its deployment and Required/selective dual-stack traffic checks passed, but the
 full gate stopped on a retired fault-target interface. ADR 0285 replaces that
 qualifier assumption with exact live admitted-link selection on both platforms.
+The next run stopped before migration on a truncated baseline history transfer;
+ADR 0286 adds bounded transport-only retries with retained failure metadata and
+single-attempt witness lookups. Invalid successfully transferred content still
+fails immediately. Neither repaired fault selection nor full lifecycle is yet
+live-qualified by that interrupted run.
 Run the full current-cut lifecycle gate, then
 qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
 must prove the controller replacement stays inside its 2-GiB cgroup as well as

@@ -152,11 +152,11 @@ done
 
 controller_raw() {
     local path=$1 pod
-    pod=$("${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json |
+    pod=$(timeout 20 "${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json |
         jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running") | .metadata.name' |
-        head -n 1)
-    [[ -n ${pod} ]]
-    "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy${path}"
+        head -n 1) || return
+    [[ -n ${pod} ]] || return 1
+    timeout 20 "${kc[@]}" get --raw "/api/v1/namespaces/unf-system/pods/${pod}:9962/proxy${path}"
 }
 
 generation_snapshot() {

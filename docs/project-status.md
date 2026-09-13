@@ -562,6 +562,11 @@ passed Required/selective convergence and dual-stack PodIP/ClusterIP traffic,
 then failed selecting a retired interface before ciphertext/fail-closed tests.
 ADR 0285 repairs live fault-target selection; full cl02 qualification and
 matching-image Kind remain open.
+The subsequent run (`77367c2` qualifier) stopped before migration on an incomplete
+history transfer. ADR 0286 adds bounded transport-only retries, preserves raw
+attempts and records read outcomes without retrying content-verification
+failures. Full cl02 qualification, matching-image Kind, and the later heavy-load
+stabilization milestones remain pending.
 
 ## Updating this tracker
 

@@ -147,7 +147,7 @@ oc_read() {
 
 host_probe_pod_on_node() {
     local node=$1
-    oc_read -n "${host_probe_namespace}" get pods \
+    timeout 20 "${kc[@]}" -n "${host_probe_namespace}" get pods \
         -l app.kubernetes.io/name=unf-encryption-host-probe \
         --field-selector "spec.nodeName=${node}" -o json | jq -er '
           .items[] | select(.metadata.deletionTimestamp == null
@@ -159,14 +159,14 @@ host_probe_pod_on_node() {
 node_exec() {
     local node=$1 pod
     shift
-    pod=$(host_probe_pod_on_node "${node}")
-    [[ -n ${pod} ]]
+    pod=$(host_probe_pod_on_node "${node}") || return
+    [[ -n ${pod} ]] || return 1
     timeout 20 "${kc[@]}" -n "${host_probe_namespace}" exec "${pod}" -c host-probe \
         -- chroot /host "$@"
 }
 
 controller_pod_and_node() {
-    oc_read -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json \
+    timeout 20 "${kc[@]}" -n unf-system get pods -l app.kubernetes.io/name=unf-controller -o json \
         | jq -r '.items[] | select(.metadata.deletionTimestamp == null and .status.phase == "Running")
             | [.metadata.name,.spec.nodeName] | @tsv' \
         | head -1
@@ -174,14 +174,15 @@ controller_pod_and_node() {
 
 controller_raw() {
     local path=$1 controller pod node probe
-    controller=$(controller_pod_and_node)
+    controller=$(controller_pod_and_node) || return
     IFS=$'\t' read -r pod node <<<"${controller}"
-    [[ -n ${pod} && -n ${node} ]]
+    [[ -n ${pod} && -n ${node} ]] || return 1
     probe=$(host_probe_pod_on_node "${node}" 2>/dev/null || true)
     if [[ -n ${probe} ]]; then
         timeout 20 "${kc[@]}" -n "${host_probe_namespace}" exec "${probe}" -c host-probe \
             -- wget -T 10 -t 1 -qO- "http://127.0.0.1:9962${path}"
     else
+        [[ ${host_probe_created} == false ]] || return 1
         # The witness is deliberately removed before final Native-only agent
         # convergence. This bounded fallback is never reachable by a causal
         # generation join or a Required/selective traffic stage.
