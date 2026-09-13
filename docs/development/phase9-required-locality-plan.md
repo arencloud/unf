@@ -1,7 +1,7 @@
 # Phase 9 Required locality and replica closure
 
 This completes the open boundary from ADRs 0293–0294 and 0324. Existing
-`450de80` fleets remain Native by default while this work is implemented and
+`f984db9` fleets remain Native by default while this work is implemented and
 qualified. A successful scoped reply gate is not full Phase 9 closure.
 
 ## Safety and efficiency boundary
@@ -31,7 +31,7 @@ Required path authoritative; it never becomes a Native fallback.
 |---|---|---|
 | L1 exact address ownership | Verified locally — ADR 0325 | Shared validated placement preserves dual-stack IP/UID/identity/Node ownership; ambiguous ownership and capacity fail before expansion; no policy-pair enumeration in the placement-only API; 758 workspace tests pass |
 | L2 replayable locality certificate | Verified locally — ADR 0326 | Versioned, canonical, Node/revision-bound certificate; independent placement replay; negative replica, move, UID reuse, stale-cut, malformed-wire and address-substitution tests; 770 workspace tests pass; no packet-path change |
-| L3 consuming integration | In progress — ownership prerequisites and isolated target-device lifetime verified on both platforms, ADRs 0339–0346; controller/wire distribution verified locally, ADR 0347 | Explicit wire/map compatibility and restart migration; authenticated agent distribution; exact local attachment/route readback; banked publication and packet-policy-first consumption; status/explanation without claiming observed delivery from placement alone |
+| L3 consuming integration | In progress — ownership prerequisites and isolated target-device lifetime verified on both platforms, ADRs 0339–0346; live candidate distribution/status/retirement verified cl02 then Kind, ADRs 0353–0354 | Explicit wire/map compatibility and restart migration; continuous source/peer lifetime and exact attachment/route readback; banked publication and packet-policy-first consumption; status/explanation without claiming observed delivery from placement alone |
 | L4 cl02 validation | Pending | Same-Node and mixed local/remote replicas; IPv4/IPv6 TCP/UDP; PodIP, Service and translated ports; policy isolation and replies; positive remote ciphertext and zero remote Required plaintext; move/replacement/recovery; full fixture cleanup |
 | L5 matching Kind validation | Pending | Same immutable runtime and L4 matrix after cl02; retained state preserved; observer failures and losses remain failures |
 | Q complete Phase 9 lifecycle | Pending | Full current-runtime cl02 lifecycle then independent matching Kind, including staged Required baseline, rotation, failure/recovery, composition, history and cleanup; update release pins and platform status only with complete evidence |
@@ -47,8 +47,10 @@ candidate-only status with explicit false kernel/delivery claims. Live
 cl02-before-Kind distribution qualification remains pending.
 ADR 0350 adds its opt-in platform gate, joining each worker observation to
 Kubernetes metadata, its public plan and fresh applied reports, with Native
-candidate retirement. Two positive and 105 negative local gate cases pass;
-the live runtime qualification remains pending.
+candidate retirement. Two positive and 105 negative local gate cases pass.
+ADRs 0353–0354 verify the complete live expanded gate on identical `f984db9`
+images, cl02 before retained Kind, with reviewed logs and preserved state.
+This closes candidate distribution, not continuous lifetime or packet admission.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

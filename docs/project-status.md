@@ -659,6 +659,12 @@ two placement replays/retirements, three CNI UID/nonce bindings/retirements,
 24 allowed/eight denied requests, 188 WireGuard frames, zero captured Required
 plaintext and zero capture loss. Final logs and state are reviewed; matching
 Kind is next. This remains candidate-only, not a verified L3 packet consumer.
+ADR 0354 verifies the identical `f984db9` runtime on retained Kind: guarded
+state-preserving rollout, complete expanded candidate/CNI/reply gate, 73
+WireGuard frames, zero captured Required plaintext, zero capture loss and
+full Native cleanup. Both live fleets now run `f984db9`. Current/rotated logs
+are reviewed; per-packet log amplification and transition warnings remain
+stabilization findings. Consuming locality and full Phase 9/S1–S5 stay open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

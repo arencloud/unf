@@ -3,7 +3,16 @@
 Requested 2026-09-12. Phase 9's closure (ADR 0292) was reopened by S1's
 transport coverage findings (ADR 0293). Phase 9 and S1–S5 remain open.
 
-Current checkpoint: ADRs 0316–0317 qualify runtime `5ea1bd2` on cl02, then
+Current checkpoint: ADRs 0353–0354 qualify runtime `f984db9` on cl02, then
+retained Kind with identical images. The complete expanded cross-worker
+Required reply gate verifies runtime CNI ownership and placement-candidate
+distribution/retirement, with preserved state and reviewed current/rotated
+logs. Candidate kernel admission and observed-delivery claims remain false.
+Both fleets run Native by default. Locality packet consumption, local/remote
+replicas, complete Phase 9 lifecycle and S1–S5 remain open. No resource savings
+or sustained-load envelope is claimed.
+
+Historical checkpoint: ADRs 0316–0317 qualify runtime `5ea1bd2` on cl02, then
 retained Kind with identical images and no state reset. Each passes 24 Native
 allow cases, eight reverse denials, empty-Namespace continuity (232/720 fresh
 connections, zero failures), exact cleanup and full agent convergence. Current
