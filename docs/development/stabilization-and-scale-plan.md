@@ -5,6 +5,11 @@ S1's missing transport coverage findings (ADR 0293). ADR 0294 implements the
 Native repair; live requalification and Required coverage remain pending.
 S1–S5 are not yet verified.
 
+Latest result: ADR 0304 records runtime `54f5511` passing the corrected cl02
+deployment and adoption-fenced Native gate (24 allows, eight denials, cleanup).
+Retained Kind recovery and matching-runtime Native coverage are next; full
+Phase 9 lifecycle and heavy-load stabilization are still unverified.
+
 ADR 0303 rejects the first key-independent candidate's embedded provenance and
 repairs fail-open conditional deployment checks; rebuilding and cl02-first
 qualification remain required. Retained Kind has not been reset or upgraded.

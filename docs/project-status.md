@@ -547,6 +547,11 @@ preserved. Neither Phase 9 platform row is reverified. Required locality,
 replica/reply, continuity and full lifecycle gates remain open, followed by the
 separate S1–S5 stabilization and measured-load program.
 
+ADR 0304 subsequently records rebuilt runtime `54f5511` passing the corrected
+cl02 staged deployment and adoption-fenced Native gate: 24 allowed cases,
+eight unsolicited reverse denials, exact fixture cleanup and five-agent
+convergence. Retained Kind recovery is next; the full platform rows stay open.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.
