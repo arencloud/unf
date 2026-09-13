@@ -45,3 +45,18 @@ exact cleanup and fleet convergence are still mandatory. Build and verify exact
 image provenance, deploy/test cl02 first, then matching-image Kind only after
 cl02 passes. The old failed window is retained. Phase 9, Required locality/reply
 coverage, general update continuity and S1–S5 remain open.
+
+Published candidate source `42907aa96c77b7d6ce7e5c875d476cd7a43fd2aa`,
+development tag `s1-namespace-42907aa`. Both final images were run locally
+read-only/unprivileged without cluster credentials and reported that exact
+revision. The builder uses the distinct `UNF_SOURCE_REVISION` input from
+ADR 0303; source copying and compilation reuse the previous Rust 1.95 cache.
+
+| Component | Immutable Quay manifest SHA-256 |
+|---|---|
+| controller | `c9243eeede806427081fc5791cd4f36893c1936792ad7303e7a88080a0977cdd` |
+| agent | `a3f8c55ee505773fca2f131373098433097239d3b9d08d859e789ee49a3080c6` |
+
+Tools remain the same immutable `e9cce439…2352` image. Build/push/provenance
+evidence is ignored under `.artifacts/s1-namespace-42907aa-*`. Full Kind
+qualification stays pending; cl02 must pass this candidate first.

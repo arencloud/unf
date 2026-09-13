@@ -16,6 +16,14 @@ ADR 0309 implements dependency-aware namespace invalidation and an observable
 skipped-work counter; local regressions pass, live qualification is pending.
 Do not run this repaired slice on Kind before cl02 passes.
 
+S2 profiling lead, not an attributed CPU result: `policy_snapshot` calls
+`dataplane_policy_state` for every authenticated pull; the latter clones the
+full cached tuple even on a matching revision and the endpoint returns the
+complete JSON body. Measure allocation/serialization and transfer costs before
+considering immutable sharing or conditional delivery. Any optimization must
+retain current-Pod authentication, authority readiness, cold-start/failed-apply
+recovery and epoch/revision fencing, including older-agent compatibility.
+
 ADR 0303 rejects the first key-independent candidate's embedded provenance and
 repairs fail-open conditional deployment checks; rebuilding and cl02-first
 qualification remain required. Retained Kind has not been reset or upgraded.
