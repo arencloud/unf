@@ -11,7 +11,12 @@ UNF Pods have zero restarts. Log warnings, Kind's per-packet log amplification
 and operator health findings remain tracked. No sustained-load/resource savings
 are claimed.
 
-Next: finish Required locality/replica/reply coverage and full current
+ADR 0318 adds locally verified Required policy-tracked reply contracts with
+explicit initiating-pair provenance and fail-closed schema-2 compatibility.
+The live clusters remain on the qualified Native runtime; Required reply
+traffic has not yet been qualified on either platform.
+
+Next: qualify Required replies on cl02 before Kind, finish Required locality/replica coverage and full current
 runtime lifecycle qualification, cl02 before Kind. Empty-Namespace no-op
 continuity does not establish arbitrary policy/Service update atomicity. Active
 tuple collisions and LRU capacity behavior remain load-envelope boundaries.

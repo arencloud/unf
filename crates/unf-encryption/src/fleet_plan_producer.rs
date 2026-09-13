@@ -1246,6 +1246,50 @@ mod tests {
     }
 
     #[test]
+    fn required_transport_carries_reply_provenance_through_fleet_distribution() {
+        let mut input = input(true);
+        input.policies[1].allowed = false;
+        input.policies[1].reason = PolicyReason::DefaultAction;
+        let cut = produce_fleet_plan_cut(input).unwrap();
+        cut.verify().unwrap();
+        let source = &cut.plans[0];
+        let reply = &cut.plans[1];
+        assert_eq!(
+            source.epochs[0].contract.schema_version,
+            crate::ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            reply.epochs[0].contract.schema_version,
+            crate::ATTESTED_ENCRYPTION_REPLY_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(reply.mode, NodeLocalPlanMode::Active);
+        assert_eq!(reply.decisions.len(), 1);
+        assert_eq!(
+            reply.decisions[0].disposition,
+            crate::EncryptionDisposition::Required
+        );
+        assert_eq!(reply.decisions[0].source_identity, IdentityId::new(21));
+        assert_eq!(reply.decisions[0].destination_identity, IdentityId::new(11));
+        assert_eq!(reply.decisions[0].plan_index, Some(0));
+        assert_eq!(
+            reply.epochs[0].contract.plans[0].policy.reply_to,
+            Some(crate::EncryptionIdentityPair {
+                source: IdentityId::new(11),
+                destination: IdentityId::new(21),
+            })
+        );
+        assert_eq!(
+            reply.epochs[0].contract.plans[0].policy.policy_ids,
+            vec![PolicyId::new(9)]
+        );
+        let wire = serde_json::to_vec(&cut).unwrap();
+        let decoded: NodeLocalPlanFleetCut = serde_json::from_slice(&wire).unwrap();
+        decoded.verify().unwrap();
+        assert_eq!(decoded, cut);
+        assert_eq!(cut.plans[2].mode, NodeLocalPlanMode::Dormant);
+    }
+
+    #[test]
     fn native_transport_deduplicates_replica_identity_coverage() {
         let mut input = input(true);
         input.model = EncryptionModel::normalize(

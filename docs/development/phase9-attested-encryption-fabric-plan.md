@@ -26,6 +26,13 @@ separately revisioned. The authoritative state remains in
 
 ## Accepted Phase 9 gate
 
+Current repair checkpoint (ADRs 0316–0318): Native expiry/empty-Namespace
+continuity passes cl02 then matching-image retained Kind on runtime `5ea1bd2`.
+Required policy-tracked reply contracts are locally verified with explicit
+initiating-pair provenance and schema 2; their live qualification remains next.
+Required locality/replica coverage and complete lifecycle requalification
+remain open. Historical platform results above do not close these gaps.
+
 The phase closes only when one exact committed tuple passes independent Kind
 and OpenShift gates and demonstrates:
 

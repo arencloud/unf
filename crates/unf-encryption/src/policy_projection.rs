@@ -6,12 +6,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use unf_common::{IdentityId, PolicyId, PolicyReason};
 
 use crate::{EncryptionPolicyFact, MAX_ENCRYPTION_PATHS};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EncryptionIdentityPair {
     pub source: IdentityId,
     pub destination: IdentityId,

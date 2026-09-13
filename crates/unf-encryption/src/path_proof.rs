@@ -1864,6 +1864,7 @@ pub(crate) mod tests {
             disposition: EncryptionDisposition::Required,
             intent_uids: vec!["encrypt-a-b".into()],
             policy: EncryptionPolicyBinding {
+                reply_to: None,
                 policy_ids: vec![],
                 reason: PolicyReason::NoApplicablePolicy,
                 revision: revisions.policy,

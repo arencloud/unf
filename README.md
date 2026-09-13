@@ -739,10 +739,15 @@ rotation and cleanup ([ADR 0292](docs/adr/0292-phase9-closure-and-stabilization-
 Subsequent stabilization found uncovered same-Node Native and isolated-return
 transport failures, so affected qualification is reopened for repair
 ([ADR 0293](docs/adr/0293-stabilization-native-transport-coverage-gap.md)).
-The current work is [stabilization and scale qualification](docs/development/stabilization-and-scale-plan.md):
-cl02 still has six unhealthy operators and unresolved internal reachability
-issues. Phase closure does not mean production readiness or proven heavy-load
-CPU/memory efficiency.
+Phase 9 remains open for Required coverage and lifecycle requalification.
+Runtime `5ea1bd2` passes the expanded Native expiry/churn gate on cl02, then
+matching-image retained Kind (ADRs 0316–0317). Required reply contracts now
+have explicit initiating-policy provenance and local regression coverage;
+live Required replies and locality remain pending (ADR 0318).
+The [stabilization and scale plan](docs/development/stabilization-and-scale-plan.md)
+tracks operator/reachability findings, log volume, feature interactions and
+resource-versus-load measurements. Bounded qualification does not mean
+production readiness or proven heavy-load CPU/memory efficiency.
 The architecture requires that source policy and Service/egress ownership precede
 encryption; kernel WireGuard owns all cryptography; private keys remain on their
 Node; and an independently replayed Attested Encryption Path Contract requires

@@ -57,6 +57,9 @@ use unf_common::{IdentityId, PolicyId, PolicyReason, Revision};
 
 pub const ENCRYPTION_MODEL_SCHEMA_VERSION: u16 = 1;
 pub const ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION: u16 = 1;
+/// Contracts containing policy-tracked reply provenance use a distinct schema
+/// and digest domain. Plain new-flow contracts preserve their frozen v1 bytes.
+pub const ATTESTED_ENCRYPTION_REPLY_CONTRACT_SCHEMA_VERSION: u16 = 2;
 pub const ENCRYPTION_FAST_PATH_MAP_ABI_VERSION: u16 = unf_ebpf_common::ENCRYPTION_MAP_ABI_VERSION;
 pub const MAX_ENCRYPTION_INTENTS: usize = 4_096;
 pub const MAX_ENCRYPTION_IDENTITIES_PER_SELECTOR: usize = 4_096;
@@ -462,6 +465,11 @@ pub struct EncryptionPolicyBinding {
     pub policy_ids: Vec<PolicyId>,
     pub reason: PolicyReason,
     pub revision: Revision,
+    /// Exact initiating identity pair whose allowed policy requests return
+    /// transport. This never authorizes a new flow in this plan's direction:
+    /// the packet policy/established-flow gate remains mandatory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<EncryptionIdentityPair>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -643,10 +651,11 @@ impl AttestedEncryptionPathContract {
         facts: &EncryptionContractFacts,
         local_node: &EncryptionNode,
     ) -> Result<(), EncryptionContractError> {
-        if self.schema_version != ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION {
+        let expected_schema = contract_schema_version(&self.plans);
+        if self.schema_version != expected_schema {
             return Err(EncryptionContractError::UnsupportedSchema {
                 actual: self.schema_version,
-                expected: ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION,
+                expected: expected_schema,
             });
         }
         let expected = compile_contract(
@@ -672,12 +681,14 @@ impl AttestedEncryptionPathContract {
     pub fn verify_integrity(&self) -> Result<(), EncryptionContractError> {
         #[cfg(test)]
         CONTRACT_INTEGRITY_REPLAYS.with(|count| count.set(count.get() + 1));
-        if self.schema_version != ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION {
+        let expected_schema = contract_schema_version(&self.plans);
+        if self.schema_version != expected_schema {
             return Err(EncryptionContractError::UnsupportedSchema {
                 actual: self.schema_version,
-                expected: ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION,
+                expected: expected_schema,
             });
         }
+        validate_reply_origins(&self.plans)?;
         let expected = contract_digest(
             self.contract_revision,
             &self.local_node,
@@ -811,7 +822,7 @@ fn compile_contract(
         &failure_envelope,
     )?;
     Ok(AttestedEncryptionPathContract {
-        schema_version: ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION,
+        schema_version: contract_schema_version(&plans),
         contract_revision,
         local_node,
         valid_from_unix_ms,
@@ -879,9 +890,24 @@ fn compile_plan(
         policy.source == source.identity && policy.destination == destination.identity
     }))
     .ok_or(EncryptionContractError::MissingPolicy)?;
-    if !policy.allowed {
-        return Ok(None);
-    }
+    let (policy, reply_to) = if policy.allowed {
+        (policy, None)
+    } else {
+        let Some(initiating) = unique(context.policies.iter().filter(|candidate| {
+            candidate.source == destination.identity
+                && candidate.destination == source.identity
+                && candidate.allowed
+        })) else {
+            return Ok(None);
+        };
+        (
+            initiating,
+            Some(EncryptionIdentityPair {
+                source: initiating.source,
+                destination: initiating.destination,
+            }),
+        )
+    };
     if matches!(policy.reason, PolicyReason::NoApplicablePolicy) != policy.policy_ids.is_empty() {
         return Err(EncryptionContractError::InvalidPolicy);
     }
@@ -922,6 +948,7 @@ fn compile_plan(
             policy_ids: policy.policy_ids.clone(),
             reason: policy.reason,
             revision: context.facts.revisions.policy,
+            reply_to,
         },
         source_key,
         destination_key,
@@ -1269,6 +1296,29 @@ fn public_key_digest(key: WireGuardPublicKey) -> EncryptionPublicKeyDigest {
     EncryptionPublicKeyDigest(hasher.finalize().into())
 }
 
+fn contract_schema_version(plans: &[AttestedEncryptionPathPlan]) -> u16 {
+    if plans.iter().any(|plan| plan.policy.reply_to.is_some()) {
+        ATTESTED_ENCRYPTION_REPLY_CONTRACT_SCHEMA_VERSION
+    } else {
+        ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION
+    }
+}
+
+fn validate_reply_origins(
+    plans: &[AttestedEncryptionPathPlan],
+) -> Result<(), EncryptionContractError> {
+    if plans.iter().any(|plan| {
+        plan.policy.reply_to.is_some_and(|origin| {
+            origin.source != plan.destination.identity
+                || origin.destination != plan.source.identity
+                || origin.source == origin.destination
+        })
+    }) {
+        return Err(EncryptionContractError::InvalidPolicy);
+    }
+    Ok(())
+}
+
 fn contract_digest(
     contract_revision: Revision,
     local_node: &EncryptionNode,
@@ -1279,7 +1329,7 @@ fn contract_digest(
     failure_envelope: &EncryptionFailureEnvelope,
 ) -> Result<AttestedEncryptionContractDigest, EncryptionContractError> {
     let material = serde_json::to_vec(&(
-        ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION,
+        contract_schema_version(plans),
         contract_revision,
         local_node,
         valid_from_unix_ms,
@@ -1290,7 +1340,11 @@ fn contract_digest(
     ))
     .map_err(|error| EncryptionContractError::CanonicalEncoding(error.to_string()))?;
     let mut hasher = Sha256::new();
-    hasher.update(b"unf.attested-encryption-path-contract.v1\0");
+    if contract_schema_version(plans) == ATTESTED_ENCRYPTION_REPLY_CONTRACT_SCHEMA_VERSION {
+        hasher.update(b"unf.attested-encryption-path-contract.v2\0");
+    } else {
+        hasher.update(b"unf.attested-encryption-path-contract.v1\0");
+    }
     hasher.update(material);
     Ok(AttestedEncryptionContractDigest(hasher.finalize().into()))
 }
@@ -1581,6 +1635,170 @@ mod tests {
             ])
         );
         assert!(first.decision_witness(1).is_err());
+    }
+
+    fn required_reply_fixture() -> (EncryptionModel, EncryptionContractFacts, EncryptionNode) {
+        let (_, mut facts, _) = fixture();
+        let model = EncryptionModel::normalize(
+            "cluster-a".to_owned(),
+            EncryptionBaseline::Required,
+            Vec::new(),
+        )
+        .unwrap();
+        facts.policies.push(EncryptionPolicyFact {
+            source: IdentityId::new(22),
+            destination: IdentityId::new(11),
+            allowed: false,
+            reason: PolicyReason::DefaultAction,
+            policy_ids: vec![PolicyId::new(99)],
+        });
+        let reply_node = facts
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.identity == IdentityId::new(22))
+            .unwrap()
+            .node
+            .clone();
+        (model, facts, reply_node)
+    }
+
+    #[test]
+    fn required_policy_tracked_reply_has_explicit_transport_provenance() {
+        let (model, facts, reply_node) = required_reply_fixture();
+        let contract = issue(&model, &facts, &reply_node).unwrap();
+        contract.verify(&model, &facts, &reply_node).unwrap();
+        contract.verify_integrity().unwrap();
+        assert_eq!(
+            contract.schema_version,
+            ATTESTED_ENCRYPTION_REPLY_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            contract.plans.len(),
+            1,
+            "a policy-tracked reply still needs Required transport"
+        );
+        assert_eq!(contract.plans[0].source.identity, IdentityId::new(22));
+        assert_eq!(contract.plans[0].destination.identity, IdentityId::new(11));
+        assert_eq!(
+            contract.plans[0].policy.policy_ids,
+            vec![PolicyId::new(3), PolicyId::new(9)]
+        );
+        assert_eq!(
+            contract.plans[0].policy.reply_to,
+            Some(EncryptionIdentityPair {
+                source: IdentityId::new(11),
+                destination: IdentityId::new(22),
+            })
+        );
+        assert_eq!(contract.plans[0].policy.reason, PolicyReason::ExplicitRule);
+        assert_eq!(contract.plans[0].policy.revision, facts.revisions.policy);
+        assert!(
+            !facts
+                .policies
+                .iter()
+                .find(|policy| policy.source == IdentityId::new(22))
+                .unwrap()
+                .allowed
+        );
+    }
+
+    #[test]
+    fn required_reply_provenance_rejects_mutation_downgrade_and_revoked_permission() {
+        let (model, mut facts, reply_node) = required_reply_fixture();
+        let contract = issue(&model, &facts, &reply_node).unwrap();
+        let mut downgrade = contract.clone();
+        downgrade.schema_version = ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION;
+        assert!(matches!(
+            downgrade.verify_integrity(),
+            Err(EncryptionContractError::UnsupportedSchema { .. })
+        ));
+        assert!(downgrade.verify(&model, &facts, &reply_node).is_err());
+
+        let mut unrelated = contract.clone();
+        unrelated.plans[0].policy.reply_to.as_mut().unwrap().source = IdentityId::new(99);
+        assert!(matches!(
+            unrelated.verify_integrity(),
+            Err(EncryptionContractError::InvalidPolicy)
+        ));
+        assert!(unrelated.verify(&model, &facts, &reply_node).is_err());
+
+        let mut stripped = contract.clone();
+        stripped.plans[0].policy.reply_to = None;
+        stripped.schema_version = ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION;
+        assert!(stripped.verify_integrity().is_err());
+        assert!(stripped.verify(&model, &facts, &reply_node).is_err());
+
+        facts.policies[0].allowed = false;
+        assert!(contract.verify(&model, &facts, &reply_node).is_err());
+        let denied = issue(&model, &facts, &reply_node).unwrap();
+        assert!(denied.plans.is_empty());
+        assert_eq!(
+            denied.schema_version,
+            ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn required_reply_still_requires_exact_bidirectional_keys_paths_and_lifetime() {
+        let (model, facts, reply_node) = required_reply_fixture();
+        for index in 0..2 {
+            let mut missing_key = facts.clone();
+            missing_key.keys.remove(index);
+            assert!(issue(&model, &missing_key, &reply_node).is_err());
+            let mut expired_key = facts.clone();
+            expired_key.keys[index].valid_until_unix_ms = 1_500;
+            assert!(issue(&model, &expired_key, &reply_node).is_err());
+            let mut missing_path = facts.clone();
+            missing_path.paths.remove(index);
+            assert!(issue(&model, &missing_path, &reply_node).is_err());
+        }
+        let mut missing_reverse_fact = facts.clone();
+        missing_reverse_fact.policies.pop();
+        assert!(matches!(
+            issue(&model, &missing_reverse_fact, &reply_node),
+            Err(EncryptionContractError::MissingPolicy)
+        ));
+        let mut ambiguous = facts.clone();
+        ambiguous.policies.push(facts.policies[0].clone());
+        assert!(matches!(
+            issue(&model, &ambiguous, &reply_node),
+            Err(EncryptionContractError::InvalidPolicy)
+        ));
+    }
+
+    #[test]
+    fn reply_wire_is_strict_canonical_and_native_intent_stays_native() {
+        let (model, mut facts, reply_node) = required_reply_fixture();
+        let contract = issue(&model, &facts, &reply_node).unwrap();
+        let wire = serde_json::to_value(&contract).unwrap();
+        let decoded: AttestedEncryptionPathContract = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(decoded, contract);
+        decoded.verify_integrity().unwrap();
+        let mut unknown = wire;
+        unknown["plans"][0]["policy"]["replyTo"]["allowNewFlow"] = true.into();
+        assert!(serde_json::from_value::<AttestedEncryptionPathContract>(unknown).is_err());
+        facts.endpoints.reverse();
+        facts.policies.reverse();
+        facts.keys.reverse();
+        facts.paths.reverse();
+        assert_eq!(issue(&model, &facts, &reply_node).unwrap(), contract);
+
+        // A one-way Required intent does not implicitly change the reverse
+        // direction's Native requirement, even when that direction is a reply.
+        let (selective, _, _) = fixture();
+        assert!(
+            issue(&selective, &facts, &reply_node)
+                .unwrap()
+                .plans
+                .is_empty()
+        );
+        let (_, plain_facts, plain_node) = fixture();
+        let plain = issue(&selective, &plain_facts, &plain_node).unwrap();
+        assert_eq!(
+            plain.schema_version,
+            ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION
+        );
+        assert!(!serde_json::to_string(&plain).unwrap().contains("replyTo"));
     }
 
     #[test]

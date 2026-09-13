@@ -36,6 +36,15 @@ require_text crates/unf-encryption/src/lib.rs \
     'pub const ATTESTED_ENCRYPTION_PATH_CONTRACT_SCHEMA_VERSION: u16 = 1;' \
     "the wire contract must be explicitly versioned"
 require_text crates/unf-encryption/src/lib.rs \
+    'pub const ATTESTED_ENCRYPTION_REPLY_CONTRACT_SCHEMA_VERSION: u16 = 2;' \
+    "reply provenance must not silently change legacy contract semantics"
+require_text crates/unf-encryption/src/lib.rs \
+    'required_reply_provenance_rejects_mutation_downgrade_and_revoked_permission' \
+    "reply contracts must reject weakened or revoked provenance"
+require_text crates/unf-encryption/src/fast_path.rs \
+    'required_reply_transport_remains_policy_first_and_replica_exact' \
+    "reply transport must not grant new reverse-direction policy permission"
+require_text crates/unf-encryption/src/lib.rs \
     'PolicyAllowBeforeEncryption' \
     "policy precedence must be an admitted invariant"
 require_text crates/unf-encryption/src/lib.rs \

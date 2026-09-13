@@ -1437,8 +1437,12 @@ mod tests {
         fixture_with_replica(epoch, false)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn fixture_with_replica(epoch: u64, replicated: bool) -> Fixture {
+        fixture_with_policy_mode(epoch, replicated, false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn fixture_with_policy_mode(epoch: u64, replicated: bool, reply_only: bool) -> Fixture {
         let source_node = node("worker-a", 1);
         let destination_node = node("worker-b", 2);
         let replica_node = node("worker-c", 3);
@@ -1486,7 +1490,7 @@ mod tests {
                 }
             }));
         }
-        let policies = source_identities
+        let mut policies: Vec<_> = source_identities
             .into_iter()
             .flat_map(|source| {
                 destination_identities
@@ -1500,6 +1504,19 @@ mod tests {
                     })
             })
             .collect();
+        if reply_only {
+            let initiating = policies.clone();
+            for policy in &mut policies {
+                policy.allowed = false;
+                policy.reason = PolicyReason::DefaultAction;
+                policy.policy_ids = vec![PolicyId::new(99)];
+            }
+            policies.extend(initiating.into_iter().map(|policy| EncryptionPolicyFact {
+                source: policy.destination,
+                destination: policy.source,
+                ..policy
+            }));
+        }
         let path = |source: &EncryptionNode, destination: &EncryptionNode| EncryptionPathFact {
             source_node_uid: source.uid.clone(),
             destination_node_uid: destination.uid.clone(),
@@ -1891,6 +1908,105 @@ mod tests {
             peers: plan.peers.clone(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn required_reply_transport_remains_policy_first_and_replica_exact() {
+        let fixture = fixture_with_policy_mode(7, true, true);
+        assert_eq!(
+            fixture.contract.schema_version,
+            crate::ATTESTED_ENCRYPTION_REPLY_CONTRACT_SCHEMA_VERSION
+        );
+        assert!(
+            fixture
+                .contract
+                .plans
+                .iter()
+                .all(|plan| plan.policy.reply_to.is_some())
+        );
+        let decisions: Vec<_> = fixture
+            .contract
+            .plans
+            .iter()
+            .enumerate()
+            .map(|(index, plan)| FastPathDecisionInput {
+                source_identity: plan.source.identity,
+                destination_identity: plan.destination.identity,
+                disposition: EncryptionDisposition::Required,
+                contract_epoch: Some(7),
+                plan_index: Some(index),
+            })
+            .collect();
+        let state = compile_encryption_fast_path(
+            context(1),
+            &[FastPathEpochAdmission {
+                contract: &fixture.contract,
+                transaction: &fixture.transaction,
+                readback: &fixture.snapshot,
+                readiness_digest: [7; 32],
+                state: FastPathEpochState::Active,
+                drain_until_monotonic_ns: 0,
+            }],
+            &decisions,
+        )
+        .unwrap();
+        state.verify_integrity().unwrap();
+        assert_eq!(
+            state.decisions.len(),
+            4,
+            "identity pairs coalesce across replicas"
+        );
+        assert_eq!(
+            state.transports.len(),
+            2,
+            "one transport per peer, not per reply/policy"
+        );
+        for (address, expected_uid) in [
+            ("10.42.2.8", "uid-worker-b"),
+            ("fd42:2::8", "uid-worker-b"),
+            ("10.42.3.8", "uid-worker-c"),
+            ("fd42:3::8", "uid-worker-c"),
+        ] {
+            let mut packet = packet();
+            packet.destination_address = address.parse().unwrap();
+            packet.policy_authorized = false;
+            assert_eq!(
+                select_encryption_transport(&state, packet, None),
+                FastPathPacketDecision::Drop(FastPathDropReason::PolicyDenied)
+            );
+            packet.policy_authorized = true;
+            let FastPathPacketDecision::Encrypt { lease, .. } =
+                select_encryption_transport(&state, packet, None)
+            else {
+                panic!("policy-tracked reply must use Required transport for {address}");
+            };
+            assert_eq!(
+                state
+                    .transport_authority
+                    .iter()
+                    .find(|transport| transport.transport_id == lease.transport_id)
+                    .unwrap()
+                    .destination_node_uid,
+                expected_uid
+            );
+            packet.policy_authorized = false;
+            assert_eq!(
+                select_encryption_transport(&state, packet, Some(lease)),
+                FastPathPacketDecision::Drop(FastPathDropReason::PolicyDenied)
+            );
+            packet.policy_authorized = true;
+            packet.policy_revision = Revision::new(999);
+            assert_eq!(
+                select_encryption_transport(&state, packet, None),
+                FastPathPacketDecision::Drop(FastPathDropReason::RevisionMismatch)
+            );
+        }
+        let mut absent = packet();
+        absent.destination_address = "10.99.0.8".parse().unwrap();
+        assert!(matches!(
+            select_encryption_transport(&state, absent, None),
+            FastPathPacketDecision::Drop(_)
+        ));
     }
 
     #[test]

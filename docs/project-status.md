@@ -537,7 +537,14 @@ release gate.
 
 ### Phase 9 resume history
 
-Current checkpoint (2026-09-13, ADRs 0298–0303): exact predecessor-receipt
+Current checkpoint: ADRs 0316–0317 qualify runtime `5ea1bd2` for Native
+expiry/empty-Namespace continuity on cl02 then matching-image retained Kind.
+ADR 0318 implements locally verified policy-tracked Required reply contracts
+with explicit initiating-pair provenance; live reply qualification is next.
+Required locality/replica coverage, full lifecycle requalification and S1–S5
+remain open. Neither platform row is reverified by these bounded slices.
+
+Historical checkpoint (2026-09-13, ADRs 0298–0303): exact predecessor-receipt
 recovery and wholly Native key-readiness isolation are implemented with local
 regressions. The former candidate failed cl02 Native traffic; the latter's
 first image failed embedded-revision preflight. Build environment shadowing and

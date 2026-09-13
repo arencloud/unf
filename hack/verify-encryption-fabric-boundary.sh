@@ -24,8 +24,8 @@ require_text '.master-prompt/Rust Universal eBPF Network Fabric.md' \
     '# 25. Encryption' \
     "the master-prompt encryption requirement must remain present"
 require_text docs/project-status.md \
-    '| Phase 9 — attested encryption fabric | **In progress** |' \
-    "the authoritative Phase 9 state must be in progress"
+    '| Phase 9 — attested encryption fabric | **In progress — coverage repair** |' \
+    "the authoritative Phase 9 state must retain the reopened coverage boundary"
 require_text docs/project-status.md \
     '| Architecture and acceptance boundary | **Verified** |' \
     "milestone 9.1 must be tracked as verified"
@@ -153,8 +153,8 @@ require_text docs/architecture/components.md \
     'The accepted Phase 9 boundary keeps encryption intent, key authority,' \
     "component ownership must remain explicit"
 require_text README.md \
-    'Phase 9 begins the attested encryption fabric.' \
-    "the user-facing status must expose the active phase"
+    'Phase 9 remains open for Required coverage and lifecycle requalification.' \
+    "the user-facing status must expose the reopened qualification"
 require_text docs/roadmap.md \
     '## Phase 9 — attested encryption fabric' \
     "the roadmap must include Phase 9"
