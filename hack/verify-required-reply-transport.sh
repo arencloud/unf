@@ -10,6 +10,8 @@ project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 [[ $UNF_REQUIRED_REPLY_RUNTIME_REVISION =~ ^[0-9a-f]{40}$ ]]
 [[ $UNF_TEST_TOOLS_IMAGE =~ @sha256:[0-9a-f]{64}$ ]]
 [[ $UNF_REQUIRED_REPLY_CAPTURE_INTERFACE =~ ^[a-zA-Z0-9_.-]{1,15}$ ]]
+diagnostic_hold=${UNF_REQUIRED_REPLY_DIAGNOSTIC_HOLD_SECONDS:-0}
+[[ $diagnostic_hold =~ ^(0|[1-9]|[1-5][0-9]|60)$ ]]
 [[ -z $(git -C "$project_root" status --porcelain) ]]
 git -C "$project_root" merge-base --is-ancestor "$UNF_REQUIRED_REPLY_RUNTIME_REVISION" HEAD
 context=${KUBE_CONTEXT:-$(kubectl --kubeconfig "$KUBECONFIG" config current-context)}
@@ -49,6 +51,10 @@ failure() {
     fi
     "${read_api[@]}" -n "$namespace" get pods,services,networkpolicies,encryptionpolicies -o json > "$directory/failed-fixture.json" 2>&1 || true
     jq -n --arg stage "$stage" --argjson status "$status" '{result:"failed",stage:$stage,exitCode:$status}' > "$directory/failure.json"
+    if (( diagnostic_hold > 0 )); then
+        printf 'Holding only the failed fixture for %s seconds for read-only diagnostics\n' "$diagnostic_hold" >&2
+        sleep "$diagnostic_hold"
+    fi
     printf 'Required reply qualification failed at %s; retain %s\n' "$stage" "$directory" >&2
     return "$status"
 }

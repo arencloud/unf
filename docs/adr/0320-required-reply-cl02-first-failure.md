@@ -38,6 +38,24 @@ Tests preserve a mocked failed-run packet file and reject observer failure;
 the existing capture-loss/crash/timeout tests remain mandatory. These changes
 repair evidence collection, not the dataplane failure.
 
+Two subsequent instrumented runs also fail: one completes all 12 Required
+probes then loses a Native IPv6 UDP control; another again loses the translated
+Required IPv6 UDP reply. Paired traces in the latter show the request crossing
+WireGuard, reaching the destination Pod, and a Pod reply entering its host
+without leaving through WireGuard. The source's sampled policy/Service and
+encryption revisions remain aligned around that failure; a source revision
+fence is not its demonstrated cause. Both runs retain cleanly stopped underlay
+captures and zero kernel capture loss. Destination-side attribution remains
+open, not inferred from successful earlier replies.
+
+An explicit `UNF_REQUIRED_REPLY_DIAGNOSTIC_HOLD_SECONDS` option (default zero,
+maximum 60) permits bounded read-only inspection after a failed run records its
+capture and probe status, before normal fixture cleanup. It never retries a
+probe, changes a verdict, extends admission or skips cleanup. Runtime policy
+connection maps are not pinned: trying a nonexistent `CONNECTIONS` pin is an
+observer error, not proof that connection state was absent. Exact map/program
+IDs must be resolved before inspecting that state.
+
 All current UNF container/installer logs are reviewed. They contain no ERROR,
 panic, OOM or verifier failure in the retained window. They do contain startup
 admission, key catch-up, reciprocal proof/plan retries, one Service selection
