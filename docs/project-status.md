@@ -643,6 +643,11 @@ Both latter claims remain false; authenticated live distribution is next.
 ADR 0350 adds the cl02-before-Kind distribution qualifier with exact public-cut
 joins and Native candidate retirement; local positive/negative observer tests
 pass. Platform results and packet consumption are not yet verified.
+ADR 0351 records a rollout observer failure: cl02's controller updates to
+`f984db9`, but agents remain `450de80` when the runner is stopped. The retired
+controller termination log is unavailable and explicitly not claimed reviewed.
+Checked foreground log-inventory materialization is repaired and locally tested;
+agent rollout and fresh complete feature-validation windows remain pending.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
