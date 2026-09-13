@@ -31,7 +31,10 @@ for namespace in "$fabric" "$source_namespace" "$destination" "$replacement"; do
     namespaces+=("$namespace")
     ip -n "$namespace" link set lo up
 done
-fabric_tc() { ip netns exec "$fabric" tc "$@"; }
+fabric_tc() {
+    printf 'TC command:' >&2; printf ' %q' "$@" >&2; printf '\n' >&2
+    ip netns exec "$fabric" tc "$@"
+}
 ip -n "$fabric" link add name source index 201 type veth peer name eth0 netns "$source_namespace"
 ip -n "$fabric" link set source up
 ip -n "$source_namespace" link set eth0 up
@@ -93,8 +96,10 @@ start_receivers "$replacement" replacement
 fabric_tc qdisc add dev source clsact
 fabric_tc actions add action mirred egress redirect dev target index 101
 for family in ip ipv6; do
-    priority=10; [[ $family != ipv6 ]] || priority=11
-    fabric_tc filter add dev source ingress protocol "$family" pref "$priority" matchall \
+    priority=10; address=10.244.46.2; port=17777
+    [[ $family != ipv6 ]] || { priority=11; address=fd46::2; port=17778; }
+    fabric_tc filter add dev source ingress protocol "$family" pref "$priority" handle 1 flower \
+        skip_hw dst_ip "$address" ip_proto udp dst_port "$port" \
         action mirred index 101
 done
 stage=positive-delivery
@@ -138,9 +143,13 @@ read_action 101 reused-action
 
 stage=explicit-fresh-device-binding
 fabric_tc actions add action mirred egress redirect dev target index 102
+read_action 102 candidate-action
+fabric_tc -j filter show dev source ingress > "$directory/pre-rebind-filters.json"
 for family in ip ipv6; do
-    priority=10; [[ $family != ipv6 ]] || priority=11
-    fabric_tc filter replace dev source ingress protocol "$family" pref "$priority" matchall \
+    priority=10; address=10.244.46.2; port=17777
+    [[ $family != ipv6 ]] || { priority=11; address=fd46::2; port=17778; }
+    fabric_tc filter replace dev source ingress protocol "$family" pref "$priority" handle 1 flower \
+        skip_hw dst_ip "$address" ip_proto udp dst_port "$port" \
         action mirred index 102
 done
 send_pair new-binding
@@ -151,7 +160,19 @@ read_action 101 retired-action
 ! grep -Fq reused- "$directory/replacement-v6.payload"
 
 stage=statistics-review
-# Raw action and packet evidence is retained for independent strict review.
-# No success is emitted until the caller's JSON gate validates target lifetime
-# and positive attempt/drop counters; mere absence of payload is insufficient.
-echo 'Device lifecycle traffic complete; strict action evidence review required'
+gate_directory=${UNF_LOCAL_DELIVERY_GATE_DIRECTORY:-/usr/local/share/unf-qualification}
+jq -e -s -L "$gate_directory" 'include "local-delivery-device-gate"; device_lifetime_verified' \
+    "$directory/baseline-action.json" "$directory/renamed-action.json" \
+    "$directory/down-action.json" "$directory/deleted-action.json" \
+    "$directory/reused-action.json" "$directory/candidate-action.json" \
+    "$directory/new-action.json" "$directory/retired-action.json" >/dev/null
+for family in v4 v6; do
+    [[ $(wc -l < "$directory/genuine-$family.payload") == 3 ]]
+    [[ $(wc -l < "$directory/replacement-$family.payload") == 1 ]]
+done
+stage=verified
+jq -n '{schemaVersion:1,result:"passed",scope:"isolated-device-reference-delivery",
+    families:["IPv4","IPv6"],protocol:"UDP",positivePayloads:8,
+    deniedProbeAttempts:4,retiredActionAttempts:10,retiredActionOverlimits:4,
+    renamedDeviceRetained:true,downStateFenced:true,reusedIndexFenced:true,
+    explicitNewBinding:true,liveLocalityAdmission:false}' | tee "$directory/evidence.json"

@@ -607,6 +607,9 @@ still required; no full Phase 9 or stabilization row is promoted.
 ADR 0343 adds an isolated TC device-reference lifecycle investigation fixture
 for L3's continuous-lifetime gap. Kernel qualification and the strict positive
 attempt/drop evidence gate remain pending; no live dataplane changes are made.
+ADR 0344 records the failed cl02 device-lifetime pilot and adds explicit filter
+handles, exact UDP classification and a locally verified statistics gate.
+Corrected cl02 execution remains required; Kind is not advanced on the failure.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

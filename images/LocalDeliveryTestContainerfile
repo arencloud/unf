@@ -3,4 +3,5 @@ FROM ${TEST_TOOLS_IMAGE}
 ARG UNF_SOURCE_REVISION
 LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
 COPY hack/verify-local-delivery-device-lifetime.sh /usr/local/bin/verify-local-delivery-device-lifetime
+COPY hack/local-delivery-device-gate.jq /usr/local/share/unf-qualification/local-delivery-device-gate.jq
 ENTRYPOINT ["bash", "/usr/local/bin/verify-local-delivery-device-lifetime"]

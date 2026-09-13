@@ -87,6 +87,9 @@ ADR 0343 starts an isolated device-reference delivery investigation for that
 lifetime gap. The fixture is implemented but emits no verified result until
 positive delivery, target invalidation and attempt/drop evidence pass a strict
 gate on cl02 before Kind. It is not a live plaintext exception.
+ADR 0344 preserves the first cl02 pilot's EEXIST failure and removes ambiguous
+filter handles and non-probe counter noise. The exact eight-snapshot statistics
+gate passes 96 negative mutations locally; corrected cl02 execution is next.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,
