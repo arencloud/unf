@@ -28,6 +28,7 @@ forward_pid=
 stage=preflight
 source "$project_root/hack/phase9-http-probe.sh"
 source "$project_root/hack/phase9-capture.sh"
+source "$project_root/hack/required-reply-diagnostics.sh"
 cleanup() {
     local status=$?
     trap - EXIT ERR
@@ -42,6 +43,12 @@ cleanup() {
 }
 failure() {
     local status=$?
+    # Notify bounded external read-only observers immediately, independently
+    # of API/capture readback. Preserve this original failure classification.
+    jq -n --arg stage "$stage" --argjson status "$status" '{result:"failed",stage:$stage,exitCode:$status}' > "$directory/failure.json"
+    if declare -F controller_raw >/dev/null; then
+        required_reply_preserve_failure_status
+    fi
     if [[ $capture_started == true && $capture_finished == false ]]; then
         # Retain failure evidence before deleting the owned Namespace. This
         # does not turn a failed traffic run into plaintext-absence evidence.
@@ -50,7 +57,6 @@ failure() {
         fi
     fi
     "${read_api[@]}" -n "$namespace" get pods,services,networkpolicies,encryptionpolicies -o json > "$directory/failed-fixture.json" 2>&1 || true
-    jq -n --arg stage "$stage" --argjson status "$status" '{result:"failed",stage:$stage,exitCode:$status}' > "$directory/failure.json"
     if (( diagnostic_hold > 0 )); then
         printf 'Holding only the failed fixture for %s seconds for read-only diagnostics\n' "$diagnostic_hold" >&2
         sleep "$diagnostic_hold"
@@ -197,6 +203,9 @@ for pod in required-client native-client server; do
     done
 done
 "${read_api[@]}" -n "$namespace" get pods,services,networkpolicies -o json > "$directory/fixture.json"
+stage=capture-preparation
+source "$project_root/hack/required-reply-capture.sh"
+required_reply_capture_prepare
 stage=policy-adoption
 source "$project_root/hack/required-reply-adoption.sh"
 required_reply_wait_policy
@@ -213,7 +222,6 @@ spec:
 EOF
 required_reply_wait_generation required
 stage=capture-and-traffic
-source "$project_root/hack/required-reply-capture.sh"
 required_reply_capture_start
 capture_started=true
 allowed=0

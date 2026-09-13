@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-bash -n "$root/hack/verify-required-reply-transport.sh" "$root/hack/required-reply-adoption.sh" "$root/hack/required-reply-capture.sh"
+bash -n "$root/hack/verify-required-reply-transport.sh" "$root/hack/required-reply-adoption.sh" "$root/hack/required-reply-capture.sh" "$root/hack/required-reply-diagnostics.sh"
 jq -L "$root/hack" -ne '
   include "required-reply-adoption";
   def good: [{node:"a",pending:false,generation:5,policyRevision:3,serviceRevision:4,egressRevision:2,epochs:[7]},
@@ -33,6 +33,17 @@ bash "$root/hack/verify-phase9-capture.sh"
 rg -Fq 'del(.explicitStopAfterFault) + {explicitStopAfterTraffic:true}' "$root/hack/required-reply-capture.sh"
 rg -Fq 'required_reply_preserve_failure_capture >' "$root/hack/verify-required-reply-transport.sh"
 rg -Fq '"$directory/probes.jsonl"' "$root/hack/verify-required-reply-transport.sh"
+# Capture object creation must precede the final adoption barrier. Starting
+# capture afterward may only signal the already-created, bounded process.
+awk '
+  /^required_reply_capture_prepare$/ {prepare=NR}
+  /^required_reply_wait_policy$/ {policy=NR}
+  /^required_reply_wait_generation required$/ {generation=NR}
+  /^required_reply_capture_start$/ {start=NR}
+  END {exit !(prepare>0 && prepare<policy && policy<generation && generation<start)}
+' "$root/hack/verify-required-reply-transport.sh"
+rg -Fq 'exec /usr/bin/timeout --signal=INT 300 /usr/bin/tcpdump' "$root/hack/required-reply-capture.sh"
+rg -Fq '/usr/bin/timeout 600 /bin/sh' "$root/hack/required-reply-capture.sh"
 source "$root/hack/required-reply-capture.sh"
 directory=$(mktemp -d)
 trap 'rm -r -- "$directory"' EXIT
@@ -47,4 +58,20 @@ phase9_capture_finish() { return 1; }
 if required_reply_preserve_failure_capture >/dev/null 2>&1; then
     echo 'Failed capture observation must not be accepted' >&2; exit 1
 fi
+source "$root/hack/required-reply-diagnostics.sh"
+controller_raw() {
+    case $1 in
+        /v1/flows) printf '{"entries":[]}\n';;
+        /v1/state/agents) echo 'mock observer failure' >&2; return 22;;
+        /v1/encryption/status) printf '{"generation":7}\n';;
+        *) return 99;;
+    esac
+}
+required_reply_preserve_failure_status
+[[ $(< "$directory/failed-flows.exit") == 0 ]]
+[[ $(< "$directory/failed-state-agents.exit") == 22 ]]
+[[ $(< "$directory/failed-encryption-status.exit") == 0 ]]
+jq -e '.entries==[]' "$directory/failed-flows.json" >/dev/null
+jq -e '.generation==7' "$directory/failed-encryption-status.json" >/dev/null
+rg -Fq 'mock observer failure' "$directory/failed-state-agents.observer.log"
 echo 'Required reply gate rejects incomplete/stale/foreign cuts and unbound reply provenance'

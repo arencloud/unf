@@ -5,7 +5,7 @@ required_reply_preserve_failure_capture() {
       jq -ce 'del(.explicitStopAfterFault) + {explicitStopAfterTraffic:true}'
 }
 
-required_reply_capture_start() {
+required_reply_capture_prepare() {
     local family
     capture_pod=underlay-capture
     capture_container_path=/capture/required-reply.pcap
@@ -55,8 +55,11 @@ spec:
     - name: tcpdump
       image: $UNF_TEST_TOOLS_IMAGE
       imagePullPolicy: IfNotPresent
-      command: [/usr/bin/timeout]
-      args: ["--signal=INT", "300", "/usr/bin/tcpdump", "-U", "-ni", "$UNF_REQUIRED_REPLY_CAPTURE_INTERFACE", "-w", "$capture_container_path", "$capture_filter"]
+      command: [/bin/sh, -ec]
+      args:
+        - |
+          /usr/bin/timeout 600 /bin/sh -ec 'until test -e /capture/start; do sleep 1; done'
+          exec /usr/bin/timeout --signal=INT 300 /usr/bin/tcpdump -U -ni "$UNF_REQUIRED_REPLY_CAPTURE_INTERFACE" -w "$capture_container_path" "$capture_filter"
       securityContext: {privileged: true}
       resources: {requests: {cpu: 10m, memory: 16Mi}, limits: {cpu: 500m, memory: 128Mi}}
       volumeMounts: [{name: capture, mountPath: /capture}]
@@ -69,8 +72,19 @@ spec:
       volumeMounts: [{name: capture, mountPath: /capture}]
 EOF
     "${kc[@]}" -n "$namespace" wait --for=condition=Ready "pod/$capture_pod" --timeout=180s >/dev/null
-    "${read_api[@]}" -n "$namespace" logs "$capture_pod" -c tcpdump > "$directory/capture-start.log"
-    rg -q "listening on $UNF_REQUIRED_REPLY_CAPTURE_INTERFACE," "$directory/capture-start.log"
+}
+
+required_reply_capture_start() {
+    local deadline=$((SECONDS+15))
+    # Exec changes only this owned emptyDir, not any Kubernetes object. All
+    # capture Pod/SA/namespace mutations precede policy and encryption adoption.
+    timeout 15 "${kc[@]}" -n "$namespace" exec "$capture_pod" -c keeper -- touch /capture/start
+    while (( SECONDS < deadline )); do
+        "${read_api[@]}" -n "$namespace" logs "$capture_pod" -c tcpdump > "$directory/capture-start.log"
+        if rg -q "listening on $UNF_REQUIRED_REPLY_CAPTURE_INTERFACE," "$directory/capture-start.log"; then return 0; fi
+        sleep 1
+    done
+    return 1
 }
 
 required_reply_capture_finish() {

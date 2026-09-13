@@ -540,7 +540,9 @@ release gate.
 Current checkpoint: ADRs 0316–0317 qualify runtime `5ea1bd2` for Native
 expiry/empty-Namespace continuity on cl02 then matching-image retained Kind.
 ADR 0318 implements locally verified policy-tracked Required reply contracts
-with explicit initiating-pair provenance; live reply qualification is next.
+with explicit initiating-pair provenance. ADRs 0320–0321 record failed cl02
+reply qualification and correct capture setup occurring after admission;
+the corrected scoped gate must pass cl02 before retained Kind advances.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 

@@ -13,14 +13,19 @@ are claimed.
 
 ADR 0318 adds locally verified Required policy-tracked reply contracts with
 explicit initiating-pair provenance and fail-closed schema-2 compatibility.
-The live clusters remain on the qualified Native runtime; Required reply
-traffic has not yet been qualified on either platform. ADR 0319 publishes
+cl02 now runs candidate `67c2772` with a Native baseline; retained Kind remains
+on `5ea1bd2`. Required reply traffic has not yet been qualified on either
+platform. ADR 0319 publishes
 candidate `67c2772` and a scoped cl02-first reply/ciphertext gate, with exact
 policy/generation adoption and public reply-provenance checks.
 ADR 0320 records the first cl02 reply gate failing its IPv6 translated UDP
 probe after admission and 11 preceding probes. Failed-capture retention is
 repaired; root cause remains under investigation. Native cleanup is positively
 verified; Kind is not advanced past the failed cl02 gate.
+ADR 0321 records a later destination-side revision mismatch during a failed
+Native TCP control and moves capture-object preparation before admission.
+This corrects a moving-fixture qualifier, not S4's policy/Service update
+continuity requirement; the corrected cl02 result remains pending.
 
 Next: qualify Required replies on cl02 before Kind, finish Required locality/replica coverage and full current
 runtime lifecycle qualification, cl02 before Kind. Empty-Namespace no-op
