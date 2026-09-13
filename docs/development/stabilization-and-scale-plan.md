@@ -1,47 +1,33 @@
 # Stabilization and scale qualification
 
-Requested 2026-09-12. Phase 9's 2026-09-13 closure (ADR 0292) was reopened by
-S1's missing transport coverage findings (ADR 0293). ADR 0294 implements the
-Native repair; live requalification and Required coverage remain pending.
-S1–S5 are not yet verified.
+Requested 2026-09-12. Phase 9's closure (ADR 0292) was reopened by S1's
+transport coverage findings (ADR 0293). Phase 9 and S1–S5 remain open.
 
-Latest result: ADRs 0304–0305 record runtime `54f5511` passing the corrected
-cl02 deployment and adoption-fenced Native gate, then retained Kind recovery
-without a state reset and the matching-image gate (each: 24 allows, eight
-denials, cleanup). Controlled continuity and Required coverage are next; full
-Phase 9 lifecycle and heavy-load stabilization are still unverified.
+Current checkpoint: ADR 0316 qualifies runtime `5ea1bd2` on cl02. Guarded
+deployment, 24 Native allow cases, eight reverse denials, 232 fresh connections
+with zero failures across empty-Namespace churn, exact cleanup and five-agent
+convergence pass. All six UNF Pods have zero restarts; log warnings and operator
+health findings remain tracked. No sustained-load/resource savings are claimed.
 
-The next continuity slice failed on cl02 (ADR 0308: 10/208 fresh connections).
-ADR 0309 implements dependency-aware namespace invalidation and an observable
-skipped-work counter; local regressions pass. ADR 0310's cl02 rollout and
-24-allow/eight-denial gate pass, but continuity fails one of 232 connections
-despite stable policy revision and four skipped invalidations. Capture the
-remaining exact failure path; do not upgrade Kind before cl02 passes.
+Next: qualify the identical archived images on retained Kind without resetting
+its state. Then finish Required locality/replica/reply coverage and full current
+runtime lifecycle qualification, cl02 before Kind. Empty-Namespace no-op
+continuity does not establish arbitrary policy/Service update atomicity. Active
+tuple collisions and LRU capacity behavior remain load-envelope boundaries.
 
-ADR 0312 now attributes a reproduced IPv6 failure to an expired reverse Service
-mapping blocking a new tuple. Packet captures, drop telemetry and an exact
-read-only key lookup agree. Add ownership-safe expiry reclamation regressions
-before another runtime build; preserve live mappings and successor pairs.
-This is a concrete S1 reliability finding, not completed scale optimization.
+Repair evidence is retained chronologically in the ADRs:
 
-ADR 0313 implements claimed expiry and owner-checked paired cleanup. The
-regression-backed candidate passes local kernel, encrypted-DSR, concurrent-touch
-and workspace checks. Publish its newly built BPF object with exact runtime
-provenance, then qualify cl02/logs/continuity before updating Kind. LRU capacity
-eviction and active tuple collisions remain explicit load-envelope boundaries.
-
-ADR 0314 rejects candidate `5505d00` on cl02's RHCOS verifier budget despite
-local kernel passes. Rollout stopped after three replacements; previous-image
-recovery preserves state. Reduce verified instruction/state exploration and
-prove isolated cl02 loading before another rollout. Kind remains untouched.
-The minimal thirteen-word copy repair now passes isolated cl02 loading of all
-fourteen programs; the same observer reproduces the original rejection. All
-three prior-image agents recovered without state resets. Runtime deployment
-and Native/churn traffic qualification are still pending; this is not closure.
-ADR 0315 adds a candidate restart/termination guard to serial rollout polling.
-It rejects the retained failed cl02 snapshot while allowing pre-admission
-not-Ready staging. Full convergence and isolated kernel verification remain
-separate required checks.
+- ADRs 0294–0305: explicit Native locality/replies, exact-predecessor receipt
+  recovery, key-independent Native publication and immutable build provenance;
+  bounded Native gates pass on both platforms with runtime `54f5511`.
+- ADRs 0308–0312: continuity failures, dependency-aware namespace invalidation,
+  paired captures and exact read-only attribution to expired Service tuples.
+- ADRs 0313–0314: owner-claimed expiry, concurrent-touch and encrypted-DSR
+  regressions; RHCOS verifier rejection, state-preserving recovery, and the
+  minimal fixed-width copy repair proven red/green on isolated cl02.
+- ADR 0315: serial rollout rejects failed/restarted candidates while permitting
+  the pre-admission staging needed by the fleet barrier.
+- ADR 0316: the repaired runtime passes the expanded cl02 Native/churn gate.
 
 S2 profiling lead, not an attributed CPU result: `policy_snapshot` calls
 `dataplane_policy_state` for every authenticated pull; the latter clones the
@@ -51,14 +37,6 @@ considering immutable sharing or conditional delivery. Any optimization must
 retain current-Pod authentication, authority readiness, cold-start/failed-apply
 recovery and epoch/revision fencing, including older-agent compatibility.
 
-ADR 0303 rejects the first key-independent candidate's embedded provenance and
-repairs fail-open conditional deployment checks; rebuilding and cl02-first
-qualification remain required. Retained Kind has not been reset or upgraded.
-ADR 0300 now implements key-independent publication for wholly Native models,
-after ADR 0299's cl02 failure. Its local regressions pass; a new immutable
-runtime must pass cl02 before retained Kind is updated. Do not treat the
-earlier `571379d` Native pass as qualification of this implementation.
-
 Commit and push each completed step before the next. Platform feature tests run
 on OpenShift cl02 first, then isolated Kind; local checks precede deployment.
 Both platform results must name the same immutable runtime images. Credentials
@@ -66,7 +44,7 @@ remain in ignored, owner-only local files and never enter evidence or Git.
 
 | Step | State | Required exit evidence |
 |---|---|---|
-| P9 coverage repair | In progress | ADRs 0293–0296: Native locality/reply repair passes 24 cl02 allow cases, eight reverse denials and cleanup; four platform operators temporarily recover. ADR 0298 implements the mixed-cursor receipt repair, but its cl02 rollout passes while the Native packet gate fails (ADR 0299). ADR 0300 tracks Native publication's unnecessary key-readiness dependency; repair and qualify cl02-first before touching retained Kind. Continuity, Required locality/replica/reply coverage and full lifecycle qualification remain open |
+| P9 coverage repair | In progress | ADR 0316: runtime `5ea1bd2` passes cl02 Native/empty-Namespace continuity and cleanup. Matching-image retained Kind, Required locality/replica/reply coverage and full lifecycle qualification remain open |
 | S1 baseline and budgets | In progress | Attribute internal DNS/Pod-endpoint failures and operator health first; feature/limit inventory; hardware/kernel/MTU/offloads, endpoints/policies/services/flows; idle/loaded CPU, RSS/cgroup peak, BPF memory, throughput, latency percentiles, convergence |
 | S2 control-plane scale | Pending | Profile policy compilation, snapshots, informer churn and agent pulls; remove measured repeated work; bound queues/caches; compare equal input and churn fixtures before/after |
 | S3 agent and dataplane efficiency | Pending | Map occupancy/update work, connection creation/expiry, telemetry backpressure, Service selection, encryption and egress under mixed dual-stack load; policy correctness and bounded recovery |

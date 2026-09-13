@@ -624,6 +624,13 @@ programs without host attachment. The three affected agents recovered on the
 prior image without resetting state. A new exact-image rollout and traffic
 qualification remain required; Kind has not received the rejected candidate.
 
+ADR 0316 qualifies the repaired runtime `5ea1bd2` on cl02: guarded deployment,
+24 allows, eight reverse denials, 232 fresh churn connections with zero failures,
+unchanged policy revision/four skipped invalidations, cleanup and five-agent
+convergence. All six UNF Pods have zero restarts; warnings remain tracked.
+Matching-image Kind is next, followed by Required coverage and full lifecycle
+qualification. This bounded pass does not close Phase 9 or S1–S5.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.
