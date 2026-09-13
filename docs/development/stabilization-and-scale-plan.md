@@ -12,7 +12,7 @@ remain in ignored, owner-only local files and never enter evidence or Git.
 
 | Step | State | Required exit evidence |
 |---|---|---|
-| P9 coverage repair | Reopened by S1 | ADR 0292 records real ordered platform passes; ADR 0293 then identifies uncovered same-Node Native and isolated-return failures. Repair and expand regression/platform coverage before restoring closure |
+| P9 coverage repair | In progress | ADRs 0293–0296: Native locality/reply repair passes 24 cl02 allow cases, eight reverse denials and cleanup; matching-image Kind remains pending. Four platform operators recover, but transient reachability, Required locality/replica/reply coverage and full lifecycle requalification remain open |
 | S1 baseline and budgets | In progress | Attribute internal DNS/Pod-endpoint failures and operator health first; feature/limit inventory; hardware/kernel/MTU/offloads, endpoints/policies/services/flows; idle/loaded CPU, RSS/cgroup peak, BPF memory, throughput, latency percentiles, convergence |
 | S2 control-plane scale | Pending | Profile policy compilation, snapshots, informer churn and agent pulls; remove measured repeated work; bound queues/caches; compare equal input and churn fixtures before/after |
 | S3 agent and dataplane efficiency | Pending | Map occupancy/update work, connection creation/expiry, telemetry backpressure, Service selection, encryption and egress under mixed dual-stack load; policy correctness and bounded recovery |
@@ -32,6 +32,8 @@ These observations guide later work; they do not mark S1–S5 complete.
 
 | Observation | Required follow-up |
 |---|---|
+| Runtime `571379d` passes expanded cl02 Native isolation/translated-port coverage; DNS/OAuth later recover after initial timeouts | ADRs 0295–0296: fresh matching-image Kind, then controlled traffic continuity during reconciliation/churn; do not turn a steady-state pass into an uninterrupted-service claim |
+| Short pre-repair sample: controller 1.335 CPU cores; agents 0.155–0.253 cores with 343–663 MiB cgroup memory but only 15–23 MiB RSS | ADR 0295: repeat under controlled healthy workloads, include pinned/shared/file accounting and longer windows; do not tighten limits from process RSS or compare freshly restarted cgroups as equal workloads |
 | S1 synchronized capture and kernel readback show missing same-Node Native and policy-isolated-return decisions despite policy-allowed requests | ADR 0293: reproduce, repair explicit transport coverage without weakening Required/policy checks, measure state/CPU impact, then cl02-first/Kind qualification; assess Required locality/replica/return cases separately |
 | `24a66ca` recovered the missing frontier, but the full cl02 gate failed during Required migration; Native cleanup intent left split journals and mixed Prepared/Active key epochs | Repair restart-safe key attestation and generation recovery, preserve exact key expiry and admission barriers, and prove actual cleanup before Kind or scale claims |
 | `cfff9c3` stayed within the 2-GiB controller limit without OOM, but Required migration timed out with 5,972 proof selections | Requalify ADRs 0270–0272 on cl02 before Kind; keep exact runtime and evidence provenance |
