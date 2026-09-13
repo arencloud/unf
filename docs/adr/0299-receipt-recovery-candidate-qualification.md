@@ -2,7 +2,7 @@
 
 Date: 2026-09-13
 
-Status: immutable candidate published; live gates pending
+Status: cl02 staged rollout passed; expanded Native traffic failed; Kind held
 
 ADR 0298's runtime candidate is
 `b5bf6c6f0f249ce1e23371835623acbf0ea5affc`. Publish and anonymously verify
@@ -24,6 +24,39 @@ anonymous Quay manifest reads match their pushed digests:
 The release record retains `qualificationOrder: openshift-first` and pending
 Kind evidence. These digest checks prove published artifact identity, not
 runtime traffic or recovery correctness.
+
+## cl02 result
+
+Qualifier `6717935` passes the controller-first/node-serial staged deployment,
+with all five agent receipts and the same public admitted generation
+`1789275605720`, zero container restarts, and kube-proxy absent. This is not a
+successful packet or mixed-cursor recovery qualification.
+
+The expanded Native gate then fails its first allowed IPv4 Service request
+after the initial Pod-IP probes. At a correlated observation all agents report
+policy/Service convergence at `535/203`, but the retained encryption generation
+is still bound to `581/230`. Authentication, console, ingress and
+kube-controller-manager become unhealthy again; Insights and network were
+already unhealthy. The owned fixture is removed and the failure is retained;
+no passing evidence JSON exists for this run.
+
+An authenticated plan request over verified TLS returns 204 with no successor.
+Public key bootstrap reports fleet floor 569; agent warnings show transition
+568 behind that floor and deferred retirement. The controller code requires a
+complete, common ready key epoch before producing even a fully Native plan.
+ADR 0300 separates that coupling from the receipt repair and plans a narrow
+key-independent Native path. A later recovery or retry cannot erase this
+bounded gate failure. No keys, maps or journals were cleared.
+
+One follow-up bulk public-journal capture was interrupted by an exec EOF and
+contains incomplete files; it is not a complete fleet proof. The earlier
+post-rollout five-Node capture and the persisted public controller frontier
+remain valid within their separate capture windows. Authentication tokens used
+for the diagnostic requests stayed in process memory/curl stdin, never artifacts.
+
+Kind remains on `571379d`, with its original two-receipt checkpoint and mixed
+cursors retained. The new runtime has not been deployed there because cl02
+traffic did not pass. Full Phase 9 and S1–S5 remain open.
 
 ## Correctly scoped pre-candidate resource observation
 
