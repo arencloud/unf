@@ -47,6 +47,13 @@ Protocol-compatible live rollout and consuming locality integration remain open.
 Kind's post-test log review hits two 2-MiB caps, requiring expanded reads plus
 74,503,522 bytes of retained current/rotated CRI files. Three current proof-round
 warnings and per-packet log amplification remain findings, not a clean-log claim.
+ADRs 0333–0337 verify candidate-protocol installation, guarded live cl02 CNI
+rollout on `450de80`, and real runtime UID/nonce ownership and retirement in the
+full selective reply gate. It passes 24 allowed/eight denied requests and
+positive ciphertext with exact fixture cleanup. Matching Kind still runs
+`67c2772` and remains pending. Known policy-admission limits, proof/plan warnings,
+an expired watch and the unavailable retired-controller termination logs remain
+explicit findings; no full Phase 9 or stabilization row is closed.
 
 Repair evidence is retained chronologically in the ADRs:
 

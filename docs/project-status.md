@@ -583,6 +583,10 @@ locality consumer remain next; neither full platform row is closed.
 ADR 0336 adds locally checked live CNI-incarnation and retirement assertions to
 the Required reply qualifier. Candidate `450de80` images are built and version
 checked with unchanged eBPF; live rollout and this expanded gate remain pending.
+ADR 0337 verifies the guarded `450de80` live cl02 rollout, real runtime UID/nonce
+capture and retirement, 24 allowed/eight denied requests, ciphertext and exact
+fixture cleanup. All UNF containers are Ready with zero restarts. Matching Kind
+still runs `67c2772` and is next; operational log findings remain open.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
 remain open. Neither platform row is reverified by these bounded slices.
 

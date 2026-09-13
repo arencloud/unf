@@ -63,6 +63,9 @@ runtime UID capture and consuming locality integration remain open.
 ADR 0336 adds opt-in live runtime UID/nonce/lease and normal-retirement evidence
 to the complete selective Required reply gate. Local positive/19-negative
 validation passes; real cl02 rollout and matching Kind are pending.
+ADR 0337 verifies live cl02 rollout and the complete expanded CNI/reply gate
+on `450de80`. Matching Kind remains pending. This closes the cl02 runtime UID
+prerequisite only; it does not admit local Required plaintext or close L3.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,
