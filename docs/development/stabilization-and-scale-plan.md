@@ -3,14 +3,15 @@
 Requested 2026-09-12. Phase 9's closure (ADR 0292) was reopened by S1's
 transport coverage findings (ADR 0293). Phase 9 and S1–S5 remain open.
 
-Current checkpoint: ADR 0316 qualifies runtime `5ea1bd2` on cl02. Guarded
-deployment, 24 Native allow cases, eight reverse denials, 232 fresh connections
-with zero failures across empty-Namespace churn, exact cleanup and five-agent
-convergence pass. All six UNF Pods have zero restarts; log warnings and operator
-health findings remain tracked. No sustained-load/resource savings are claimed.
+Current checkpoint: ADRs 0316–0317 qualify runtime `5ea1bd2` on cl02, then
+retained Kind with identical images and no state reset. Each passes 24 Native
+allow cases, eight reverse denials, empty-Namespace continuity (232/720 fresh
+connections, zero failures), exact cleanup and full agent convergence. Current
+UNF Pods have zero restarts. Log warnings, Kind's per-packet log amplification
+and operator health findings remain tracked. No sustained-load/resource savings
+are claimed.
 
-Next: qualify the identical archived images on retained Kind without resetting
-its state. Then finish Required locality/replica/reply coverage and full current
+Next: finish Required locality/replica/reply coverage and full current
 runtime lifecycle qualification, cl02 before Kind. Empty-Namespace no-op
 continuity does not establish arbitrary policy/Service update atomicity. Active
 tuple collisions and LRU capacity behavior remain load-envelope boundaries.
@@ -27,7 +28,8 @@ Repair evidence is retained chronologically in the ADRs:
   minimal fixed-width copy repair proven red/green on isolated cl02.
 - ADR 0315: serial rollout rejects failed/restarted candidates while permitting
   the pre-admission staging needed by the fleet barrier.
-- ADR 0316: the repaired runtime passes the expanded cl02 Native/churn gate.
+- ADRs 0316–0317: the repaired runtime passes the expanded Native/churn gate
+  on cl02 first, then matching-image retained Kind.
 
 S2 profiling lead, not an attributed CPU result: `policy_snapshot` calls
 `dataplane_policy_state` for every authenticated pull; the latter clones the
@@ -44,7 +46,7 @@ remain in ignored, owner-only local files and never enter evidence or Git.
 
 | Step | State | Required exit evidence |
 |---|---|---|
-| P9 coverage repair | In progress | ADR 0316: runtime `5ea1bd2` passes cl02 Native/empty-Namespace continuity and cleanup. Matching-image retained Kind, Required locality/replica/reply coverage and full lifecycle qualification remain open |
+| P9 coverage repair | In progress | ADRs 0316–0317: runtime `5ea1bd2` passes Native/empty-Namespace continuity and cleanup on cl02 then matching-image retained Kind. Required locality/replica/reply coverage and full lifecycle qualification remain open |
 | S1 baseline and budgets | In progress | Attribute internal DNS/Pod-endpoint failures and operator health first; feature/limit inventory; hardware/kernel/MTU/offloads, endpoints/policies/services/flows; idle/loaded CPU, RSS/cgroup peak, BPF memory, throughput, latency percentiles, convergence |
 | S2 control-plane scale | Pending | Profile policy compilation, snapshots, informer churn and agent pulls; remove measured repeated work; bound queues/caches; compare equal input and churn fixtures before/after |
 | S3 agent and dataplane efficiency | Pending | Map occupancy/update work, connection creation/expiry, telemetry backpressure, Service selection, encryption and egress under mixed dual-stack load; policy correctness and bounded recovery |

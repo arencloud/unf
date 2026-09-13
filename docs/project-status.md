@@ -631,6 +631,14 @@ convergence. All six UNF Pods have zero restarts; warnings remain tracked.
 Matching-image Kind is next, followed by Required coverage and full lifecycle
 qualification. This bounded pass does not close Phase 9 or S1–S5.
 
+ADR 0317 verifies the identical runtime on retained Kind after cl02: 24 allows,
+eight reverse denials, 720 fresh churn connections with zero failures, stable
+policy revision/three skipped invalidations, cleanup and three-agent convergence.
+No state reset was used. Current UNF Pods have zero restarts; the log review
+includes rotated files after discovering INFO-volume truncation. The Native
+slice is verified on both platforms; Required coverage and full lifecycle tests
+remain open before Phase 9 closure and the S1–S5 load-envelope program.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.
