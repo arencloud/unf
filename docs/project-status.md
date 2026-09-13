@@ -596,6 +596,10 @@ but existing policy/named-port rejections and encryption retries remain visible.
 Both fixture namespaces were removed. Kind is unchanged; precise failure-path
 diagnostics are next, not a Phase 9 or heavy-load completion claim.
 
+ADR 0311 adds bounded connection-stage/reason metadata without raw headers,
+payloads, relaxed timeouts or retry-to-pass. Local and exact deployed-tools
+regressions pass; paired cl02 packet diagnosis is next, with Kind unchanged.
+
 The chronology below preserves intermediate failures and then-pending checks.
 Historical closure evidence is in ADR 0292; ADRs 0293–0294 reopen coverage and
 track the Native repair. The history below is not a current closure claim.

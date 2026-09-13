@@ -1,6 +1,9 @@
 #!/bin/sh
 # Runs in the existing immutable test-tools image: no Python dependency.
 set -eu
+# Parse only fixed wget diagnostics, never emit server headers or response data.
+LC_ALL=C
+export LC_ALL
 targets=$1
 duration=${2:-45}
 case $duration in ''|*[!0-9]*) exit 2;; esac
@@ -23,9 +26,25 @@ while test "$(date +%s)" -lt "$deadline"; do
         response=$(timeout 2 wget --no-proxy --timeout=1 --tries=1 --server-response --output-document=/dev/null "$target" 2>&1) || status=$?
         ok=false
         if test "$status" = 0 && printf '%s\n' "$response" | grep -Eq 'HTTP/1\.[01] 200( |$)'; then ok=true; else failures=$((failures+1)); fi
+        stage=unknown reason=other
+        if printf '%s\n' "$response" | grep -Eq 'HTTP/1\.[01] [0-9]{3}( |$)'; then
+            stage=http-response
+        elif printf '%s\n' "$response" | grep -Fq 'connected.'; then
+            stage=tcp-connected
+        elif printf '%s\n' "$response" | grep -Fq 'Connecting to '; then
+            stage=tcp-connect
+        fi
+        if test "$ok" = true; then reason=none
+        elif test "$status" = 124; then reason=watchdog-timeout
+        elif printf '%s\n' "$response" | grep -Fq 'Connection refused'; then reason=connection-refused
+        elif printf '%s\n' "$response" | grep -Fq 'Connection reset by peer'; then reason=connection-reset
+        elif printf '%s\n' "$response" | grep -Eqi 'timed out|timeout'; then reason=timeout
+        elif test "$stage" = http-response; then reason=http-status
+        fi
         ended=$(date +%s%3N)
         jq -cn --arg target_name "$label" --argjson at "$started" --argjson elapsed "$((ended-started))" --argjson ok "$ok" --argjson status "$status" \
-            '{type:"sample",label:$target_name,unixMs:$at,elapsedMs:$elapsed,ok:$ok,wgetExit:$status}'
+            --arg stage "$stage" --arg reason "$reason" \
+            '{type:"sample",label:$target_name,unixMs:$at,elapsedMs:$elapsed,ok:$ok,wgetExit:$status,stage:$stage,reason:$reason}'
         samples=$((samples+1))
     done <<EOF
 $rows

@@ -6,17 +6,27 @@ trap 'rm -f "$temporary/wget" "$temporary/calls" "$temporary/records" "$temporar
 ln -s "$root/hack/testdata/native-continuity-wget.sh" "$temporary/wget"
 targets=$(jq -cn '[range(8)|{label:("target/"+tostring),address:"192.0.2.1",port:8080}]')
 export UNF_CONTINUITY_WGET_CALLS=$temporary/calls
-for scenario in ok wrong-status malformed timeout failed; do
+for scenario in ok wrong-status malformed timeout failed connect-timeout response-timeout refused reset; do
     export UNF_CONTINUITY_WGET_SCENARIO=$scenario
     : > "$temporary/calls"
     PATH="$temporary:$PATH" sh "$root/hack/native-continuity-probe-remote.sh" "$targets" 1 > "$temporary/records"
     calls=$(wc -l < "$temporary/calls")
     expected=false
     [[ $scenario != ok ]] || expected=true
-    jq -se --argjson expected "$expected" --argjson calls "$calls" '
+    case $scenario in
+        ok) stage=http-response; reason=none;;
+        wrong-status) stage=http-response; reason=http-status;;
+        timeout) stage=unknown; reason=watchdog-timeout;;
+        connect-timeout) stage=tcp-connect; reason=timeout;;
+        response-timeout) stage=tcp-connected; reason=timeout;;
+        refused) stage=tcp-connect; reason=connection-refused;;
+        reset) stage=tcp-connected; reason=connection-reset;;
+        *) stage=unknown; reason=other;;
+    esac
+    jq -se --argjson expected "$expected" --argjson calls "$calls" --arg stage "$stage" --arg reason "$reason" '
         .[0].type=="started" and .[-1].type=="complete" and .[-1].samples>0
         and .[-1].samples==$calls
-        and all(.[]|select(.type=="sample");.ok==$expected)
+        and all(.[]|select(.type=="sample");.ok==$expected and .stage==$stage and .reason==$reason)
         and (if $expected then .[-1].failures==0 else .[-1].failures==.[-1].samples end)' "$temporary/records" >/dev/null
 done
 if PATH="$temporary:$PATH" sh "$root/hack/native-continuity-probe-remote.sh" '[]' 1 > "$temporary/records" 2>/dev/null; then
