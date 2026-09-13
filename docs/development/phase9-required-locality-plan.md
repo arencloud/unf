@@ -51,7 +51,9 @@ rollout and the actual locality consumer are still pending.
 ADR 0330 implements a versioned, durable nonce and exact pending-pair recovery
 for interrupted creation; all 784 workspace tests and strict Clippy pass.
 ADR 0331 verifies all four interrupted-creation states and twelve negative
-checks on isolated cl02; the matching Kind qualification remains pending.
+checks on isolated cl02; ADR 0332 verifies the identical image on retained Kind.
+Both live fleets remain unchanged. Protocol-compatible live rollout and the
+actual locality consumer remain pending.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

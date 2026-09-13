@@ -41,7 +41,12 @@ ADRs 0327–0329 add versioned CNI Pod-incarnation ownership and qualify the
 isolated production CNI/kernel lifecycle on cl02 before identical-image Kind.
 The actual kernel gate catches and repairs missing aliases at initial veth
 creation; all 779 workspace tests pass. Live fleets remain unchanged, and
-interrupted-creation recovery plus consuming locality integration remain open.
+ADRs 0330–0332 add durable creation nonces and verify isolated interrupted-pair
+recovery on cl02 before identical-image Kind; 784 workspace tests pass.
+Protocol-compatible live rollout and consuming locality integration remain open.
+Kind's post-test log review hits two 2-MiB caps, requiring expanded reads plus
+74,503,522 bytes of retained current/rotated CRI files. Three current proof-round
+warnings and per-packet log amplification remain findings, not a clean-log claim.
 
 Repair evidence is retained chronologically in the ADRs:
 
