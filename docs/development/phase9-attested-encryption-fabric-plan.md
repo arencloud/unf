@@ -22,7 +22,7 @@ separately revisioned. The authoritative state remains in
 | 9.6 | Bidirectional live path proof | **Verified** | Phases 9.6a–f provide the exact Causal Duplex Path Quorum through consuming activation. Collision-Fenced Unicast Duplex Closure reserves an ordinary IPv4 host without invalidating legacy leases, refuses live collisions, capability-binds exact per-interface reverse-path acceptance in provider schema v3, and runs two production socket engines concurrently over marked dual-stack WireGuard routes. Peer loss denies with routes retained; a fresh round recovers; counters advance; underlay capture exposes ciphertext only. `make encryption-path-live-test`; ADRs 0194–0199 |
 | 9.7 | Operations, upgrade, recovery, and performance | **Verified** | Phases 9.7a–h provide causal operations, minimum-cut diagnosis, adjacent compatibility, survivable recovery/exact cleanup, and a Regression-First Performance Ledger. Immutable native/WireGuard dual-stack evidence records throughput, p50/p95/p99, loss/retransmits, CPU/RSS, map work, 1–128 peers, MTU, handshake, ciphertext, and prewarmed rotation—including regressions and limits. `make encryption-performance-test`; live reproduction is `make encryption-performance-live`; ADRs 0200–0207 |
 | 9.8 | Kube-proxy-free Kind qualification | **Verified** | Exact runtime and qualifier `30266627f42321cd90613c00cb5ba71ac648e02f` passed the complete fresh three-Node dual-stack Kubernetes v1.35.0 gate with ADR 0267. Default-Required and explicit-selective PodIP/Service traffic, 404 WireGuard frames with zero Required plaintext, eight-of-eight fail-closed Required probes with eight-of-eight Native successes, natural rotation, agent/controller replacement, 295 loss-free operation records, performance, Phase 8 egress coexistence, exact cleanup, and no-CNI rollback passed. Evidence JSON SHA-256 is `7801aa7d…0775`; packet-capture SHA-256 is `aff51bb9…f03` |
-| 9.9 | OpenShift qualification | **In progress** | Current runtime `cb59e90` passed preserved-state deployment, Required migration/persistence, Required/selective dual-stack traffic and the 8/8 Required-denied plus 8/8 Native-successful fault matrix on cl02. The latest full run failed capture-statistics validation before rotation/replacement and exact cleanup. ADRs 0285–0289 harden qualifier ownership, host compatibility, bounded reads and complete capture evidence. Rerun the full cl02 gate, then qualify the identical images on fresh Kind before closure |
+| 9.9 | OpenShift qualification | **In progress** | Runtime `cb59e90`, qualifier `f96aec2`, passed the existing full cl02 gate in 1,532 seconds with capture, rotation, replacement, bounded persistence/history and final Native convergence (ADR 0289). ADR 0290 closes negative-observation assertion gaps and passes focused cl02 checks. Rerun the stricter full gate, then qualify identical images on fresh Kind before closure |
 
 ## Accepted Phase 9 gate
 
@@ -175,50 +175,19 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Following the user's 2026-09-12 instruction, platform verification now runs on
-cl02 first, then fresh Kind. Local checks precede image publication. A candidate
-release record declares `qualificationOrder: openshift-first` and Kind `pending`
-with no invented hashes or platform observations. ADR 0279's deployment failed
-on a missing intermediate frontier, despite Native intent being configured.
-ADR 0283's guarded deployment and exact missing-frontier recovery passed on cl02,
-preserving Node-local authority and reaching the initially pending Native cut.
-The subsequent full gate failed during Required migration; post-trap journals
-remain split across Native/Required cuts, so cleanup is not verified. Repair and
-requalify mixed-phase key attestation and generation recovery without deleting
-durable authority. ADR 0284 implements mixed-phase witness reconstruction and
-atomic complete-column persistence; qualify that repair on preserved cl02 state.
-Its deployment and Required/selective dual-stack traffic checks passed, but the
-full gate stopped on a retired fault-target interface. ADR 0285 replaces that
-qualifier assumption with exact live admitted-link selection on both platforms.
-The next run stopped before migration on a truncated baseline history transfer;
-ADR 0286 adds bounded transport-only retries with retained failure metadata and
-single-attempt witness lookups. Invalid successfully transferred content still
-fails immediately. Neither repaired fault selection nor full lifecycle is yet
-live-qualified by that interrupted run.
-ADR 0286's next run passed history, migration and Required/selective traffic,
-then exposed jq 1.6 syntax incompatibility at the first fault selection.
-ADR 0287 adds host-compatible selection, strict netlink-read validation and
-read-only host preflight. Bind capture lifetime to the complete fault window
-before rerunning the full qualification; a fixed timer can expire too early.
-ADR 0288 implements explicit post-fault capture closure and zero-loss checks,
-with local regressions and a cl02 capture-control smoke test. The full repaired
-gate remains pending on the unchanged `cb59e90` runtime.
-That run passed the complete application fault matrix and explicit capture stop,
-then failed loss-statistics validation. ADR 0289 preserves raw capture evidence
-before cleanup and limits capture to the union of the actual verification
-queries. Its cl02 capture-control smoke passed; full qualification is pending.
-The existing full gate then passed in 1,532 seconds with qualifier `f96aec2`,
-including source-agent/controller recovery, natural rotation, capture and final
-Native convergence (ADR 0289). Preserve that versioned result; the assertion
-audit must still distinguish diagnostic failures from denied probes/cleanup
-and check all rotated-table/IPv6 state before final requalification and Kind.
-Run the full current-cut lifecycle gate, then
-qualify those same images on fresh Kind before closing Phase 9. The cl02 gate
-must prove the controller replacement stays inside its 2-GiB cgroup as well as
-preserving RHCOS/SELinux/CRI-O facts, cross-worker encrypted IPv4/IPv6 direct
-and Service traffic, selective fail-closed behavior, rotation/recovery, exact
-cleanup, agent convergence, kube-proxy absence, and the before/after
-ClusterOperator state.
+Platform verification follows the user's cl02-first, then fresh-Kind order.
+The pinned runtime is `cb59e90`; its existing full cl02 gate passed in 1,532
+seconds under qualifier `f96aec2` (ADR 0289). Preserve that exact evidence;
+earlier failures and repairs remain documented in ADRs 0279–0289.
+
+ADR 0290 finishes the negative-assertion audit: command failure cannot mean
+network denial or absent state, and cleanup covers rotated tables, protocol-owned
+fences, and both IP families. Focused cl02 checks pass. Run the stricter full
+cl02 lifecycle next, preserving capture, migration, rotation/replacement,
+bounded persistence/operations, the 2-GiB controller limit, final convergence
+and before/after operator state. Then qualify the same immutable images on
+fresh Kind. The six unhealthy cl02 operators remain a stabilization concern;
+no newly unhealthy delta is not whole-cluster health.
 
 After Phase 9 closes, follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate

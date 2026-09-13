@@ -31,6 +31,7 @@ checkpoint_persistence_checks='[]'
 source "${project_root}/hack/phase9-operations.sh"
 source "${project_root}/hack/phase9-link-fault.sh"
 source "${project_root}/hack/phase9-capture.sh"
+source "${project_root}/hack/phase9-http-probe.sh"
 
 phase9_link_exec() {
     node_exec "${source_node}" "$@"
@@ -359,10 +360,7 @@ set_baseline() {
 }
 
 http_probe_once() {
-    local pod=$1 address=$2 port=$3 target
-    if [[ ${address} == *:* ]]; then target="http://[${address}]:${port}/health"; else target="http://${address}:${port}/health"; fi
-    timeout 15 "${kc[@]}" -n "${namespace}" exec "${pod}" \
-        -- wget -T 3 -t 1 -qO- "${target}" | rg -qx ok
+    phase9_http_probe_once "$@"
 }
 
 http_probe() {
@@ -492,10 +490,9 @@ for node in "${nodes[@]}"; do
         test "$(getenforce)" = Enforcing
         test -S /run/unf/cni.sock
         test -f /etc/kubernetes/cni/net.d/10-unf.conflist
-        ! iptables-save 2>/dev/null | grep -q "^-A KUBE-SVC"
-        ! ip6tables-save 2>/dev/null | grep -q "^-A KUBE-SVC"
         echo host-ready')
     rg -qx host-ready <<<"${host_facts}"
+    node_exec "${node}" sh -euc "$(<"${project_root}/hack/phase9-host-firewall-check.sh")"
     node_exec "${node}" sh -euc "$(<"${project_root}/hack/phase9-link-selector-preflight.sh")" \
         phase9-link-selector-preflight "$(<"${project_root}/hack/phase9-link-targets.jq")"
 done
@@ -549,8 +546,8 @@ required_baseline_generation=$(wait_generation_after "${native_generation_id}" r
 assert_checkpoint_persistence required-migration
 
 stage=fixture
-resources_created=true
 "${kc[@]}" create namespace "${namespace}" >/dev/null
+resources_created=true
 "${kc[@]}" -n "${namespace}" create serviceaccount capture >/dev/null
 "${kc[@]}" -n "${namespace}" adm policy add-scc-to-user privileged --serviceaccount=capture >/dev/null
 "${kc[@]}" apply -f - >/dev/null <<EOF
@@ -692,7 +689,7 @@ for family in 4 6 4 6 4 6 4 6; do
     else
         required_target=${required_pod6}; native_target=${native_pod6}
     fi
-    if ! http_probe_once required-client "${required_target}" 8080 >/dev/null 2>&1; then
+    if phase9_http_probe_denied required-client "${required_target}" 8080 >/dev/null 2>&1; then
         required_blocked=$((required_blocked + 1))
     fi
     if http_probe native-client "${native_target}" 8081 >/dev/null 2>&1; then
@@ -736,6 +733,7 @@ while (( SECONDS < replacement_deadline )); do
     sleep 1
 done
 [[ -n ${replacement_agent_uid} ]]
+echo "source agent Ready; waiting for exact generation recovery" >&2
 recovered_generation=$(wait_generation)
 jq -e --argjson recovered "${recovered_generation}" '
     length == ($recovered | length)
@@ -743,6 +741,7 @@ jq -e --argjson recovered "${recovered_generation}" '
     and ($recovered[0].generation >= .[0].generation)' <<<"${pre_agent_recovery_generation}" >/dev/null
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
 initial_epoch=$(jq -r --arg node "${source_node}" '.[] | select(.node == $node) | .epochs | max' <<<"${recovered_generation}")
+echo "source agent recovered; waiting for natural rotation beyond epoch ${initial_epoch}" >&2
 rotated_generation=$(wait_epoch_change "${initial_epoch}")
 traffic_matrix required-client "${required_pod4}" "${required_pod6}" "${required_service4}" "${required_service6}" 8080
 pre_restart_generation=$(jq -r '.[0].generation' <<<"${rotated_generation}")
@@ -751,6 +750,7 @@ operations_before_restart=$(phase9_operations_capture before-restart "${operatio
 phase9_operations_continuity "${operations_baseline}" "${operations_before_restart}"
 "${kc[@]}" -n unf-system rollout restart deployment/unf-controller >/dev/null
 "${kc[@]}" -n unf-system rollout status deployment/unf-controller --timeout=10m >/dev/null
+echo "controller replacement Ready; waiting for exact successor generation" >&2
 restart_generation=$(wait_generation_after "${pre_restart_generation}")
 assert_checkpoint_persistence after-controller-replacement
 
@@ -772,15 +772,26 @@ set_baseline native
 "${kc[@]}" delete namespace "${namespace}" --wait=true --timeout=10m >/dev/null
 resources_created=false
 owned_state_absent=false
+cleanup_snapshots='[]'
 cleanup_deadline=$((SECONDS + convergence_timeout_seconds))
 while (( SECONDS < cleanup_deadline )); do
     owned_state_absent=true
+    cleanup_snapshots='[]'
     for node in "${nodes[@]}"; do
-        if node_exec "${node}" sh -euc \
-            'ip -o link show | grep -q "unfwg" || ip rule show | grep -q "lookup 2000[12]"' >/dev/null 2>&1; then
+        if ! snapshot=$(node_exec "${node}" sh -euc \
+            "$(<"${project_root}/hack/phase9-cleanup-snapshot.sh")" phase9-cleanup-snapshot "${node}" \
+            2>"${diagnostics}/cleanup-${node}-read.log"); then
             owned_state_absent=false
             break
         fi
+        printf '%s\n' "${snapshot}" >"${diagnostics}/cleanup-${node}.json"
+        if ! jq -en --arg node "${node}" --argjson snapshot "${snapshot}" '$snapshot |
+            .schemaVersion == 1 and .node == $node and .absent
+            and ([.links,.rules4,.rules6,.routes4,.routes6] | all(.[]; . == 0))' >/dev/null; then
+            owned_state_absent=false
+            break
+        fi
+        cleanup_snapshots=$(jq -cn --argjson snapshots "${cleanup_snapshots}" --argjson snapshot "${snapshot}" '$snapshots + [$snapshot]')
     done
     [[ ${owned_state_absent} == true ]] && break
     sleep 1
@@ -833,6 +844,7 @@ jq -n \
     --argjson requiredGeneration "${default_generation}" --argjson selectiveGeneration "${selective_generation}" \
     --argjson baselineRequiredGeneration "${required_baseline_generation}" \
     --argjson finalNativeGeneration "${final_native_generation}" \
+    --argjson cleanupSnapshots "${cleanup_snapshots}" \
     --argjson recoveredGeneration "${recovered_generation}" --argjson rotatedGeneration "${rotated_generation}" \
     --argjson restartGeneration "${restart_generation}" --argjson operations "${operations_status}" \
     --argjson operationsEvidence "${operations_evidence}" \
@@ -865,7 +877,7 @@ jq -n \
         completeThroughSequence:$operations.completeThroughSequence,
         retainedRecords:$operations.retainedRecords,lossAffected:$operations.lossAffected,
         continuity:$operationsEvidence},
-      cleanup:"passed",cleanupGenerations:$finalNativeGeneration,
+      cleanup:"passed",cleanupGenerations:$finalNativeGeneration,cleanupKernelState:$cleanupSnapshots,
       initialAgents:$initialAgents,finalAgents:$finalAgents,
       baselineUnhealthyOperators:$baselineUnhealthy,finalUnhealthyOperators:$finalUnhealthy,
       newlyUnhealthyOperators:$newUnhealthy,

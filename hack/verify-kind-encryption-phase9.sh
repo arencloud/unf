@@ -22,6 +22,7 @@ qualification_stage=preflight
 source "${project_root}/hack/phase9-operations.sh"
 source "${project_root}/hack/phase9-link-fault.sh"
 source "${project_root}/hack/phase9-capture.sh"
+source "${project_root}/hack/phase9-http-probe.sh"
 resources_created=false
 link_lowered=false
 capture_node=
@@ -146,9 +147,9 @@ for node in "${nodes[@]}"; do
         test "$(find /etc/cni/net.d -mindepth 1 -maxdepth 1 -type f | wc -l)" -eq 1
         test -f /etc/cni/net.d/10-unf.conflist
         test -S /run/unf/cni.sock
-        ! iptables-save 2>/dev/null | grep -q "^-A KUBE-SVC"
-        ! ip6tables-save 2>/dev/null | grep -q "^-A KUBE-SVC"
     '
+    timeout 20 "${runtime[@]}" exec "${node}" sh -euc \
+        "$(<"${project_root}/hack/phase9-host-firewall-check.sh")"
     timeout 20 "${runtime[@]}" exec "${node}" sh -euc \
         "$(<"${project_root}/hack/phase9-link-selector-preflight.sh")" \
         phase9-link-selector-preflight "$(<"${project_root}/hack/phase9-link-targets.jq")"
@@ -227,9 +228,7 @@ set_baseline() {
 }
 
 http_probe_once() {
-    local pod=$1 address=$2 port=$3 target
-    if [[ ${address} == *:* ]]; then target="http://[${address}]:${port}/health"; else target="http://${address}:${port}/health"; fi
-    "${kc[@]}" -n "${namespace}" exec "${pod}" -- wget -T 3 -t 1 -qO- "${target}" | rg -qx ok
+    phase9_http_probe_once "$@"
 }
 
 http_probe() {
@@ -245,7 +244,7 @@ http_probe() {
 }
 
 http_probe_fails() {
-    ! http_probe_once "$@" >/dev/null 2>&1
+    phase9_http_probe_denied "$@" >/dev/null 2>&1
 }
 
 traffic_matrix() {
@@ -326,10 +325,12 @@ jq -e 'length == 4 and all(.[];
 }
 
 qualification_stage=default-required
-operations_directory="${project_root}/.artifacts/phase9-kind-operations"
+operations_directory="${diagnostics_dir}/operations"
 set_baseline required
 pre_fixture_generation=$(wait_generation true)
 pre_fixture_generation=$(jq -r '.[0].generation' <<<"${pre_fixture_generation}")
+"${kc[@]}" create namespace "${namespace}" >/dev/null
+resources_created=true
 operations_baseline=$(phase9_operations_capture baseline "${operations_directory}")
 "${kc[@]}" apply -f - >/dev/null <<EOF
 apiVersion: v1
@@ -409,7 +410,6 @@ spec:
   selector: {app: native-server}
   ports: [{name: http, port: 8081, targetPort: 8081}]
 EOF
-resources_created=true
 "${kc[@]}" -n "${namespace}" wait --for=condition=Ready pods --all --timeout=180s >/dev/null
 default_generation=$(wait_generation_after "${pre_fixture_generation}")
 required_pod4=$("${kc[@]}" -n "${namespace}" get pod required-server -o json | jq -er '.status.podIPs[].ip | select(contains("."))')
@@ -586,14 +586,26 @@ fi
 qualification_stage=exact-cleanup
 "${kc[@]}" delete namespace "${namespace}" --wait=true --timeout=180s >/dev/null
 resources_created=false
+mkdir -p "${diagnostics_dir}"
+cleanup_snapshots='[]'
 for _ in $(seq 1 180); do
     absent=true
+    cleanup_snapshots='[]'
     for node in "${nodes[@]}"; do
-        if "${runtime[@]}" exec "${node}" sh -ec \
-            'ip -o link show | grep -q "unfwg" || ip rule show | grep -q "lookup 2000[12]"'; then
+        if ! snapshot=$(timeout 20 "${runtime[@]}" exec "${node}" sh -euc \
+            "$(<"${project_root}/hack/phase9-cleanup-snapshot.sh")" phase9-cleanup-snapshot "${node}" \
+            2>"${diagnostics_dir}/cleanup-${node}-read.log"); then
             absent=false
             break
         fi
+        printf '%s\n' "${snapshot}" >"${diagnostics_dir}/cleanup-${node}.json"
+        if ! jq -en --arg node "${node}" --argjson snapshot "${snapshot}" '$snapshot |
+            .schemaVersion == 1 and .node == $node and .absent
+            and ([.links,.rules4,.rules6,.routes4,.routes6] | all(.[]; . == 0))' >/dev/null; then
+            absent=false
+            break
+        fi
+        cleanup_snapshots=$(jq -cn --argjson snapshots "${cleanup_snapshots}" --argjson snapshot "${snapshot}" '$snapshots + [$snapshot]')
     done
     [[ ${absent} == true ]] && break
     sleep 1
@@ -614,6 +626,7 @@ jq -n \
     --argjson controllerVersion "${controller_version}" \
     --argjson agentVersions "${agent_versions}" \
     --argjson nodes "${nodes_json}" \
+    --argjson cleanupSnapshots "${cleanup_snapshots}" \
     --argjson defaultGeneration "${default_generation}" \
     --argjson selectiveGeneration "${selective_generation}" \
     --argjson recoveredGeneration "${recovered_generation}" \
@@ -661,6 +674,7 @@ jq -n \
         committedLedger:"docs/benchmarks/phase9-encryption-performance.json"},
       egressCoexistence: $egress,
       cleanup: "passed",
+      cleanupKernelState: $cleanupSnapshots,
       rollback: $rollback
     }' >"${artifact_tmp}"
 mv "${artifact_tmp}" "${artifact}"

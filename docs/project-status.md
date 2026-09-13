@@ -30,7 +30,7 @@ repeatable test are both present in this repository.
 | Phase 6 — LoadBalancer exposure | **Verified** | Master prompt §§20–22: provider-neutral dual-stack VIP ownership, reachability, translation, health, operations, and independent platform qualification | All milestones 6.1–6.9 are Verified. Runtime revision `830771c` passed the 280-second kube-proxy-free dual-stack Kind lifecycle and, through three immutable public Quay digests, the independent 973-second five-Node dual-stack OpenShift cl02 gate qualified by revision `ade286b`; ADRs 0093–0101 |
 | Phase 7 — advanced Service selection | **Verified** | Master prompt §§20–21 and §30: internal locality, session affinity, topology preferences, graceful draining, measured scalable selection, and opt-in DSR | All milestones 7.1–7.10 are Verified. Runtime `06fc937` passed the 463-second kube-proxy-free three-Node dual-stack Kind gate and, through immutable public Quay digests, the independent 1,670-second five-Node dual-stack OpenShift cl02 gate qualified by `018f14c`; both include cross-worker DSR, recovery, convergence, and exact cleanup; ADRs 0102–0112 |
 | Phase 8 — identity-aware egress fabric | **Verified** | Master prompt §24: EgressIP/pools, identity-scoped egress, HA gateways, deterministic failover, multiple addresses, FQDN/internet controls, NAT transparency/observability, and provider-neutral reachability | All milestones 8.1–8.11 are Verified. Runtime `2f404ed` passed the 1,013-second three-Node dual-stack Kind gate and, through immutable public images, the independent 411-second five-Node dual-stack OpenShift cl02 gate qualified by `baf2bb0`. Both include zero-churn warm-standby rejoin, recovery, exact cleanup, and kube-proxy absence; ADRs 0113–0157 |
-| Phase 9 — attested encryption fabric | **In progress** | Master prompt §25: kernel WireGuard node-to-node transport, policy-required/selective encryption, key rotation, and encryption observability as the prerequisite for §26 multi-cluster | Milestones 9.1–9.8 have historical verification. Current runtime `cb59e90` passed preserved-state cl02 deployment, Required migration/persistence, Required/selective dual-stack traffic and the eight-denied/eight-Native-successful fault matrix. The full gate stopped at capture-statistics validation before rotation/replacement and exact cleanup. ADRs 0285–0289 repair qualifier evidence; rerun cl02, then matching-image fresh Kind. S1–S5 heavy-load stabilization remains pending Phase 9 closure |
+| Phase 9 — attested encryption fabric | **In progress** | Master prompt §25: kernel WireGuard node-to-node transport, policy-required/selective encryption, key rotation, and encryption observability as the prerequisite for §26 multi-cluster | Milestones 9.1–9.8 have historical verification. Runtime `cb59e90` passed the existing full cl02 gate in 1,532 seconds with qualifier `f96aec2` (ADR 0289). ADR 0290 closes negative-observation assertion gaps and passes focused cl02 checks; the stricter full cl02 run and matching-image fresh Kind remain pending. Six cl02 operators remain unhealthy. S1–S5 heavy-load stabilization remains pending Phase 9 closure |
 
 Sections 98–99 describe the richer first enforcement and enriched-observability
 scenario. Those scenarios span the Phase 2 gate because they require a real deny
@@ -592,6 +592,12 @@ operator. Archive JSON SHA-256 is `7bdcbab9…9aae`. Final audit still requires
 strict separation of probe/host-read failures from denial/cleanup evidence and
 coverage of rotating tables plus IPv6 state. Requalify those assertions before
 matching-image fresh Kind and Phase 9 closure; S1–S5 remain pending.
+ADR 0290 implements that audit, including actual in-Pod probe outcomes, positive
+dual-stack rotated-table/protocol cleanup, successful firewall-dump preflight,
+and exact namespace ownership. Shared regressions pass under jq 1.6/1.8.1.
+Focused cl02 checks distinguish real healthy/refused connections, detect live
+encryption state, and positively confirm post-gate absence on all five hosts.
+Run the stricter full cl02 gate before fresh Kind; Phase 9 remains In progress.
 
 ## Updating this tracker
 
