@@ -672,6 +672,10 @@ namespace identity for a later consumer, not continuous packet-time authority.
 ADR 0356 verifies all thirteen isolated held-namespace observation checks on
 cl02, including exact drift rejection and sticky retirement after restoration.
 Live runtime remains unchanged; matching retained Kind is next.
+ADR 0357 verifies the identical held-namespace fixture on retained Kind, with
+all thirteen checks, cleanup, current/rotated log review and full convergence.
+Both platform snapshot prerequisites pass; continuous packet-time authority
+and consuming locality remain open alongside full Phase 9 and S1–S5.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

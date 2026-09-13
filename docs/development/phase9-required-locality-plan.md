@@ -55,6 +55,8 @@ ADR 0355 adds locally verified descriptor-retaining veth observations, strict
 rechecks and sticky retirement. Isolated cl02-before-Kind qualification remains
 pending; holding namespace FDs does not pin device placement or close L3.
 ADR 0356 verifies its complete isolated cl02 fixture; matching Kind is next.
+ADR 0357 verifies the identical retained-Kind fixture and complete log/state
+audit. Both snapshot prerequisites pass; continuous packet-time proof is next.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
