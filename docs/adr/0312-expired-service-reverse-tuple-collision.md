@@ -64,3 +64,14 @@ are a separate translation-design boundary; no unlimited-connections claim.
 After local regression/verifier checks, qualify exact images on cl02 before
 Kind. General update continuity, Required coverage, full Phase 9 and S1–S5
 remain open.
+
+Final all-container log sweep ran cl02 first, then retained Kind, covering the
+preceding 20 minutes with explicit per-container bounds. All six cl02 and four
+Kind UNF Pods were Ready with zero restarts; no captured ERROR, panic or OOM
+record was found. Kind had no WARN records. cl02 still reported 59 fresh-peer
+testimony warnings, one rejected plan request and two Service-selection-contract
+verification failures retaining the active bank, plus retention/clsact warnings.
+The latter failures occurred during fixture cleanup/setup, not the captured
+SYN window; they remain separate stabilization findings. Raw logs are ignored
+under `s1-service-collision-final-{cl02,kind}-logs` and pass redacted secret scans.
+No overall clean-log or healthy-cluster claim follows.
