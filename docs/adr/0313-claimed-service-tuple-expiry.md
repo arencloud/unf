@@ -77,11 +77,28 @@ ordinary linker and no modified system library; a project-local experimental
 linker remains ignored and is not required. The pinned nightly intrinsic is
 explicit, with kernel load tests mandatory for future compiler changes.
 
+## Immutable candidate publication
+
+Runtime source `5505d00710f7f7947f770456cdaeb9654af04a85` is built and
+published to the development repositories. Both isolated images report that
+exact revision through `/v1/version`. Both packaged BPF objects hash to
+`90b1ccad01f22af45e541ca1cf400d537b6026a72f101958bfc1f3591e95b0bd`;
+the prior object is archived separately, not packaged.
+
+- Controller manifest: `ed6467f3c09ac2e5756bc74c0a77df892dec38b2f39963028798b5594c7bc506`.
+- Agent manifest: `3bc02e761dfd23ff98a0bcd5fdb4d76abecac9e1359b2b8f7d15e6c43a6d1242`.
+
+The release record remains OpenShift-first with full Kind qualification pending.
+The pre-rollout 20-minute log review finds all six cl02 UNF Pods Ready with zero
+restarts, no structured ERROR entries, 452 bounded flow-history retention
+warnings and one rejected reciprocal-key attestation warning. Those warnings
+are retained as observations, not evidence of clean overall cluster health.
+Raw logs and build/provenance evidence remain ignored under
+`.artifacts/s1-expiry-5505d00-*`.
+
 ## Next
 
-Commit this source before building. Archive and copy the newly verified BPF
-object into the runtime build context; do not accidentally package the prior
-object. Verify exact source revisions in both immutable images, deploy cl02,
+Commit the immutable release pins before deployment, deploy cl02,
 inspect every UNF container's logs and run the adopted Native/churn gate.
 Only after cl02 passes may retained Kind receive the same images. No live
 result, CPU/throughput saving, Phase 9 closure or S1–S5 completion is claimed
