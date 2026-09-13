@@ -98,6 +98,9 @@ The first matching Kind device-reference gate fails its IPv4 positive control.
 ADR 0344 records missing fixture reverse routes, observed Node RPF defaults and
 the diagnostic gap. Exact reverse-route/RPF readback and failure capture are
 added; a corrected-image cl02 rerun must precede matching Kind again.
+ADR 0345 records that complete cl02 rerun on `40def8e`, including explicit
+private RPF/return-route evidence, exact statistics and final convergence.
+Matching revised-image Kind remains required.
 
 - Bind both local address owners to independently read-back workload attachment
   and route ownership. Reject host/physical ingress masquerading as a workload,

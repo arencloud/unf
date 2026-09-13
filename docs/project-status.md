@@ -623,6 +623,8 @@ The first matching Kind target-device gate fails its IPv4 positive control.
 Fixture reverse routes and failure-time kernel evidence are strengthened;
 the corrected image must pass cl02 before matching Kind. ADR 0344 retains
 the failure and separates observed Node RPF settings from unproven causality.
+The revised `40def8e` device-lifetime fixture passes the complete cl02 rerun
+with exact statistics and final convergence; matching Kind is next (ADR 0345).
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

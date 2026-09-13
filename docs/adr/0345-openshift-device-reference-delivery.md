@@ -46,3 +46,24 @@ target-device reference semantics. Source authentication, veth peer namespace
 relocation, arbitrary TC composition, authenticated/banked locality consumption,
 restart recovery and performance remain unproven here. L3, L4/L5, Q and S1–S5
 remain open; no production plaintext permission or release promotion is added.
+
+## Reverse-route fixture rerun
+
+After the first matching Kind failure, source
+`40def8e47674c2fc77e482a7c0ce67a52befff76` adds verified return routes and
+failure-time kernel evidence. Its image is
+`quay.io/arencloud/unf-test-tools-dev@sha256:ca0943efb8562cbc85b5c3486ba8d47d0c7a8c110bf45aa42308f18ec82e1d27`.
+The complete cl02 gate passes again with the same result SHA-256 above.
+Archive SHA-256: `424447bd95dac017995fd135c6385116c27794a79b9b060652854d3c0caa2fc1`.
+Both private target namespaces report all/eth0 RPF values 0/0; reverse-route
+readback selects eth0. No RPF setting is changed by the test. This does not
+establish what the deleted Kind fixture's private defaults were.
+
+The fixture namespace is removed. An initial controller status read is not
+fully converged; a subsequent independent read is fully converged, with all
+five agents fresh at policy 398 / Service 204. Current UNF containers remain
+Ready without restarts. The final 485-line / 120,759-byte log capture retains
+405 flow-history, 49 proof-assistance, nine topology-history and four key
+publication warnings, with no observed fatal pattern. Commit/push this rerun
+before the identical revised image on retained Kind. The earlier Kind failure
+remains failed evidence.
