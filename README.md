@@ -732,11 +732,14 @@ exact cleanup, five-agent convergence, and an unchanged `network` unhealthy
 baseline. Evidence SHA-256 is
 `a2f8cb2279a3e1417ad1533575b644487e64cbfd1d8afafe351e99fad7e126d3`;
 ADR 0157. These independent Kind and OpenShift results close Phase 8.
-Phase 9's attested encryption fabric is verified through milestone 9.9 for its
-documented lab scope. Runtime `cb59e90` passed strict cl02 qualification first,
+Phase 9's attested encryption fabric passed its documented platform gates.
+Runtime `cb59e90` passed strict cl02 qualification first,
 then fresh matching-image Kind, including fail-closed traffic, recovery,
 rotation and cleanup ([ADR 0292](docs/adr/0292-phase9-closure-and-stabilization-handoff.md)).
-The next work is [stabilization and scale qualification](docs/development/stabilization-and-scale-plan.md):
+Subsequent stabilization found uncovered same-Node Native and isolated-return
+transport failures, so affected qualification is reopened for repair
+([ADR 0293](docs/adr/0293-stabilization-native-transport-coverage-gap.md)).
+The current work is [stabilization and scale qualification](docs/development/stabilization-and-scale-plan.md):
 cl02 still has six unhealthy operators and unresolved internal reachability
 issues. Phase closure does not mean production readiness or proven heavy-load
 CPU/memory efficiency.
