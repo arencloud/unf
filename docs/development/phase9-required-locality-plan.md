@@ -100,6 +100,10 @@ immutable, authenticated production consuming boundary remain open.
 ADR 0371 implements the next bounded concurrent target-peer movement fixture,
 with exact sequences/run tokens, per-CPU counters and independent receiver-loss
 checks. Local checks pass; the complete cl02-before-Kind gate remains pending.
+ADR 0372 verifies the complete cl02 serial/concurrent gate with working foreign
+positive controls and zero unauthorized foreign delivery. Its 136 requested but
+unobserved redirects remain an attribution gap, not a lossless result. Matching
+Kind and production lifetime/publication/consumption remain open.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
