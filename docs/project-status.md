@@ -680,6 +680,10 @@ ADR 0358 begins an isolated packet-time device/peer namespace readback
 investigation with a separate drop-only BPF object and checked running-kernel
 layout. Local compilation and positive/22-negative decoder checks pass;
 cl02 verifier/runtime qualification is pending. No live map or packet changes.
+ADR 0359 verifies the corrected isolated packet-time device/peer namespace
+readback on cl02: nine exact observations, one invalid-configuration rejection,
+independent socket-cookie comparisons and complete cleanup/log review. All
+packets are dropped; no locality permission is enabled. Matching Kind is next.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
