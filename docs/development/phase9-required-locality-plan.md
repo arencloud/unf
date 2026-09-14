@@ -63,6 +63,9 @@ yet kernel-qualified or production authority; cl02 must precede matching Kind.
 ADR 0359 verifies its complete corrected drop-only cl02 gate, including current
 peer namespace cookies after move/return. Matching retained Kind remains next;
 continuous safe delivery and authenticated source/target ownership stay open.
+ADR 0360 records Kind's split-module metadata failure before BPF load and a
+locally checked all-layout agreement correction. The revised immutable fixture
+must pass cl02 before Kind; neither full platform row is closed by this repair.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

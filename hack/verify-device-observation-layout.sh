@@ -50,4 +50,31 @@ for mutation in "${cases[@]}"; do
         printf 'Incorrectly accepted layout mutation %s\n' "$index" >&2; exit 1
     fi
 done
-printf 'Device layout positive/22-negative checks passed; evidence=%s\n' "$directory"
+# Newer split module BTF retains equivalent structures under different type IDs.
+# Exercise references into those copies, not just unused same-name records.
+jq '.[0].types as $base | .[1].types += ($base|map(.id+=100
+    | if has("type_id") then .type_id+=100 else . end
+    | if has("members") then .members|=map(.type_id+=100) else . end))
+    | .[1].types[0].members[0].type_id=103' "$directory/valid.json" > "$directory/split.json"
+jq -L "$root/hack" -e 'include "device-observation-layout"; device_observation_layout ==
+ {schemaVersion:1,scope:"isolated-device-readback-layout",wordBytes:8,skbDevice:16,deviceIndex:8,deviceNet:16,netCookie:32,devicePeer:128,kernelAdmitted:false}' "$directory/split.json" >/dev/null
+split_cases=(
+  '.[1].types += [(.[1].types[]|select(.id==105)|.id=205)]'
+  '.[1].types |= map(if .id==107 then .members[0].bits_offset=96 else . end)'
+  '.[1].types |= map(if .id==107 then .members[1].bits_offset=192 else . end)'
+  '.[1].types |= map(if .id==110 then .members[0].bits_offset=320 else . end)'
+  '.[1].types |= map(if .id==108 then .members[0].bits_offset=192 else . end)'
+  '.[1].types |= map(if .id==107 then .size=160 else . end)'
+  '.[1].types |= map(if .id==110 then .size=80 else . end)'
+  '.[1].types |= map(if .id==105 then .size=160 else . end)'
+  '.[1].types |= map(if .id==103 then .type_id=110 else . end)'
+  '.[1].types |= map(if .id==110 then .members=[] else . end)'
+)
+for mutation in "${split_cases[@]}"; do
+    index=$((index+1))
+    jq "$mutation" "$directory/split.json" > "$directory/negative-$index.json"
+    if jq -L "$root/hack" -e 'include "device-observation-layout"; device_observation_layout' "$directory/negative-$index.json" > "$directory/negative-$index.out" 2> "$directory/negative-$index.err"; then
+        printf 'Incorrectly accepted split layout mutation %s\n' "$index" >&2; exit 1
+    fi
+done
+printf 'Device layout 2-positive/%s-negative checks passed; evidence=%s\n' "$index" "$directory"

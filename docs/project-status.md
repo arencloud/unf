@@ -684,6 +684,9 @@ ADR 0359 verifies the corrected isolated packet-time device/peer namespace
 readback on cl02: nine exact observations, one invalid-configuration rejection,
 independent socket-cookie comparisons and complete cleanup/log review. All
 packets are dropped; no locality permission is enabled. Matching Kind is next.
+ADR 0360 records the matching Kind failure before BPF load on repeated split-
+module BTF definitions. A bounded all-layout agreement check passes two positive
+and 32 negative local cases; corrected cl02-before-Kind qualification is pending.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

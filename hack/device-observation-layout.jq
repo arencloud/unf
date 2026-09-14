@@ -2,6 +2,7 @@
 def device_observation_layout:
   if type!="array" or length!=2 or any(.[]; (.types|type)!="array") then
     error("two BTF type inventories required") else . end
+  | . as $inventories
   | [.[].types[]] as $all
   | if ($all|length)>200000 or ($all|length)==0
       or any($all[]; (.id|type)!="number" or .id<=0 or .id!=(.id|floor))
@@ -15,8 +16,10 @@ def device_observation_layout:
           or .kind=="RESTRICT" or .kind=="TYPE_TAG"
           then resolved(.type_id;$depth+1) else . end end;
     def named($name):
-      [$all[]|select(.kind=="STRUCT" and .name==$name)]
-      | if length!=1 then error("missing or ambiguous BTF structure") else .[0] end;
+      [$inventories[] | [.types[]|select(.kind=="STRUCT" and .name==$name)]]
+      | if any(.[];length>1) or (flatten|length)==0 then
+          error("missing or ambiguous BTF structure: \($name)")
+        else .[][] end;
     def fields($id;$name):
       reduce range(0;64) as $_step
         ({queue:[{id:$id,offset:0,depth:0}],found:[]};
@@ -51,7 +54,9 @@ def device_observation_layout:
       resolved($id;0)
       | if .kind!="INT" or .size!=$size or (.nr_bits//($size*8))!=$size*8
         or (.bits_offset//0)!=0 then error("unexpected integer shape") else . end;
-    named("sk_buff") as $skb | named("net_device") as $dev
+    # Split module BTF may repeat base structures with distinct IDs. Check every
+    # combination (at most 2^4), never select the first same-name definition.
+    [named("sk_buff") as $skb | named("net_device") as $dev
     | named("net") as $net | named("veth_priv") as $veth
     | field($skb.id;"dev") as $skbdev
     | field($dev.id;"ifindex") as $index
@@ -73,9 +78,13 @@ def device_observation_layout:
         or $cookie.bits_offset/8+8>$net.size
         or $cookie.bits_offset/8>65536
       then error("unsupported kernel device layout") else . end
-    | {schemaVersion:1,scope:"isolated-device-readback-layout",wordBytes:8,
+    | {sizes:[$skb.size,$dev.size,$net.size,$veth.size],
+       layout:{schemaVersion:1,scope:"isolated-device-readback-layout",wordBytes:8,
        skbDevice:($skbdev.bits_offset/8),deviceIndex:($index.bits_offset/8),
        deviceNet:(($ndnet.bits_offset+$netptr.bits_offset)/8),
        netCookie:($cookie.bits_offset/8),
        devicePeer:((($dev.size+31)/32|floor)*32+$peer.bits_offset/8),
-       kernelAdmitted:false};
+       kernelAdmitted:false}}]
+    | unique
+    | if length!=1 then error("conflicting base/module device layouts")
+      else .[0].layout end;
