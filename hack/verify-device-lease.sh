@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 [[ ${UNF_DEVICE_OBSERVATION_ISOLATED_CONTAINER:-} == yes && $EUID == 0 && $(uname -m) == x86_64 ]]
-for command in ip tc bpftool jq socat ss timeout mount umount od grep kernel-netns-cookie device-observation-loader device-owner-aliases; do command -v "$command" >/dev/null; done
+for command in ip tc bpftool jq socat ss timeout mount umount od grep kernel-netns-cookie device-observation-loader device-owner-aliases device-context-seed; do command -v "$command" >/dev/null; done
 directory=$(mktemp -d /tmp/unf-device-observation.XXXXXX)
 suffix=${directory##*.}
 fabric=unf-dl-f-$suffix
@@ -152,20 +152,38 @@ read_result() {
     jq -e '.value|length==32 and all(.[];type=="string" and test("^0x[0-9a-fA-F]{2}$"))' "$directory/$name-map.json" >/dev/null
     jq '[.value|map(ltrimstr("0x")|ascii_downcase)|range(0;32;8) as $offset|.[$offset:$offset+8]|join("")]' "$directory/$name-map.json" > "$directory/$name-words.json"
 }
+seed_target() {
+    local name=$1
+    ip netns exec "$fabric" tc -j qdisc show dev "$host" > "$directory/$name-qdiscs-before.json"
+    jq -e 'all(.[];.kind!="clsact" and .kind!="ingress")' "$directory/$name-qdiscs-before.json" >/dev/null
+    ip netns exec "$fabric" device-context-seed "$directory/bpffs" 301 > "$directory/$name-context-seed.json"
+    jq -e '.=={schemaVersion:1,seedMethod:"kernelTestContext",contextIfindex:301,programReturn:2,packetTransmitted:false,productionAuthority:false}' "$directory/$name-context-seed.json" >/dev/null
+    ip netns exec "$fabric" tc -j qdisc show dev "$host" > "$directory/$name-qdiscs-after.json"
+    jq -e 'all(.[];.kind!="clsact" and .kind!="ingress")' "$directory/$name-qdiscs-after.json" >/dev/null
+    read_result "$name-seed"
+    jq -e '.[3]=="6400000000000000"' "$directory/$name-seed-words.json" >/dev/null
+}
 bind_target() {
     local name=$1
     # The isolated sender is idle during explicit rebind. Production must use
     # distinct immutable incarnation entries/banks, not this serial test reset.
     bpftool map update pinned "$directory/bpffs/maps/P9LEASEPTR" key hex 00 00 00 00 value hex 00 00 00 00 00 00 00 00
     ip netns exec "$fabric" bpftool map update pinned "$directory/bpffs/maps/P9LEASEDEV" key hex 01 00 00 00 value hex 2d 01 00 00 00 00 00 00
-    ip netns exec "$fabric" tc qdisc replace dev "$host" clsact
-    ip netns exec "$fabric" tc filter replace dev "$host" egress pref 1 handle 1 bpf da pinned "$directory/bpffs/seed"
-    printf 'seed\n' | ip netns exec "$fabric" socat -u - UDP4-SENDTO:10.244.46.2:17779
-    read_result "$name-seed"
-    jq -e '.[3]=="6400000000000000"' "$directory/$name-seed-words.json" >/dev/null
+    seed_target "$name"
 }
 stage=initial-seed
 bind_target initial
+stage=seed-context-rejections
+if ip netns exec "$fabric" device-context-seed "$directory/bpffs" 201 > "$directory/wrong-device-seed.out" 2> "$directory/wrong-device-seed.err"; then exit 1; fi
+grep -Fq 'device context did not pass ownership checks' "$directory/wrong-device-seed.err"
+read_result wrong-device-seed
+jq -e '.==["0000000000000000","0000000000000000","0000000000000000","0000000000000000"]' "$directory/wrong-device-seed-words.json" >/dev/null
+if ip netns exec "$foreign" device-context-seed "$directory/bpffs" 301 > "$directory/wrong-namespace-seed.out" 2> "$directory/wrong-namespace-seed.err"; then exit 1; fi
+grep -Fq 'kernel device-context invocation' "$directory/wrong-namespace-seed.err"
+grep -Fq 'No such device (os error 19)' "$directory/wrong-namespace-seed.err"
+read_result wrong-namespace-seed
+jq -e '.==["0000000000000000","0000000000000000","0000000000000000","0000000000000000"]' "$directory/wrong-namespace-seed-words.json" >/dev/null
+seed_target context-recovered
 ip netns exec "$fabric" tc qdisc add dev "$source_host" clsact
 ip netns exec "$fabric" tc filter add dev "$source_host" ingress pref 1 handle 1 bpf da pinned "$directory/bpffs/program"
 probe() {
@@ -279,4 +297,4 @@ set_config 2
 pair restored-config "$source_ns" "$target_ns" yes 1 0
 [[ $seen == 62 && $redirects == 28 && $rejected == 34 && $delivered == 28 && $denied == 34 ]]
 stage=verified
-jq -n '{schemaVersion:2,result:"passed",scope:"isolated-two-ended-device-lease",positiveDeliveries:28,deniedDeliveries:34,requestedRedirects:28,guardRejections:34,fullOwnershipAliasComparison:true,kernelAdmitted:false,observedDelivery:false,productionAuthority:false,concurrentLifetimeVerified:false}'
+jq -n '{schemaVersion:3,result:"passed",scope:"isolated-two-ended-device-lease",positiveDeliveries:28,deniedDeliveries:34,requestedRedirects:28,guardRejections:34,fullOwnershipAliasComparison:true,nonTransmittingContextSeeds:4,rejectedContexts:2,kernelAdmitted:false,observedDelivery:false,productionAuthority:false,concurrentLifetimeVerified:false}'
