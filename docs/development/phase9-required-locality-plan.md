@@ -77,6 +77,9 @@ not a completed production proof. Both platform gates remain required.
 ADR 0363 verifies the corrected serial cl02 gate with sixteen deliveries and
 fourteen denials. Matching Kind is next; concurrent lifetime and authenticated
 ownership/publication/packet composition remain separate open boundaries.
+ADR 0364 verifies the identical retained-Kind serial gate and complete log/state
+review. Both kernels pass the isolated delivery/invalidation mechanism; it is
+not yet authenticated production locality or a concurrent lifetime guarantee.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
