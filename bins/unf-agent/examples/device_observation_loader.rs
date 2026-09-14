@@ -55,7 +55,13 @@ fn main() -> Result<()> {
         program.pin(directory.join(pin))?;
     }
     let maps: &[&str] = if lease {
-        &["P9LEASECFG", "P9LEASEPTR", "P9LEASEDEV", "P9LEASERES"]
+        &[
+            "P9LEASECFG",
+            "P9LEASEPTR",
+            "P9LEASEDEV",
+            "P9LEASEOWN",
+            "P9LEASERES",
+        ]
     } else {
         &["P9DEVCFG", "P9DEVOBS"]
     };

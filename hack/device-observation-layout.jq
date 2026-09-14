@@ -1,5 +1,5 @@
 # Isolated, little-endian 64-bit kernel diagnostic. Not a production BTF ABI.
-def device_observation_layout:
+def device_kernel_layout($ownership):
   if type!="array" or length!=2 or any(.[]; (.types|type)!="array") then
     error("two BTF type inventories required") else . end
   | . as $inventories
@@ -55,7 +55,7 @@ def device_observation_layout:
       | if .kind!="INT" or .size!=$size or (.nr_bits//($size*8))!=$size*8
         or (.bits_offset//0)!=0 then error("unexpected integer shape") else . end;
     # Split module BTF may repeat base structures with distinct IDs. Check every
-    # combination (at most 2^4), never select the first same-name definition.
+    # combination (at most 2^4, or 2^5 with ownership), never select the first.
     [named("sk_buff") as $skb | named("net_device") as $dev
     | named("net") as $net | named("veth_priv") as $veth
     | field($skb.id;"dev") as $skbdev
@@ -84,7 +84,29 @@ def device_observation_layout:
        deviceNet:(($ndnet.bits_offset+$netptr.bits_offset)/8),
        netCookie:($cookie.bits_offset/8),
        devicePeer:((($dev.size+31)/32|floor)*32+$peer.bits_offset/8),
-       kernelAdmitted:false}}]
+       kernelAdmitted:false}} as $basic
+    | if $ownership then
+        named("dev_ifalias") as $alias
+        | field($dev.id;"flags") as $flags
+        | field($dev.id;"ifalias") as $aliasptr
+        | pointer_to($aliasptr.type_id;"dev_ifalias") as $_aliasptr
+        | field($alias.id;"ifalias") as $data
+        | resolved($data.type_id;0) as $array
+        | integer($flags.type_id;4) as $_flags
+        | if $array.kind!="ARRAY" or $array.nr_elems!=0
+            or $flags.bits_offset%32!=0 or $flags.bits_offset/8+4>$dev.size
+            or $aliasptr.bits_offset%64!=0 or $aliasptr.bits_offset/8+8>$dev.size
+            or $alias.size<8 or $alias.size>256 or $data.bits_offset/8!=$alias.size
+          then error("unsupported device ownership layout") else . end
+        | integer($array.type_id;1) as $_char
+        | $basic | .sizes += [$alias.size]
+        | .layout += {schemaVersion:2,scope:"isolated-device-lease-layout",
+            deviceFlags:($flags.bits_offset/8),deviceAlias:($aliasptr.bits_offset/8),
+            aliasData:($data.bits_offset/8)}
+      else $basic end]
     | unique
     | if length!=1 then error("conflicting base/module device layouts")
       else .[0].layout end;
+
+def device_observation_layout: device_kernel_layout(false);
+def device_lease_layout: device_kernel_layout(true);

@@ -78,3 +78,50 @@ for mutation in "${split_cases[@]}"; do
     fi
 done
 printf 'Device layout 2-positive/%s-negative checks passed; evidence=%s\n' "$index" "$directory"
+jq '.[0].types += [
+    {id:13,kind:"INT",name:"char",size:1,nr_bits:8},
+    {id:14,kind:"ARRAY",name:"(anon)",type_id:13,index_type_id:1,nr_elems:0},
+    {id:15,kind:"STRUCT",name:"dev_ifalias",size:16,members:[{name:"ifalias",type_id:14,bits_offset:128}]},
+    {id:16,kind:"PTR",name:"(anon)",type_id:15}]
+    | .[0].types |= map(if .id==7 then .members += [
+        {name:"flags",type_id:1,bits_offset:192},{name:"ifalias",type_id:16,bits_offset:256}]
+      else . end)' "$directory/valid.json" > "$directory/owner.json"
+jq '.[0].types as $base | .[1].types += ($base|map(.id+=100
+    | if has("type_id") then .type_id+=100 else . end
+    | if has("index_type_id") then .index_type_id+=100 else . end
+    | if has("members") then .members|=map(.type_id+=100) else . end))
+    | .[1].types[0].members[0].type_id=103' "$directory/owner.json" > "$directory/owner-split.json"
+for input in owner owner-split; do
+    jq -L "$root/hack" -e 'include "device-observation-layout"; device_lease_layout ==
+      {schemaVersion:2,scope:"isolated-device-lease-layout",wordBytes:8,skbDevice:16,deviceIndex:8,deviceNet:16,netCookie:32,devicePeer:128,kernelAdmitted:false,deviceFlags:24,deviceAlias:32,aliasData:16}' "$directory/$input.json" >/dev/null
+done
+owner_cases=(
+  '.[0].types |= map(if .id==7 then .members|=map(select(.name!="flags")) else . end)'
+  '.[0].types |= map(if .id==7 then .members[2].type_id=2 else . end)'
+  '.[0].types |= map(if .id==7 then .members[2].bits_offset=200 else . end)'
+  '.[0].types |= map(if .id==7 then .members[2].bits_offset=1024 else . end)'
+  '.[0].types |= map(if .id==16 then .type_id=10 else . end)'
+  '.[0].types |= map(if .id==7 then .members[3].bits_offset=264 else . end)'
+  '.[0].types |= map(if .id==7 then .members[3].bits_offset=1024 else . end)'
+  '.[0].types |= map(select(.id!=15))'
+  '.[0].types += [(.[0].types[]|select(.id==15)|.id=215)]'
+  '.[0].types |= map(if .id==15 then .size=264|.members[0].bits_offset=2112 else . end)'
+  '.[0].types |= map(if .id==15 then .members[0].bits_offset=64 else . end)'
+  '.[0].types |= map(if .id==14 then .nr_elems=1 else . end)'
+  '.[0].types |= map(if .id==14 then .kind="PTR" else . end)'
+  '.[0].types |= map(if .id==14 then .type_id=1 else . end)'
+  '.[0].types |= map(if .id==13 then .nr_bits=7 else . end)'
+  '.[0].types |= map(if .id==15 then .members[0].bitfield_size=1 else . end)'
+  '.[1].types |= map(if .id==107 then .members[2].bits_offset=288 else . end)'
+  '.[1].types |= map(if .id==107 then .members[3].bits_offset=320 else . end)'
+  '.[1].types |= map(if .id==115 then .size=24|.members[0].bits_offset=192 else . end)'
+  '.[1].types += [(.[1].types[]|select(.id==115)|.id=215)]'
+)
+for mutation in "${owner_cases[@]}"; do
+    index=$((index+1))
+    jq "$mutation" "$directory/owner-split.json" > "$directory/negative-$index.json"
+    if jq -L "$root/hack" -e 'include "device-observation-layout"; device_lease_layout' "$directory/negative-$index.json" > "$directory/negative-$index.out" 2> "$directory/negative-$index.err"; then
+        printf 'Incorrectly accepted ownership layout mutation %s\n' "$index" >&2; exit 1
+    fi
+done
+printf 'Combined layout 4-positive/%s-negative checks passed; evidence=%s\n' "$index" "$directory"

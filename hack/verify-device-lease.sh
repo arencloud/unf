@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 [[ ${UNF_DEVICE_OBSERVATION_ISOLATED_CONTAINER:-} == yes && $EUID == 0 && $(uname -m) == x86_64 ]]
-for command in ip tc bpftool jq socat ss timeout mount umount od grep kernel-netns-cookie device-observation-loader; do command -v "$command" >/dev/null; done
+for command in ip tc bpftool jq socat ss timeout mount umount od grep kernel-netns-cookie device-observation-loader device-owner-aliases; do command -v "$command" >/dev/null; done
 directory=$(mktemp -d /tmp/unf-device-observation.XXXXXX)
 suffix=${directory##*.}
 fabric=unf-dl-f-$suffix
@@ -14,7 +14,8 @@ namespaces=()
 mounted=false
 receiver_pid=
 stage=setup
-host=target0
+source_host=unf012345678901
+host=unf012345678902
 seen=0
 redirects=0
 rejected=0
@@ -48,9 +49,27 @@ for namespace in "$fabric" "$source_ns" "$target_ns" "$foreign"; do
     [[ $(< "$directory/$namespace-cookie.txt") =~ ^[0-9a-f]{16}$ ]]
 done
 [[ $(sort -u "$directory"/*-cookie.txt | wc -l) == 4 ]]
-ip -n "$fabric" link add source0 index 201 address 02:44:45:00:01:01 type veth peer name eth0 index 202 netns "$source_ns" address 02:44:45:00:01:02
+for side in source target; do
+    if [[ $side == source ]]; then owner_host=$source_host; owner_namespace=$source_ns; octet=45
+    else owner_host=$host; owner_namespace=$target_ns; octet=46; fi
+    od -An -v -tu1 -N32 /dev/urandom | jq -sR 'split("\n")|join(" ")|split(" ")|map(select(length>0)|tonumber)' > "$directory/$side-nonce.json"
+    jq -e 'length==32 and any(.[];.!=0)' "$directory/$side-nonce.json" >/dev/null
+    jq -n --arg host "$owner_host" --arg namespace "$owner_namespace" --arg octet "$octet" --slurpfile nonce "$directory/$side-nonce.json" \
+      '{spec:{key:{network:"isolated-device-lease",containerId:$namespace,ifname:"eth0"},netns:("/run/netns/"+$namespace),mtu:1500,workloadUid:("fixture-"+$namespace)},
+        hostInterface:$host,phase:"ready",creationToken:$nonce[0],lease:{ipv4:{address:("10.244."+$octet+".2"),gateway:("10.244."+$octet+".1"),prefixLen:32},
+          ipv6:{address:("fd"+$octet+"::2"),gateway:("fd"+$octet+"::1"),prefixLen:128}}}' > "$directory/$side-attachment.json"
+    device-owner-aliases < "$directory/$side-attachment.json" > "$directory/$side-aliases.json"
+    jq -e 'length==2 and all(.[];length==96 and startswith("unf:cni:v3:")) and .[0]!=.[1]' "$directory/$side-aliases.json" >/dev/null
+done
+aliases=("$(jq -er '.[0]' "$directory/source-aliases.json")" "$(jq -er '.[1]' "$directory/source-aliases.json")"
+    "$(jq -er '.[0]' "$directory/target-aliases.json")" "$(jq -er '.[1]' "$directory/target-aliases.json")")
+ip -n "$fabric" link add "$source_host" index 201 address 02:44:45:00:01:01 type veth peer name eth0 index 202 netns "$source_ns" address 02:44:45:00:01:02
+ip -n "$fabric" link set "$source_host" alias "${aliases[0]}"
+ip -n "$source_ns" link set eth0 alias "${aliases[1]}"
 create_target() {
     ip -n "$fabric" link add "$host" index 301 address 02:44:46:00:01:01 type veth peer name eth0 index 302 netns "$target_ns" address 02:44:46:00:01:02
+    ip -n "$fabric" link set "$host" alias "${aliases[2]}"
+    ip -n "$target_ns" link set eth0 alias "${aliases[3]}"
     ip -n "$fabric" link set "$host" up
     ip -n "$fabric" addr add 10.244.46.1/32 dev "$host"
     ip -n "$fabric" addr add fd46::1/128 dev "$host" nodad
@@ -58,7 +77,7 @@ create_target() {
     ip -n "$fabric" neigh replace 10.244.46.2 lladdr 02:44:46:00:01:02 nud permanent dev "$host"
 }
 create_target
-ip -n "$fabric" link set source0 up
+ip -n "$fabric" link set "$source_host" up
 configure_source() {
     local namespace=$1
     ip -n "$namespace" link set eth0 up
@@ -90,7 +109,7 @@ if [[ -e /sys/kernel/btf/veth ]]; then
     bpftool -j -B /sys/kernel/btf/vmlinux btf dump file /sys/kernel/btf/veth format raw > "$directory/veth.json"
 else jq -n '{types:[]}' > "$directory/veth.json"; fi
 jq -n -L /usr/local/share/unf-qualification --slurpfile vm "$directory/vmlinux.json" --slurpfile veth_types "$directory/veth.json" \
-    'include "device-observation-layout"; [$vm[0],$veth_types[0]]|device_observation_layout' > "$directory/layout.json"
+    'include "device-observation-layout"; [$vm[0],$veth_types[0]]|device_lease_layout' > "$directory/layout.json"
 stage=verifier-load
 install -d -m 0700 "$directory/bpffs"
 mount -t bpf bpf "$directory/bpffs"
@@ -110,12 +129,22 @@ set_config() {
     while read -r value; do words+=$(encode64 "$value"); done < "$directory/config-values.txt"
     for namespace in "$fabric" "$source_ns" "$target_ns"; do words+=$(< "$directory/$namespace-cookie.txt"); done
     words+=000000000000000002444600010200000244460001010000
-    [[ ${#words} == 256 ]]
+    jq -r '[.deviceFlags,.deviceAlias,.aliasData,0][]' "$directory/layout.json" > "$directory/config-owner-values.txt"
+    while read -r value; do words+=$(encode64 "$value"); done < "$directory/config-owner-values.txt"
+    [[ ${#words} == 320 ]]
     read -r -a bytes <<< "$(sed 's/../& /g' <<< "$words")"
-    [[ ${#bytes[@]} == 128 ]]
+    [[ ${#bytes[@]} == 160 ]]
     bpftool map update pinned "$directory/bpffs/maps/P9LEASECFG" key hex 00 00 00 00 value hex "${bytes[@]}"
 }
-set_config 1
+set_config 2
+for owner in 0 1 2 3; do
+    hex=$(printf '%s' "${aliases[$owner]}" | od -An -v -tx1 | tr '\n' ' ')
+    read -r -a bytes <<< "$hex"
+    [[ ${#bytes[@]} == 96 ]]
+    bytes+=(00 00 00 00 00 00 00 00)
+    printf -v key '%02x' "$owner"
+    bpftool map update pinned "$directory/bpffs/maps/P9LEASEOWN" key hex "$key" 00 00 00 value hex "${bytes[@]}"
+done
 ip netns exec "$fabric" bpftool map update pinned "$directory/bpffs/maps/P9LEASEDEV" key hex 00 00 00 00 value hex c9 00 00 00 00 00 00 00
 read_result() {
     local name=$1
@@ -137,8 +166,8 @@ bind_target() {
 }
 stage=initial-seed
 bind_target initial
-ip netns exec "$fabric" tc qdisc add dev source0 clsact
-ip netns exec "$fabric" tc filter add dev source0 ingress pref 1 handle 1 bpf da pinned "$directory/bpffs/program"
+ip netns exec "$fabric" tc qdisc add dev "$source_host" clsact
+ip netns exec "$fabric" tc filter add dev "$source_host" ingress pref 1 handle 1 bpf da pinned "$directory/bpffs/program"
 probe() {
     local name=$1 family=$2 sender=$3 receiver=$4 allow=$5 requested=$6 failure=$7 target listen marker status=0 ready=false
     marker=unf-device-lease-$suffix-$name
@@ -173,6 +202,28 @@ probe() {
 pair() { local name=$1 sender=$2 receiver=$3 allow=$4 requested=$5 failure=$6; for family in 4 6; do probe "$name$family" "$family" "$sender" "$receiver" "$allow" "$requested" "$failure"; done; }
 stage=baseline
 pair baseline "$source_ns" "$target_ns" yes 1 0
+stage=ownership
+for owner in 0 1 2 3; do
+    case $owner in
+        0) owner_namespace=$fabric; owner_device=$source_host; failure=4; offset=27;;
+        1) owner_namespace=$source_ns; owner_device=eth0; failure=4; offset=59;;
+        2) owner_namespace=$fabric; owner_device=$host; failure=6; offset=90;;
+        3) owner_namespace=$target_ns; owner_device=eth0; failure=6; offset=92;;
+    esac
+    ip -n "$owner_namespace" link set "$owner_device" alias ''
+    pair "owner-$owner-missing" "$source_ns" "$target_ns" no 0 "$failure"
+    original=${aliases[$owner]}
+    if [[ ${original:offset:1} == 0 ]]; then replacement=1; else replacement=0; fi
+    changed=${original:0:offset}$replacement${original:offset+1}
+    ip -n "$owner_namespace" link set "$owner_device" alias "$changed"
+    pair "owner-$owner-mutated" "$source_ns" "$target_ns" no 0 "$failure"
+    ip -n "$owner_namespace" link set "$owner_device" alias "$original"
+    pair "owner-$owner-restored" "$source_ns" "$target_ns" yes 1 0
+done
+ip -n "$fabric" link set "$source_host" alias "${aliases[0]}x"
+pair owner-truncated "$source_ns" "$target_ns" no 0 4
+ip -n "$fabric" link set "$source_host" alias "${aliases[0]}"
+pair owner-untruncated "$source_ns" "$target_ns" yes 1 0
 stage=rename
 ip -n "$fabric" link set "$host" name renamed0
 host=renamed0
@@ -195,9 +246,14 @@ stage=peer-down
 ip -n "$target_ns" -j addr show eth0 > "$directory/peer-before-down-addresses.json"
 ip -n "$target_ns" link set eth0 down
 ip -n "$target_ns" -j addr show eth0 > "$directory/peer-after-down-addresses.json"
-pair peer-down "$source_ns" "$target_ns" no 1 0
+pair peer-down "$source_ns" "$target_ns" no 0 6
 configure_target "$target_ns"
 pair peer-up "$source_ns" "$target_ns" yes 1 0
+stage=host-down
+ip -n "$fabric" link set "$host" down
+pair host-down "$source_ns" "$target_ns" no 0 6
+ip -n "$fabric" link set "$host" up
+pair host-up "$source_ns" "$target_ns" yes 1 0
 stage=host-move
 ip -n "$fabric" link set "$host" netns "$foreign"
 pair host-moved "$source_ns" "$target_ns" no 0 2
@@ -217,10 +273,10 @@ pair replacement-unbound "$source_ns" "$target_ns" no 0 2
 bind_target replacement
 pair replacement-rebound "$source_ns" "$target_ns" yes 1 0
 stage=invalid-config
-set_config 2
-pair invalid-config "$source_ns" "$target_ns" no 0 1
 set_config 1
+pair invalid-config "$source_ns" "$target_ns" no 0 1
+set_config 2
 pair restored-config "$source_ns" "$target_ns" yes 1 0
-[[ $seen == 30 && $redirects == 18 && $rejected == 12 && $delivered == 16 && $denied == 14 ]]
+[[ $seen == 62 && $redirects == 28 && $rejected == 34 && $delivered == 28 && $denied == 34 ]]
 stage=verified
-jq -n '{schemaVersion:1,result:"passed",scope:"isolated-two-ended-device-lease",positiveDeliveries:16,deniedDeliveries:14,requestedRedirects:18,guardRejections:12,kernelAdmitted:false,observedDelivery:false,productionAuthority:false,concurrentLifetimeVerified:false}'
+jq -n '{schemaVersion:2,result:"passed",scope:"isolated-two-ended-device-lease",positiveDeliveries:28,deniedDeliveries:34,requestedRedirects:28,guardRejections:34,fullOwnershipAliasComparison:true,kernelAdmitted:false,observedDelivery:false,productionAuthority:false,concurrentLifetimeVerified:false}'

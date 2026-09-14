@@ -80,6 +80,9 @@ ownership/publication/packet composition remain separate open boundaries.
 ADR 0364 verifies the identical retained-Kind serial gate and complete log/state
 review. Both kernels pass the isolated delivery/invalidation mechanism; it is
 not yet authenticated production locality or a concurrent lifetime guarantee.
+ADR 0365 adds full kernel alias and administrative-up checks to that diagnostic,
+using the real CNI alias derivation on synthetic bound fixture records. Local
+layout/adapter checks pass; expanded cl02-before-Kind execution remains next.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

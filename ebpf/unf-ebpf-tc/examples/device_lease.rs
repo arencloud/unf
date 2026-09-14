@@ -6,7 +6,7 @@
 use aya_ebpf::{
     EbpfContext,
     bindings::TC_ACT_SHOT,
-    helpers::{bpf_probe_read_kernel, bpf_redirect_peer},
+    helpers::{bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_redirect_peer},
     macros::{classifier, map},
     maps::{Array, DevMap},
     programs::TcContext,
@@ -14,15 +14,21 @@ use aya_ebpf::{
 
 // Schema, skb device word, index/net/cookie/peer offsets, source/target host
 // indices, source/target peer indices, fabric/source/target cookies, reserved,
-// target peer MAC and target host MAC (six little-endian bytes each).
+// target peer/host MACs; flags offset, alias pointer/data offsets, reserved.
+// Schema 2 adds full alias matching and administrative-up checks.
 #[map]
-static P9LEASECFG: Array<[u64; 16]> = Array::with_max_entries(1, 0);
+static P9LEASECFG: Array<[u64; 20]> = Array::with_max_entries(1, 0);
 // Only a target-context seed may write this private pointer. Never export it
 // in diagnostic results. Entries must not be implicitly rebound or reused.
 #[map]
 static P9LEASEPTR: Array<u64> = Array::with_max_entries(1, 0);
 #[map]
 static P9LEASEDEV: DevMap = DevMap::with_max_entries(2, 0);
+// Exact NUL-terminated, zero-padded aliases: source host/peer, target host/peer.
+// A production publisher must derive these from independently verified CNI
+// ownership; matching caller-supplied strings alone is not authentication.
+#[map]
+static P9LEASEOWN: Array<[u64; 13]> = Array::with_max_entries(4, 0);
 // Serial probes, requested redirects, rejected probes, last failure stage.
 // Requested redirects are NOT observed application deliveries.
 #[map]
@@ -52,7 +58,7 @@ pub fn device_lease_seed(ctx: TcContext) -> i32 {
         && u64::from(ifindex(&ctx)) == config[7]
     {
         if let Ok(device) = context_device(&ctx, config) {
-            if endpoint(device, config, 7, 9, 12).is_ok() {
+            if endpoint(device, config, 7, 9, 12, 2).is_ok() {
                 // The fixture seeds once after binding the target devmap entry,
                 // before it attaches the source classifier or sends traffic.
                 unsafe {
@@ -108,9 +114,9 @@ fn redirect(ctx: &TcContext) -> Result<i32, u64> {
         return Err(2);
     }
     let source = context_device(ctx, config).map_err(|_| 3_u64)?;
-    endpoint(source, config, 6, 8, 11).map_err(|_| 4_u64)?;
+    endpoint(source, config, 6, 8, 11, 0).map_err(|_| 4_u64)?;
     let target = P9LEASEPTR.get(0).copied().ok_or(5_u64)?;
-    endpoint(target, config, 7, 9, 12).map_err(|_| 6_u64)?;
+    endpoint(target, config, 7, 9, 12, 2).map_err(|_| 6_u64)?;
     let destination = config[14].to_le_bytes();
     let source = config[15].to_le_bytes();
     ctx.store(
@@ -140,8 +146,8 @@ fn redirect(ctx: &TcContext) -> Result<i32, u64> {
 }
 
 #[inline(always)]
-fn valid_config(c: &[u64; 16]) -> bool {
-    c[0] == 1
+fn valid_config(c: &[u64; 20]) -> bool {
+    c[0] == 2
         && c[1] <= 7
         && c[2] <= 8192
         && c[3] <= 8192
@@ -169,21 +175,37 @@ fn valid_config(c: &[u64; 16]) -> bool {
         && c[15] > 0
         && c[14] >> 48 == 0
         && c[15] >> 48 == 0
+        && c[16] <= 8192
+        && c[16] % 4 == 0
+        && c[17] <= 8192
+        && c[17] % 8 == 0
+        && c[18] >= 8
+        && c[18] <= 256
+        && c[19] == 0
 }
 
 #[inline(always)]
-fn endpoint(device: u64, c: &[u64; 16], host: usize, peer: usize, cookie: usize) -> Result<(), ()> {
-    if u64::from(read::<u32>(device, c[2])?) != c[host] {
+fn endpoint(
+    device: u64,
+    c: &[u64; 20],
+    host: usize,
+    peer: usize,
+    cookie: usize,
+    owner: u32,
+) -> Result<(), ()> {
+    if u64::from(read::<u32>(device, c[2])?) != c[host] || read::<u32>(device, c[16])? & 1 == 0 {
         return Err(());
     }
+    ownership(device, c, owner)?;
     let namespace = read::<u64>(device, c[3])?;
     if read::<u64>(namespace, c[4])? != c[10] {
         return Err(());
     }
     let remote = read::<u64>(device, c[5])?;
-    if u64::from(read::<u32>(remote, c[2])?) != c[peer] {
+    if u64::from(read::<u32>(remote, c[2])?) != c[peer] || read::<u32>(remote, c[16])? & 1 == 0 {
         return Err(());
     }
+    ownership(remote, c, owner + 1)?;
     let namespace = read::<u64>(remote, c[3])?;
     if read::<u64>(namespace, c[4])? != c[cookie] {
         return Err(());
@@ -192,7 +214,42 @@ fn endpoint(device: u64, c: &[u64; 16], host: usize, peer: usize, cookie: usize)
 }
 
 #[inline(always)]
-fn context_device(ctx: &TcContext, c: &[u64; 16]) -> Result<u64, ()> {
+fn ownership(device: u64, c: &[u64; 20], owner: u32) -> Result<(), ()> {
+    let expected = P9LEASEOWN.get(owner).ok_or(())?;
+    let alias = read::<u64>(device, c[17])?;
+    if alias == 0 || alias % 8 != 0 {
+        return Err(());
+    }
+    let address = alias.checked_add(c[18]).ok_or(())?;
+    // CNI's longest v3 alias is 96 bytes. Read beyond that bound so a longer
+    // string with the same prefix cannot pass through helper truncation.
+    let mut buffer = [0_u64; 14];
+    // The helper bounds/fault-checks the read. Linux replaces ifalias through
+    // RCU and defers reclamation; no raw Rust dereference or pointer export.
+    let length = {
+        // SAFETY: this is exactly the initialized 112-byte backing array;
+        // the temporary byte view does not outlive its exclusive borrow.
+        let bytes =
+            unsafe { core::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast::<u8>(), 112) };
+        unsafe { bpf_probe_read_kernel_str_bytes(address as *const u8, bytes) }
+            .map_err(|_| ())?
+            .len()
+    };
+    if length == 0 || length > 96 {
+        return Err(());
+    }
+    // Compare complete bytes in thirteen aligned words, not a truncated hash
+    // or prefix. This bounds comparison work; measured hot-path cost is open.
+    for index in 0..13 {
+        if buffer[index] != expected[index] {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+#[inline(always)]
+fn context_device(ctx: &TcContext, c: &[u64; 20]) -> Result<u64, ()> {
     if c[1] > 7 {
         return Err(());
     }

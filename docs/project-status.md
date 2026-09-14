@@ -705,6 +705,9 @@ ADR 0364 verifies the identical serial delivery/invalidation gate on retained
 Kind, with unchanged RPF settings, cleanup and current/rotated log review.
 Both kernels pass this mechanism gate; production ownership, concurrent lifetime,
 packet composition and full Phase 9/S1–S5 qualification remain open.
+ADR 0365 adds locally checked full CNI-derived alias comparison at all four
+endpoints and administrative-up checks. Its expanded 62-attempt immutable
+fixture requires cl02-before-Kind qualification; production authority is unchanged.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
