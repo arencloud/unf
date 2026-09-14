@@ -74,6 +74,9 @@ source/target ownership binding and lifetime-safe consumption remain next.
 ADR 0362 implements an isolated two-ended device-map lease experiment for the
 delivery-lifetime gap. Kernel-reference semantics are audited as a design lead,
 not a completed production proof. Both platform gates remain required.
+ADR 0363 verifies the corrected serial cl02 gate with sixteen deliveries and
+fourteen denials. Matching Kind is next; concurrent lifetime and authenticated
+ownership/publication/packet composition remain separate open boundaries.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

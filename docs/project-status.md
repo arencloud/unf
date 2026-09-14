@@ -697,6 +697,10 @@ full Phase 9 qualification and S1–S5 remain open.
 ADR 0362 begins a separate two-ended device-map lease/delivery experiment,
 with packet-time namespace checks and independent application/counter evidence.
 Its cl02-before-Kind gates and production authority integration remain pending.
+ADR 0363 verifies its corrected cl02 serial delivery gate: sixteen delivered /
+fourteen denied attempts, exact counters, explicit rebind after host movement
+or deletion/index reuse, complete cleanup and reviewed logs. Matching Kind and
+the authenticated production locality consumer remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
