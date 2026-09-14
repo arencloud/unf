@@ -138,6 +138,9 @@ bank consumption and scale-efficient inventory integration remain open.
 ADR 0381 verifies the complete isolated cl02 joint observation gate, including
 all 28 drift/recovery/cancellation checks and full log/state review. Matching
 Kind remains required before this snapshot prerequisite closes.
+ADR 0382 verifies matching Kind's complete 28-check ledger and current/rotated
+logs on the identical image. Stale-safe actual journal inventory integration is
+next; neither snapshot API alone grants production locality permission.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
