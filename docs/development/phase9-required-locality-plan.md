@@ -104,6 +104,9 @@ ADR 0372 verifies the complete cl02 serial/concurrent gate with working foreign
 positive controls and zero unauthorized foreign delivery. Its 136 requested but
 unobserved redirects remain an attribution gap, not a lossless result. Matching
 Kind and production lifetime/publication/consumption remain open.
+ADR 0373 verifies that matching Kind experiment and full current/rotated log
+review. Its 43 unobserved redirects remain a finding. Four-endpoint device-map
+invalidation is the next lifetime investigation; full L3 and Phase 9 stay open.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

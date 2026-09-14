@@ -731,6 +731,9 @@ ADR 0372 verifies the bounded cl02 target-peer movement gate: 40,000 attempts,
 zero foreign delivery and receiver socket loss, with 136 explicitly unobserved
 redirects retained as a finding. Matching Kind, loss attribution and the
 production consuming boundary remain open; no lossless-handoff claim is made.
+ADR 0373 verifies the identical bounded Kind gate with zero foreign/socket-loss
+observations and 43 unobserved redirects retained. Both baseline experiments
+pass; four-endpoint invalidation, attribution and production consumption are next.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
