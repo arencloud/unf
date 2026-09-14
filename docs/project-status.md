@@ -708,6 +708,9 @@ packet composition and full Phase 9/S1–S5 qualification remain open.
 ADR 0365 adds locally checked full CNI-derived alias comparison at all four
 endpoints and administrative-up checks. Its expanded 62-attempt immutable
 fixture requires cl02-before-Kind qualification; production authority is unchanged.
+ADR 0366 verifies the expanded cl02 gate on `27efd6e`, including all 62 attempts,
+full alias/administrative-state checks, cleanup and before/during/after logs.
+The identical image remains pending on Kind; full locality consumption is open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

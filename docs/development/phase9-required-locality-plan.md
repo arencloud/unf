@@ -83,6 +83,8 @@ not yet authenticated production locality or a concurrent lifetime guarantee.
 ADR 0365 adds full kernel alias and administrative-up checks to that diagnostic,
 using the real CNI alias derivation on synthetic bound fixture records. Local
 layout/adapter checks pass; expanded cl02-before-Kind execution remains next.
+ADR 0366 verifies all 62 expanded cl02 attempts and the complete log/state audit.
+Matching Kind remains next; this is not live attachment/placement authentication.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
