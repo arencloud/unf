@@ -720,6 +720,9 @@ and full real-traffic gates require cl02-before-Kind execution.
 ADR 0369 verifies that complete cl02 gate: four non-transmitting seeds, two
 strict context rejections and all 62 traffic checks, with cleanup and full
 log/state review. Matching Kind and the production consuming boundary remain open.
+ADR 0370 verifies the identical retained-Kind gate and current/rotated log audit.
+Non-transmitting context acquisition passes both kernels; concurrent movement,
+immutable publication and authenticated production consumption remain next.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -94,6 +94,9 @@ qualification remain pending on cl02 before retained Kind.
 ADR 0369 verifies the complete cl02 context-acquisition and 62-probe traffic
 gate, including cleanup, fresh convergence and reviewed logs. Matching Kind
 remains next; concurrent lifetime and authenticated production admission stay open.
+ADR 0370 verifies the identical Kind context/traffic gate, cleanup and retained
+log review. Both kernels pass this prerequisite; concurrent movement and the
+immutable, authenticated production consuming boundary remain open.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
