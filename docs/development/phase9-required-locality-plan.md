@@ -141,6 +141,9 @@ Kind remains required before this snapshot prerequisite closes.
 ADR 0382 verifies matching Kind's complete 28-check ledger and current/rotated
 logs on the identical image. Stale-safe actual journal inventory integration is
 next; neither snapshot API alone grants production locality permission.
+ADR 0383 adds locally verified stale-safe journal cuts and bounded read copies.
+Actual agent inventory selection and locked consumption must use the cut; it is
+not itself journal/placement joining or a packet permission. Runtime gates remain.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

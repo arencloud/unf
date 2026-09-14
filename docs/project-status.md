@@ -771,6 +771,10 @@ Matching retained Kind is next; live journal/placement integration remains open.
 ADR 0382 verifies the identical Kind joint observation gate and rotated-log audit.
 Both snapshot APIs pass; stale-safe actual CNI journal/placement joining and
 production packet consumption remain open, along with full Phase 9/S1–S5.
+ADR 0383 adds locally verified process-local journal cuts with persistence-error
+revocation and borrowed inventory iteration. Read-only requests no longer clone
+the complete inventory; pagination seeks directly to its bounded range. Actual
+agent joining, runtime qualification and resource measurements remain pending.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -3,6 +3,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -362,6 +363,17 @@ pub struct AttachmentJournal {
     path: PathBuf,
     provider: NodeBlockProvider,
     attachments: BTreeMap<AttachmentKey, AttachmentRecord>,
+    instance: Option<Arc<()>>,
+    revision: u64,
+}
+
+/// Opaque process-local snapshot fence. A token from another open journal,
+/// including a reopen of the same file, can never authenticate this instance.
+/// This is not a persisted revision, file lock or kernel/placement permission.
+#[derive(Clone)]
+pub struct AttachmentJournalCut {
+    instance: Arc<()>,
+    revision: u64,
 }
 
 impl AttachmentJournal {
@@ -404,6 +416,8 @@ impl AttachmentJournal {
             path,
             provider,
             attachments,
+            instance: Some(Arc::new(())),
+            revision: 0,
         };
         if migrated {
             journal.persist()?;
@@ -431,6 +445,36 @@ impl AttachmentJournal {
     #[must_use]
     pub fn records(&self) -> Vec<AttachmentRecord> {
         self.attachments.values().cloned().collect()
+    }
+
+    /// Borrow records without cloning the full inventory. A caller retaining
+    /// selected records across asynchronous work must also retain and recheck
+    /// a cut under the journal's synchronization before consuming the result.
+    #[must_use]
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &AttachmentRecord> + DoubleEndedIterator {
+        self.attachments.values()
+    }
+
+    /// Returns no locality fence after any persistence failure. Only a later
+    /// successful durable mutation or a freshly validated reopen restores one;
+    /// read-only operations and no-op replays cannot repair uncertain durability.
+    #[must_use]
+    pub fn cut(&self) -> Option<AttachmentJournalCut> {
+        Some(AttachmentJournalCut {
+            instance: Arc::clone(self.instance.as_ref()?),
+            revision: self.revision,
+        })
+    }
+
+    /// Rejects any intervening durable state change, even change-and-restore.
+    /// Check and consumption must share the caller's journal synchronization.
+    /// This does not detect writes bypassing this journal's exclusive owner.
+    #[must_use]
+    pub fn is_current(&self, cut: &AttachmentJournalCut) -> bool {
+        self.instance
+            .as_ref()
+            .is_some_and(|instance| Arc::ptr_eq(instance, &cut.instance))
+            && self.revision == cut.revision
     }
 
     /// Applies one validated, durable transaction operation.
@@ -461,41 +505,23 @@ impl AttachmentJournal {
             self.validate_legacy_operation(schema_version, &operation)?;
         }
 
-        let previous = self.attachments.clone();
+        // Read operations cannot mutate the inventory. Do not allocate a
+        // rollback copy or compare the entire journal for Status/List/CHECK.
+        let previous = (!matches!(
+            &operation,
+            TransactionOperation::Status
+                | TransactionOperation::List { .. }
+                | TransactionOperation::Inspect { .. }
+                | TransactionOperation::Check { .. }
+        ))
+        .then(|| self.attachments.clone());
         let (attachment, attachments) = match operation {
             TransactionOperation::Status => (None, Vec::new()),
             TransactionOperation::List {
                 network,
                 after,
                 limit,
-            } => {
-                if !valid_identifier(&network, MAX_IDENTIFIER_BYTES) {
-                    return Err(JournalError::Invalid(
-                        "attachment list network is invalid".to_owned(),
-                    ));
-                }
-                if let Some(after) = &after {
-                    validate_key(after)?;
-                }
-                if !(1..=MAX_ATTACHMENT_LIST_RECORDS).contains(&limit) {
-                    return Err(JournalError::Invalid(format!(
-                        "attachment list limit must be between 1 and {MAX_ATTACHMENT_LIST_RECORDS}"
-                    )));
-                }
-                let records = self
-                    .attachments
-                    .values()
-                    .filter(|record| record.spec.key.network == network)
-                    .filter(|record| {
-                        after
-                            .as_ref()
-                            .is_none_or(|cursor| record.spec.key > *cursor)
-                    })
-                    .take(usize::from(limit))
-                    .cloned()
-                    .collect();
-                (None, records)
-            }
+            } => (None, self.list_records(&network, after.as_ref(), limit)?),
             TransactionOperation::Inspect { key } => {
                 validate_key(&key)?;
                 (self.attachments.get(&key).cloned(), Vec::new())
@@ -530,11 +556,26 @@ impl AttachmentJournal {
             }
         };
 
-        if self.attachments != previous
-            && let Err(error) = self.persist()
+        if let Some(previous) = previous
+            && self.attachments != previous
         {
-            self.attachments = previous;
-            return Err(error);
+            let Some(revision) = self.revision.checked_add(1) else {
+                self.attachments = previous;
+                return Err(JournalError::InvalidTransition(
+                    "process-local attachment revision exhausted".into(),
+                ));
+            };
+            if let Err(error) = self.persist() {
+                self.attachments = previous;
+                // A failure can occur after rename. Preserve the existing
+                // transaction rollback behavior, but never authorize locality
+                // from a potentially ambiguous durable snapshot. Reads and
+                // no-op replays cannot make this instance trustworthy again.
+                self.instance = None;
+                return Err(error);
+            }
+            self.revision = revision;
+            self.instance.get_or_insert_with(|| Arc::new(()));
         }
         Ok(TransactionResponse {
             schema_version,
@@ -544,6 +585,45 @@ impl AttachmentJournal {
                 attachment_count: self.attachments.len(),
             },
         })
+    }
+
+    fn list_records(
+        &self,
+        network: &str,
+        after: Option<&AttachmentKey>,
+        limit: u16,
+    ) -> Result<Vec<AttachmentRecord>, JournalError> {
+        if !valid_identifier(network, MAX_IDENTIFIER_BYTES) {
+            return Err(JournalError::Invalid(
+                "attachment list network is invalid".into(),
+            ));
+        }
+        if let Some(after) = after {
+            validate_key(after)?;
+        }
+        if !(1..=MAX_ATTACHMENT_LIST_RECORDS).contains(&limit) {
+            return Err(JournalError::Invalid(format!(
+                "attachment list limit must be between 1 and {MAX_ATTACHMENT_LIST_RECORDS}"
+            )));
+        }
+        // Preserve lexicographic cursor semantics, including foreign-network
+        // cursors, without walking preceding networks/pages on every read.
+        let minimum = AttachmentKey {
+            network: network.to_owned(),
+            container_id: String::new(),
+            ifname: String::new(),
+        };
+        let lower = after.filter(|key| *key >= &minimum).map_or(
+            std::ops::Bound::Included(&minimum),
+            std::ops::Bound::Excluded,
+        );
+        Ok(self
+            .attachments
+            .range((lower, std::ops::Bound::Unbounded))
+            .take_while(|(key, _)| key.network == network)
+            .take(usize::from(limit))
+            .map(|(_, record)| record.clone())
+            .collect())
     }
 
     // Never hide a binding from an old reader or let an old writer mutate it.
@@ -1073,6 +1153,7 @@ fn remove_stale_temporary(path: &Path) -> Result<(), JournalError> {
 
 #[cfg(test)]
 mod tests {
+    mod cut;
     mod ownership;
     use std::os::unix::fs::symlink;
 
