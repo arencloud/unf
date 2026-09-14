@@ -711,6 +711,9 @@ fixture requires cl02-before-Kind qualification; production authority is unchang
 ADR 0366 verifies the expanded cl02 gate on `27efd6e`, including all 62 attempts,
 full alias/administrative-state checks, cleanup and before/during/after logs.
 The identical image remains pending on Kind; full locality consumption is open.
+ADR 0367 verifies that identical expanded Kind gate: all 62 attempts, exact
+cleanup and current/rotated log review. Ownership/admin-state serial mechanism
+checks pass both kernels; concurrent lifetime and production consumption remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -85,6 +85,9 @@ using the real CNI alias derivation on synthetic bound fixture records. Local
 layout/adapter checks pass; expanded cl02-before-Kind execution remains next.
 ADR 0366 verifies all 62 expanded cl02 attempts and the complete log/state audit.
 Matching Kind remains next; this is not live attachment/placement authentication.
+ADR 0367 verifies the identical expanded Kind gate, cleanup and retained logs.
+Both kernels pass the serial ownership/admin-state mechanism; concurrent
+lifetime and the authenticated/banked production consumer remain open.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
