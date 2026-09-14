@@ -758,6 +758,9 @@ ADR 0378 verifies the complete corrected cl02 publication gate: all 70 serial
 checks, sticky movement, exact attribution of 40,000 publication packets,
 last-reference retirement and frozen-bank kernel invalidation. Matching Kind is
 next; production locality consumption and full Phase 9/S1–S5 remain open.
+ADR 0379 verifies the matching Kind publication gate and retained-log audit on
+the identical digest. Both isolated publication gates pass; authenticated
+production attachment/address/route integration is next, not Phase 9 closure.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
