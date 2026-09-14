@@ -11,8 +11,8 @@ fn main() -> Result<()> {
     );
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     ensure!(
-        arguments.len() == 2,
-        "expected object and private bpffs directory"
+        arguments.len() == 2 || (arguments.len() == 3 && arguments[2] == "lease"),
+        "expected object, private bpffs directory and optional lease mode"
     );
     let object = PathBuf::from(&arguments[0]);
     let directory = PathBuf::from(&arguments[1]);
@@ -35,21 +35,37 @@ fn main() -> Result<()> {
         .verifier_log_level(VerifierLogLevel::VERBOSE | VerifierLogLevel::STATS)
         .load(&bytes)
         .context("load diagnostic object")?;
-    let program: &mut SchedClassifier = bpf
-        .program_mut("device_observation")
-        .context("missing diagnostic classifier")?
-        .try_into()?;
-    program
-        .load()
-        .context("kernel rejected diagnostic classifier")?;
-    program.pin(directory.join("program"))?;
-    for name in ["P9DEVCFG", "P9DEVOBS"] {
+    let lease = arguments.len() == 3;
+    let programs: &[(&str, &str)] = if lease {
+        &[
+            ("device_lease_seed", "seed"),
+            ("device_lease_redirect", "program"),
+        ]
+    } else {
+        &[("device_observation", "program")]
+    };
+    for (name, pin) in programs {
+        let program: &mut SchedClassifier = bpf
+            .program_mut(name)
+            .context("missing diagnostic classifier")?
+            .try_into()?;
+        program
+            .load()
+            .context("kernel rejected diagnostic classifier")?;
+        program.pin(directory.join(pin))?;
+    }
+    let maps: &[&str] = if lease {
+        &["P9LEASECFG", "P9LEASEPTR", "P9LEASEDEV", "P9LEASERES"]
+    } else {
+        &["P9DEVCFG", "P9DEVOBS"]
+    };
+    for name in maps {
         bpf.map(name)
             .context("missing diagnostic map")?
             .pin(directory.join("maps").join(name))?;
     }
     println!(
-        "Drop-only diagnostic program and maps loaded into private bpffs; no TC attachment performed by loader"
+        "Isolated diagnostic programs and maps loaded into private bpffs; no TC attachment performed by loader"
     );
     Ok(())
 }

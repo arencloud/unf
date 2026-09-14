@@ -71,6 +71,9 @@ retained Kind remains required before this isolated readback primitive closes.
 ADR 0361 verifies the matching corrected Kind gate with all ten checks and
 current/rotated logs. Both kernels support this isolated readback primitive;
 source/target ownership binding and lifetime-safe consumption remain next.
+ADR 0362 implements an isolated two-ended device-map lease experiment for the
+delivery-lifetime gap. Kernel-reference semantics are audited as a design lead,
+not a completed production proof. Both platform gates remain required.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

@@ -6,6 +6,7 @@
 .artifacts/*
 !.artifacts/unf-ebpf-tc
 !.artifacts/unf-device-observation
+!.artifacts/unf-device-lease
 target/
 ebpf/unf-ebpf-tc/target/
 docs/
@@ -15,5 +16,6 @@ hack/*
 !hack/local-delivery-device-gate.jq
 !hack/verify-veth-observation.sh
 !hack/verify-device-observation.sh
+!hack/verify-device-lease.sh
 !hack/device-observation-layout.jq
 tests/

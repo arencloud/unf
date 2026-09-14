@@ -1,0 +1,20 @@
+ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
+ARG TEST_TOOLS_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:e9cce439d92d0f7d3d6751f234e397a7efc29f9983bc0ae8fc318432c4ff2352
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY bins ./bins
+COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
+RUN cargo build --locked --release --package unf-link --example kernel_netns_cookie
+RUN cargo build --locked --release --package unf-agent --example device_observation_loader
+
+FROM ${TEST_TOOLS_IMAGE}
+ARG UNF_SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
+COPY --from=builder /src/target/release/examples/kernel_netns_cookie /usr/local/bin/kernel-netns-cookie
+COPY --from=builder /src/target/release/examples/device_observation_loader /usr/local/bin/device-observation-loader
+COPY .artifacts/unf-device-lease /usr/local/lib/unf/device-lease
+COPY hack/device-observation-layout.jq /usr/local/share/unf-qualification/device-observation-layout.jq
+COPY hack/verify-device-lease.sh /usr/local/bin/verify-device-observation
+ENTRYPOINT ["bash", "/usr/local/bin/verify-device-observation"]
