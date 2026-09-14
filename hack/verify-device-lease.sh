@@ -26,6 +26,9 @@ cleanup() {
     if [[ -n $receiver_pid ]]; then kill "$receiver_pid" 2>/dev/null || true; wait "$receiver_pid" 2>/dev/null || true; fi
     for namespace in "${namespaces[@]}"; do
         ip -n "$namespace" -j -details link show > "$directory/final-$namespace-links.json" || result=1
+        ip -n "$namespace" -j addr show > "$directory/final-$namespace-addresses.json" || result=1
+        ip -n "$namespace" -j route show > "$directory/final-$namespace-routes4.json" || result=1
+        ip -n "$namespace" -j -6 route show > "$directory/final-$namespace-routes6.json" || result=1
     done
     if [[ $mounted == true ]]; then
         # Deliberately never dump P9LEASEPTR: it contains a private kernel address.
@@ -77,6 +80,7 @@ configure_target() {
 }
 configure_source "$source_ns"
 configure_target "$target_ns"
+ip netns exec "$target_ns" cat /proc/sys/net/ipv4/conf/all/rp_filter /proc/sys/net/ipv4/conf/eth0/rp_filter > "$directory/receiver-rpf.txt"
 stage=kernel-layout
 [[ $(od -An -tx1 -N2 /sys/kernel/btf/vmlinux | tr -d ' \n') == 9feb ]]
 [[ $(stat -c %s /sys/kernel/btf/vmlinux) -le 33554432 ]]
@@ -138,8 +142,11 @@ ip netns exec "$fabric" tc filter add dev source0 ingress pref 1 handle 1 bpf da
 probe() {
     local name=$1 family=$2 sender=$3 receiver=$4 allow=$5 requested=$6 failure=$7 target listen marker status=0 ready=false
     marker=unf-device-lease-$suffix-$name
-    if [[ $family == 4 ]]; then target=UDP4-SENDTO:10.244.46.2:17778; listen=UDP4-RECVFROM:17778,bind=10.244.46.2,reuseaddr
-    else target='UDP6-SENDTO:[fd46::2]:17778'; listen='UDP6-RECVFROM:17778,bind=[fd46::2],reuseaddr'; fi
+    # A downed interface can lose its IPv6 address. Bind within the exact owned
+    # receiver namespace without depending on that address surviving the fault.
+    # The sender still targets the exact workload address and unique payload.
+    if [[ $family == 4 ]]; then target=UDP4-SENDTO:10.244.46.2:17778; listen=UDP4-RECVFROM:17778,bind=0.0.0.0,reuseaddr
+    else target='UDP6-SENDTO:[fd46::2]:17778'; listen='UDP6-RECVFROM:17778,bind=[::],ipv6only=1,reuseaddr'; fi
     timeout 3 ip netns exec "$receiver" socat -u "$listen" - > "$directory/$name-received.txt" 2> "$directory/$name-receiver.err" &
     receiver_pid=$!
     for _ in $(seq 1 30); do
@@ -185,7 +192,9 @@ ip -n "$foreign" link set eth0 netns "$source_ns"
 configure_source "$source_ns"
 pair source-returned "$source_ns" "$target_ns" yes 1 0
 stage=peer-down
+ip -n "$target_ns" -j addr show eth0 > "$directory/peer-before-down-addresses.json"
 ip -n "$target_ns" link set eth0 down
+ip -n "$target_ns" -j addr show eth0 > "$directory/peer-after-down-addresses.json"
 pair peer-down "$source_ns" "$target_ns" no 1 0
 configure_target "$target_ns"
 pair peer-up "$source_ns" "$target_ns" yes 1 0

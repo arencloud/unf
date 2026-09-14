@@ -63,3 +63,31 @@ layout regression precede immutable-image execution on cl02, then retained
 Kind. A result cannot be called verified until payloads, all counters, namespace
 cleanup, Node identity and controller/all-agent/installer logs pass. Full Phase 9,
 L3 consumption and stabilization S1–S5 remain open.
+
+## First cl02 attempt and receiver correction
+
+Source `d06f4d8` passes local compilation, strict loader Clippy, formatting,
+807 workspace tests (26 ignored), and two positive/32 negative layout cases.
+Its immutable image
+`quay.io/arencloud/unf-test-tools-dev@sha256:a0ede070c624f776987ac3fe8f9c862322c5cfc08df1cad2d9a235d67be6e0c1`
+loads both classifiers on RHCOS, including TC device-map lookups and peer
+redirect. The first thirteen probes pass (eight deliveries, five denials;
+nine requested redirects, four classifier rejections). The IPv6 down-peer
+receiver then cannot bind its interface address. The readiness gate fails
+before sending that probe; the complete run remains failed. This is not
+qualified continuous delivery or a reason to skip the IPv6 case.
+
+Evidence is retained in `.artifacts/p9-device-lease-d06f4d8-cl02`, including the
+bind error, verifier/program metadata and exact counters. Private resources and
+the Kubernetes Namespace are cleaned up. All five live reports finish fresh/
+converged at policy 465 / Service 203, with Ready/zero-restart containers.
+Before/final controller/all-agent/installer logs cover the attempt: bounded-
+history and proof-assistance warnings remain, without a live UNF ERROR, panic,
+OOM or verifier rejection. No Kind execution follows this failed gate.
+
+Receivers now bind the wildcard address inside their exact owned namespace;
+IPv6 is explicitly IPv6-only. Exact destination addresses, unique payloads,
+receiver readiness, timeout status and per-probe counters remain required.
+Address/route and RPF evidence is expanded without changing RPF or address-
+retention sysctls. A fresh immutable image must rerun the whole cl02 gate before
+matching Kind; no diagnostic BPF or live runtime change is part of this repair.
