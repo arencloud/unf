@@ -68,3 +68,27 @@ This is not the production publisher, authenticated attachment/address/route
 join, complete source-side concurrency or policy/Service/egress composition.
 Whole-bank staging costs and tail-call/resource budgets are unmeasured. Full
 Phase 9 and stabilization S1–S5 remain open; no scale or superiority claim follows.
+
+## First cl02 failure and fixture repair
+
+The `94c3478` image (`sha256:f2cff2f7ea5378b06e7ff51fc936a307ca1dfac6d2e36793ff8b438e737b424a`)
+failed before creating bank B: its dotted parent name was placed inside bank A's
+bpffs. Linux [reserves dotted bpffs entries](https://github.com/torvalds/linux/blob/v5.14/kernel/bpf/inode.c#L353-L363)
+and returns EPERM. This is a fixture setup failure, not a passed publication gate.
+The corrected fixture keeps B's guarded parent on tmpfs, mounts a separate owned
+bpffs beneath it, and explicitly unmounts both during cleanup. No loader path
+guard or kernel permission is weakened; the BPF object is unchanged.
+
+The failed archive is retained at
+`.artifacts/p9-device-lease-94c3478-cl02/fixture.tgz`, SHA-256
+`f75527416af693f96c1687e855cb962cddeedb159f843f48426a177a5ba7b4bd`.
+Its seventy serial attempts reached `[70,30,40,0]`; the publication stage never
+ran. Before/during/after controller, five-agent and installer logs were reviewed.
+The after window has 433 bounded flow-history, 14 path-proof, five key-publication
+and two bounded topology-history warnings, with no ERROR entries. All five live
+agents remain converged at policy 496 / Service 203. Existing warnings remain
+stabilization work, not a claim of clean runtime logs.
+
+Shell syntax and the one-positive/43-negative publication gate and
+three-positive/141-negative movement gate pass after the mount correction.
+A complete corrected-image cl02 run is required before matching Kind.

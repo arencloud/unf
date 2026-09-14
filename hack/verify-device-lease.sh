@@ -12,6 +12,7 @@ target_ns=unf-dl-t-$suffix
 foreign=unf-dl-x-$suffix
 namespaces=()
 mounted=false
+mounted_bank_b=false
 receiver_pid=
 traffic_pids=()
 stage=setup
@@ -41,6 +42,7 @@ cleanup() {
         fi
     fi
     for namespace in "${namespaces[@]}"; do ip netns del "$namespace" || result=1; done
+    if [[ $mounted_bank_b == true ]]; then umount "$directory/unf-device-observation.bank-b/bpffs" || result=1; fi
     if [[ $mounted == true ]]; then umount "$directory/bpffs" || result=1; fi
     printf 'Device lease qualification exit=%s stage=%s evidence=%s\n' "$result" "$stage" "$directory"
     exit "$result"

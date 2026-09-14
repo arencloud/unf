@@ -3,7 +3,12 @@
 [[ ${UNF_DEVICE_LEASE_PARENT_FIXTURE:-} == yes && $directory =~ ^/tmp/unf-device-observation\.[a-zA-Z0-9]{6}$ && $seen == 70 ]]
 stage=generation-publication
 bank_a=$directory/bpffs
-bank_b=$bank_a/unf-device-observation.bank-b/bpffs
+bank_b=$directory/unf-device-observation.bank-b/bpffs
+# bpffs reserves dotted entry names. Keep the guarded diagnostic parent on
+# tmpfs and mount a second owned bpffs, never a dotted directory inside A.
+install -d -m 0700 "$bank_b"
+mount -t bpf bpf "$bank_b"
+mounted_bank_b=true
 install -d -m 0700 "$bank_b/maps"
 device-observation-loader /usr/local/lib/unf/device-lease "$bank_b" lease > "$directory/bank-b-verifier.log" 2>&1
 copy_public_row() {

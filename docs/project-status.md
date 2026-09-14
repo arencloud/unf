@@ -748,6 +748,9 @@ ADR 0377 adds a locally verified whole-program publication experiment, with
 sealed generation maps, exact retained map identities, per-sequence attribution
 and last-reference retirement under traffic. Its full cl02-before-Kind gate is
 pending; this does not activate a production locality consumer.
+Its first cl02 run failed creating a dotted bpffs entry before publication.
+ADR 0377 preserves that evidence and repairs private bank mount layout; a full
+corrected-image cl02 rerun must pass before Kind or any verified promotion.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

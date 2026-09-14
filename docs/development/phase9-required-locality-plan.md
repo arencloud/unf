@@ -122,6 +122,9 @@ ADR 0377 implements a locally checked whole-program dispatch experiment for
 generation-coherent publication and retirement, retaining sealed map descriptors
 and exact sequence attribution. The complete cl02-before-Kind gate is next;
 authenticated production attachment/address/route consumption remains open.
+The first cl02 publication run failed at the fixture's dotted bpffs directory.
+ADR 0377 records the corrected separate private mount and retained failure;
+the entire corrected-image cl02 gate remains required before Kind.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
