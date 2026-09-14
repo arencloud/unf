@@ -110,6 +110,10 @@ invalidation is the next lifetime investigation; full L3 and Phase 9 stay open.
 ADR 0374 adds locally checked references for all four endpoints so peer
 unregister can invalidate admission until explicit rebind. The expanded serial,
 slot-readback and concurrent gates require cl02-before-Kind qualification.
+ADR 0375 verifies that complete cl02 gate, including exact missing-peer slots
+through return, continued denial and explicit recovery. The bounded run has
+zero unobserved redirects by remaining revoked, not by transparent handoff.
+Matching Kind and the authenticated immutable production consumer remain open.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
