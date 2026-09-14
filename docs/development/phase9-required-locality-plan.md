@@ -114,6 +114,10 @@ ADR 0375 verifies that complete cl02 gate, including exact missing-peer slots
 through return, continued denial and explicit recovery. The bounded run has
 zero unobserved redirects by remaining revoked, not by transparent handoff.
 Matching Kind and the authenticated immutable production consumer remain open.
+ADR 0376 verifies that matching Kind gate, including all seventy serial checks,
+40,000 concurrent packets, sticky slot invalidation and explicit recovery.
+Generation-coherent publication and authenticated production consumption are next;
+full Phase 9 and stabilization remain open.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

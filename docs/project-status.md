@@ -741,6 +741,9 @@ ADR 0375 verifies the complete cl02 four-endpoint gate: exact sticky peer-slot
 invalidation, explicit recovery, seventy serial attempts and 40,000 concurrent
 packets with zero foreign delivery/socket loss/unobserved redirects. Admission
 stays revoked after movement; this is not transparent handoff. Kind is next.
+ADR 0376 verifies the identical complete Kind four-endpoint gate and retained
+log audit. Both kernels pass the isolated sticky-invalidation mechanism; safe
+generation publication and authenticated production consuming integration remain.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
