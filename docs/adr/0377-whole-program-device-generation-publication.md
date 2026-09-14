@@ -92,3 +92,29 @@ stabilization work, not a claim of clean runtime logs.
 Shell syntax and the one-positive/43-negative publication gate and
 three-positive/141-negative movement gate pass after the mount correction.
 A complete corrected-image cl02 run is required before matching Kind.
+
+## Retirement-observer correction
+
+The subsequent `bbf1cd1` image
+(`sha256:f67d47b53c364ca8a58c9ee5a1c527761a5d3afe25525ae3d2a84999201f91f9`)
+passes both mounts, all seventy serial checks, sticky movement (1,864 delivered,
+38,136 rejected, zero foreign/socket-loss/unobserved packets), map sealing,
+frozen-write rejection, empty dispatch and all 22 checked publications. It then
+fails the first map-retirement observer: `bpftool -j` reports ENOENT for map 2917
+in JSON stdout, while the fixture incorrectly searches stderr. The traffic
+processes are cleaned up, so this is still an incomplete publication run.
+
+The fix requires a failed lookup, empty stderr and exactly one JSON error
+matching the requested map ID and ENOENT. Wrong IDs, permission failures,
+extra/malformed fields and invalid IDs remain failures. One positive and eleven
+negative retirement-observer cases pass, as does replay of the retained actual
+failure response; the full one-positive/43-negative publication gate passes.
+No BPF, authority or lifetime criterion changes.
+
+Evidence `.artifacts/p9-device-lease-bbf1cd1-cl02/fixture.tgz` is preserved with
+SHA-256 `66af0421ded321d57b8d46b287ce063fbe5a45f6619f2f1ad509d7fccb1d8e9e`.
+All five agents finish converged at policy 499 / Service 203, Ready with zero
+restarts. Full before/during/publication/after logs retain 421 bounded-flow,
+32 proof-assistance, four bounded-topology and three key-publication warnings
+in the final window, with no ERROR entries. Another complete corrected-image
+cl02 run is required before Kind.

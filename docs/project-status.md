@@ -751,6 +751,9 @@ pending; this does not activate a production locality consumer.
 Its first cl02 run failed creating a dotted bpffs entry before publication.
 ADR 0377 preserves that evidence and repairs private bank mount layout; a full
 corrected-image cl02 rerun must pass before Kind or any verified promotion.
+The next rerun reaches all 22 publications but fails an ENOENT observer using
+stderr instead of JSON stdout. ADR 0377 adds exact-ID error validation and
+regressions; complete publication qualification remains pending.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

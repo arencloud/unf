@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 directory=$(mktemp -d /tmp/unf-device-publication-gate.XXXXXX)
+jq -ne -L hack 'include "device-lease-publication-gate";
+  {error:"get map by id (2917): No such file or directory"}|device_lease_retired_map(2917)' >/dev/null
+for record in 'null' '{}' '[]' '{error:"Operation not permitted"}' '{error:"get map by id (2918): No such file or directory"}' '{error:"get map by id (2917): No such file or directory",id:2917}' '{error:"get map by id (2917): No such file or directory followed by another error"}'; do
+    if jq -ne -L hack "include \"device-lease-publication-gate\"; $record|device_lease_retired_map(2917)" >/dev/null; then
+        printf 'Accepted invalid retirement observer: %s\n' "$record" >&2; exit 1
+    fi
+done
+for id in 0 -1 1.5 4294967296; do
+    if jq -ne -L hack --argjson id "$id" 'include "device-lease-publication-gate";
+        {error:"get map by id (\($id)): No such file or directory"}|device_lease_retired_map($id)' >/dev/null; then exit 1; fi
+done
+printf 'Retirement observer passed: 1 positive, 11 negative\n'
 jq -n '
 def sender($f): {schemaVersion:1,role:"sender",family:$f,runToken:[range(0;16)],sent:20000,elapsedNanos:20000000000,productionAuthority:false};
 def receiver($f;$n): {schemaVersion:1,role:"receiver",family:$f,runToken:[range(0;16)],received:$n,sequences:[range(0;$n)],socketDrops:0,queuedBytes:0,productionAuthority:false};

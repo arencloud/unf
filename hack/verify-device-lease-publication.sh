@@ -106,7 +106,10 @@ for map in P9LEASECFG P9LEASEPTR P9LEASEDEV P9LEASEOWN P9LEASETAG; do
         if bpftool -j map show id "$id" > "$directory/retired-$map-lookup.json" 2> "$directory/retired-$map-lookup.err"; then
             sleep 0.05
         else
-            grep -Fq 'No such file or directory' "$directory/retired-$map-lookup.err"
+            [[ ! -s $directory/retired-$map-lookup.err ]]
+            jq -e -L /usr/local/share/unf-qualification --argjson id "$id" \
+                'include "device-lease-publication-gate"; device_lease_retired_map($id)' \
+                "$directory/retired-$map-lookup.json" >/dev/null
             gone=true; break
         fi
     done

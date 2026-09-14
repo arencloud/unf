@@ -1,5 +1,11 @@
 include "device-lease-concurrency-gate";
 
+# bpftool -j writes failures to JSON stdout, not the human stderr channel.
+# Only the exact requested ID's ENOENT is evidence of retirement.
+def device_lease_retired_map($id):
+  ($id|natural and .>0 and .<=4294967295)
+  and .=={error:"get map by id (\($id)): No such file or directory"};
+
 def bank_ledger($tag; $outcome):
   .schemaVersion==1 and .capacity==65536 and .productionAuthority==false
   and (.entries|type)=="array" and (.entries|length)<=40000
