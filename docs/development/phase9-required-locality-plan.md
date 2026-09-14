@@ -125,6 +125,9 @@ authenticated production attachment/address/route consumption remains open.
 The first cl02 publication run failed at the fixture's dotted bpffs directory.
 ADR 0377 records the corrected separate private mount and retained failure;
 the entire corrected-image cl02 gate remains required before Kind.
+ADR 0378 verifies that complete corrected cl02 gate, including exact per-sequence
+publication attribution, last-reference retirement and frozen-bank invalidation.
+Matching retained Kind is next; no production locality permission is enabled.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

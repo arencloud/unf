@@ -754,6 +754,10 @@ corrected-image cl02 rerun must pass before Kind or any verified promotion.
 The next rerun reaches all 22 publications but fails an ENOENT observer using
 stderr instead of JSON stdout. ADR 0377 adds exact-ID error validation and
 regressions; complete publication qualification remains pending.
+ADR 0378 verifies the complete corrected cl02 publication gate: all 70 serial
+checks, sticky movement, exact attribution of 40,000 publication packets,
+last-reference retirement and frozen-bank kernel invalidation. Matching Kind is
+next; production locality consumption and full Phase 9/S1–S5 remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
