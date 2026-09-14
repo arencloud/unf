@@ -67,3 +67,12 @@ the workstation parser accepted it. The wrapper variable is renamed to
 evidence remain under `.artifacts/p9-device-observation-e47af7f-cl02`; private
 and Kubernetes namespaces are cleaned up. No diagnostic BPF was loaded, no
 live UNF program changed, and Kind is not advanced from this failed attempt.
+
+The corrected `3cc6735` fixture reaches the cl02 verifier but is rejected for
+misaligned variable stack access when selecting the skb-prefix word. The
+compiler elides alignment arithmetic that the older verifier still requires.
+The diagnostic configuration moves to schema 2 with an explicit bounded u64
+word index, leaving layout metadata in byte offsets. This is not a live map
+ABI migration. Full verifier/failure evidence is retained under
+`.artifacts/p9-device-observation-3cc6735-cl02`; no TC diagnostic attachment
+occurs and cleanup completes. A corrected complete cl02 run is still required.

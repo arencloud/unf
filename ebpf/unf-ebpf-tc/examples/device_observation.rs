@@ -13,7 +13,7 @@ use aya_ebpf::{
     programs::TcContext,
 };
 
-// schema, skb.dev byte offset, dev.ifindex, dev.nd_net.net, net.net_cookie,
+// schema=2, skb.dev u64-word index, dev.ifindex, dev.nd_net.net, net.net_cookie,
 // aligned netdev-private peer-pointer offset, expected ingress index, reserved.
 // The isolated loader must derive and validate offsets from the running BTF.
 #[map]
@@ -68,9 +68,8 @@ pub fn device_observation(ctx: TcContext) -> i32 {
 
 #[inline(always)]
 fn observe(ctx: &TcContext, config: &[u32; 8], result: &mut [u64; 8]) -> Result<(), u64> {
-    if config[0] != 1
-        || config[1] > 56
-        || config[1] % 8 != 0
+    if config[0] != 2
+        || config[1] > 7
         || config[2] > 8192
         || config[3] > 8192
         || config[4] > 65536
@@ -88,7 +87,7 @@ fn observe(ctx: &TcContext, config: &[u32; 8], result: &mut [u64; 8]) -> Result<
     // pointer arithmetic is performed on the verifier's context pointer.
     let prefix =
         unsafe { bpf_probe_read_kernel::<[u64; 8]>(ctx.as_ptr().cast()) }.map_err(|_| 2_u64)?;
-    let device = prefix[(config[1] / 8) as usize];
+    let device = prefix[config[1] as usize];
     result[2] = u64::from(read::<u32>(device, config[2]).map_err(|_| 3_u64)?);
     if result[2] != result[1] {
         return Err(10);

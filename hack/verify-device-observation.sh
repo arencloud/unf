@@ -85,7 +85,7 @@ encode64() { encode32 "$1" | tr -d ' '; printf '00000000'; }
 config() {
     local schema=$1 value
     jq -r --argjson schema "$schema" --argjson index "$host_index" \
-      '[$schema,.skbDevice,.deviceIndex,.deviceNet,.netCookie,.devicePeer,$index,0][]' "$directory/layout.json" > "$directory/config-values.txt"
+      '[$schema,(.skbDevice/8),.deviceIndex,.deviceNet,.netCookie,.devicePeer,$index,0][]' "$directory/layout.json" > "$directory/config-values.txt"
     : > "$directory/config-bytes.txt"
     while read -r value; do encode32 "$value" >> "$directory/config-bytes.txt"; done < "$directory/config-values.txt"
     local bytes
@@ -93,7 +93,7 @@ config() {
     [[ ${#bytes[@]} == 32 ]]
     bpftool map update pinned "$directory/bpffs/maps/P9DEVCFG" key hex 00 00 00 00 value hex "${bytes[@]}"
 }
-config 1
+config 2
 ip netns exec "$fabric" tc qdisc add dev "$host" clsact
 ip netns exec "$fabric" tc filter add dev "$host" ingress pref 1 handle 1 bpf da pinned "$directory/bpffs/program"
 probe() {
@@ -137,9 +137,9 @@ host=renamed0
 probe renamed4 "$peer" 4 "$peer_cookie" 0
 probe renamed6 "$peer" 6 "$peer_cookie" 0
 stage=invalid-config
-config 2
+config 3
 probe invalid-config "$peer" 4 "$peer_cookie" 1
-config 1
+config 2
 probe recovered-config "$peer" 4 "$peer_cookie" 0
 ip netns exec "$fabric" tc -j -s filter show dev "$host" ingress > "$directory/final-filter.json"
 [[ $count == 10 ]]
