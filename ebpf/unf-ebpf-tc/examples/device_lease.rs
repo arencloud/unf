@@ -8,7 +8,7 @@ use aya_ebpf::{
     bindings::TC_ACT_SHOT,
     helpers::{bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_redirect_peer},
     macros::{classifier, map},
-    maps::{Array, DevMap},
+    maps::{Array, DevMap, PerCpuArray},
     programs::TcContext,
 };
 
@@ -33,6 +33,31 @@ static P9LEASEOWN: Array<[u64; 13]> = Array::with_max_entries(4, 0);
 // Requested redirects are NOT observed application deliveries.
 #[map]
 static P9LEASERES: Array<[u64; 4]> = Array::with_max_entries(1, 0);
+// Separate counters for simultaneous IPv4/IPv6 senders. Userspace reads them
+// only after both senders stop; serial seed/status counters are never shared.
+#[map]
+static P9LEASECON: PerCpuArray<[u64; 3]> = PerCpuArray::with_max_entries(1, 0);
+
+#[classifier]
+pub fn device_lease_concurrent(ctx: TcContext) -> i32 {
+    if !probe(&ctx, 17778) {
+        return TC_ACT_SHOT;
+    }
+    let Some(output) = P9LEASECON.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    unsafe { (*output)[0] = (*output)[0].saturating_add(1) };
+    match redirect(&ctx) {
+        Ok(action) => {
+            unsafe { (*output)[1] = (*output)[1].saturating_add(1) };
+            action
+        }
+        Err(_) => {
+            unsafe { (*output)[2] = (*output)[2].saturating_add(1) };
+            TC_ACT_SHOT
+        }
+    }
+}
 
 #[classifier]
 pub fn device_lease_seed(ctx: TcContext) -> i32 {

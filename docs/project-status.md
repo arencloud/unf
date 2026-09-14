@@ -723,6 +723,10 @@ log/state review. Matching Kind and the production consuming boundary remain ope
 ADR 0370 verifies the identical retained-Kind gate and current/rotated log audit.
 Non-transmitting context acquisition passes both kernels; concurrent movement,
 immutable publication and authenticated production consumption remain next.
+ADR 0371 adds a locally checked bounded concurrent target-peer movement gate:
+sequenced dual-stack traffic, original/foreign receivers, socket-loss accounting,
+per-CPU counters and an explicit foreign positive control. cl02 then matching
+Kind remain required; production lifetime and Phase 9/S1–S5 stay open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -40,6 +40,7 @@ fn main() -> Result<()> {
         &[
             ("device_lease_seed", "seed"),
             ("device_lease_redirect", "program"),
+            ("device_lease_concurrent", "concurrent"),
         ]
     } else {
         &[("device_observation", "program")]
@@ -61,6 +62,7 @@ fn main() -> Result<()> {
             "P9LEASEDEV",
             "P9LEASEOWN",
             "P9LEASERES",
+            "P9LEASECON",
         ]
     } else {
         &["P9DEVCFG", "P9DEVOBS"]

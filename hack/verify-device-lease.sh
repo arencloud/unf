@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 [[ ${UNF_DEVICE_OBSERVATION_ISOLATED_CONTAINER:-} == yes && $EUID == 0 && $(uname -m) == x86_64 ]]
-for command in ip tc bpftool jq socat ss timeout mount umount od grep kernel-netns-cookie device-observation-loader device-owner-aliases device-context-seed; do command -v "$command" >/dev/null; done
+for command in ip tc bpftool jq socat ss timeout mount umount od grep kernel-netns-cookie device-observation-loader device-owner-aliases device-context-seed device-lease-traffic; do command -v "$command" >/dev/null; done
 directory=$(mktemp -d /tmp/unf-device-observation.XXXXXX)
 suffix=${directory##*.}
 fabric=unf-dl-f-$suffix
@@ -13,6 +13,7 @@ foreign=unf-dl-x-$suffix
 namespaces=()
 mounted=false
 receiver_pid=
+traffic_pids=()
 stage=setup
 source_host=unf012345678901
 host=unf012345678902
@@ -25,6 +26,7 @@ cleanup() {
     local result=$?
     trap - EXIT
     if [[ -n $receiver_pid ]]; then kill "$receiver_pid" 2>/dev/null || true; wait "$receiver_pid" 2>/dev/null || true; fi
+    for pid in "${traffic_pids[@]}"; do kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; done
     for namespace in "${namespaces[@]}"; do
         ip -n "$namespace" -j -details link show > "$directory/final-$namespace-links.json" || result=1
         ip -n "$namespace" -j addr show > "$directory/final-$namespace-addresses.json" || result=1
@@ -34,6 +36,9 @@ cleanup() {
     if [[ $mounted == true ]]; then
         # Deliberately never dump P9LEASEPTR: it contains a private kernel address.
         bpftool -j map dump pinned "$directory/bpffs/maps/P9LEASERES" > "$directory/final-map.json" 2> "$directory/final-map.err" || result=1
+        if [[ -e $directory/bpffs/maps/P9LEASECON ]]; then
+            bpftool -j map dump pinned "$directory/bpffs/maps/P9LEASECON" > "$directory/final-concurrent-map.json" 2> "$directory/final-concurrent-map.err" || result=1
+        fi
     fi
     for namespace in "${namespaces[@]}"; do ip netns del "$namespace" || result=1; done
     if [[ $mounted == true ]]; then umount "$directory/bpffs" || result=1; fi
@@ -118,16 +123,17 @@ install -d -m 0700 "$directory/bpffs/maps"
 device-observation-loader /usr/local/lib/unf/device-lease "$directory/bpffs" lease > "$directory/verifier.log" 2>&1
 bpftool -j prog show pinned "$directory/bpffs/program" > "$directory/program.json"
 bpftool -j prog show pinned "$directory/bpffs/seed" > "$directory/seed-program.json"
+bpftool -j prog show pinned "$directory/bpffs/concurrent" > "$directory/concurrent-program.json"
 encode64() {
     local value=$1
     printf '%02x%02x%02x%02x00000000' "$((value & 255))" "$(((value >> 8) & 255))" "$(((value >> 16) & 255))" "$(((value >> 24) & 255))"
 }
 set_config() {
-    local schema=$1 value words bytes
+    local schema=$1 target_cookie_namespace=${2:-$target_ns} value words bytes
     jq -r --argjson schema "$schema" '[$schema,(.skbDevice/8),.deviceIndex,.deviceNet,.netCookie,.devicePeer,201,301,202,302][]' "$directory/layout.json" > "$directory/config-values.txt"
     words=
     while read -r value; do words+=$(encode64 "$value"); done < "$directory/config-values.txt"
-    for namespace in "$fabric" "$source_ns" "$target_ns"; do words+=$(< "$directory/$namespace-cookie.txt"); done
+    for namespace in "$fabric" "$source_ns" "$target_cookie_namespace"; do words+=$(< "$directory/$namespace-cookie.txt"); done
     words+=000000000000000002444600010200000244460001010000
     jq -r '[.deviceFlags,.deviceAlias,.aliasData,0][]' "$directory/layout.json" > "$directory/config-owner-values.txt"
     while read -r value; do words+=$(encode64 "$value"); done < "$directory/config-owner-values.txt"
@@ -296,5 +302,80 @@ pair invalid-config "$source_ns" "$target_ns" no 0 1
 set_config 2
 pair restored-config "$source_ns" "$target_ns" yes 1 0
 [[ $seen == 62 && $redirects == 28 && $rejected == 34 && $delivered == 28 && $denied == 34 ]]
+stage=concurrent-target-movement
+ip netns exec "$fabric" tc filter replace dev "$source_host" ingress pref 1 handle 1 bpf da pinned "$directory/bpffs/concurrent"
+read_concurrent() {
+    local name=$1
+    bpftool -j map lookup pinned "$directory/bpffs/maps/P9LEASECON" key hex 00 00 00 00 > "$directory/$name-per-cpu.json"
+    jq -L /usr/local/share/unf-qualification 'include "device-lease-concurrency-gate"; device_lease_counters' "$directory/$name-per-cpu.json" > "$directory/$name-counters.json"
+}
+start_receivers() {
+    local name=$1 count=$2 seconds=$3 location namespace family pid ready
+    run_token=$(od -An -v -tx1 -N16 /dev/urandom | tr -d ' \n')
+    [[ $run_token =~ ^[0-9a-f]{32}$ && $run_token != 00000000000000000000000000000000 ]]
+    printf '%s\n' "$run_token" > "$directory/$name-token.txt"
+    for location in original foreign; do
+        if [[ $location == original ]]; then namespace=$target_ns; else namespace=$foreign; fi
+        for family in 4 6; do
+            timeout 40 ip netns exec "$namespace" device-lease-traffic receive "$run_token" "$family" "$count" "$seconds" > "$directory/$name-$location$family.json" 2> "$directory/$name-$location$family.err" &
+            pid=$!; traffic_pids+=("$pid"); ready=false
+            for _ in $(seq 1 40); do
+                if grep -Fxq "receiver-ready family=$family" "$directory/$name-$location$family.err"; then ready=true; break; fi
+                kill -0 "$pid"
+                sleep 0.05
+            done
+            [[ $ready == true ]]
+        done
+    done
+}
+start_senders() {
+    local name=$1 count=$2 interval=$3 family
+    for family in 4 6; do
+        timeout 35 ip netns exec "$source_ns" device-lease-traffic send "$run_token" "$family" "$count" "$interval" > "$directory/$name-sent$family.json" 2> "$directory/$name-sent$family.err" &
+        traffic_pids+=("$!")
+    done
+}
+finish_traffic() {
+    local name=$1 pid
+    for pid in "${traffic_pids[@]}"; do wait "$pid"; done
+    traffic_pids=()
+    read_concurrent "$name"
+    jq -n --slurpfile sent4 "$directory/$name-sent4.json" --slurpfile sent6 "$directory/$name-sent6.json" \
+      --slurpfile original4 "$directory/$name-original4.json" --slurpfile original6 "$directory/$name-original6.json" \
+      --slurpfile foreign4 "$directory/$name-foreign4.json" --slurpfile foreign6 "$directory/$name-foreign6.json" \
+      --slurpfile counters "$directory/$name-counters.json" \
+      '{sent4:$sent4[0],sent6:$sent6[0],original4:$original4[0],original6:$original6[0],foreign4:$foreign4[0],foreign6:$foreign6[0],counters:$counters[0]}' > "$directory/$name-traffic.json"
+}
+# Prove the foreign receiver/path works before testing its rejection. Only
+# this private diagnostic configuration temporarily names the foreign cookie.
+ip -n "$target_ns" link set eth0 netns "$foreign"
+configure_target "$foreign"
+set_config 2 "$foreign"
+seed_target foreign-control
+start_receivers control 20 3
+start_senders control 20 5000
+finish_traffic control
+ip -n "$foreign" link set eth0 netns "$target_ns"
+configure_target "$target_ns"
+set_config 2
+seed_target concurrent-recovered
+start_receivers stress 20000 30
+start_senders stress 20000 1000
+sleep 1
+for round in $(seq 1 10); do
+    ip -n "$target_ns" link set eth0 netns "$foreign"
+    configure_target "$foreign"
+    ip -n "$foreign" -j -details link show eth0 > "$directory/concurrent-$round-foreign-links.json"
+    sleep 0.2
+    ip -n "$foreign" link set eth0 netns "$target_ns"
+    configure_target "$target_ns"
+    ip -n "$target_ns" -j -details link show eth0 > "$directory/concurrent-$round-original-links.json"
+    sleep 0.2
+done
+finish_traffic stress
+ip netns exec "$fabric" tc -j -s filter show dev "$source_host" ingress > "$directory/concurrent-final-tc.json"
+jq -n -L /usr/local/share/unf-qualification --slurpfile control "$directory/control-traffic.json" --slurpfile stress "$directory/stress-traffic.json" \
+  'include "device-lease-concurrency-gate"; {control:$control[0],stress:$stress[0]}|device_lease_concurrency_gate' > "$directory/concurrency-result.json"
+jq -e -s --arg alias "${aliases[3]}" 'length==20 and all(.[];length==1 and .[0].ifindex==302 and .[0].ifalias==$alias and (.[0].flags|index("UP"))!=null)' "$directory"/concurrent-*-links.json >/dev/null
 stage=verified
-jq -n '{schemaVersion:3,result:"passed",scope:"isolated-two-ended-device-lease",positiveDeliveries:28,deniedDeliveries:34,requestedRedirects:28,guardRejections:34,fullOwnershipAliasComparison:true,nonTransmittingContextSeeds:4,rejectedContexts:2,kernelAdmitted:false,observedDelivery:false,productionAuthority:false,concurrentLifetimeVerified:false}'
+jq -n --slurpfile concurrency "$directory/concurrency-result.json" '{schemaVersion:4,result:"passed",scope:"isolated-two-ended-device-lease",positiveDeliveries:28,deniedDeliveries:34,requestedRedirects:28,guardRejections:34,fullOwnershipAliasComparison:true,nonTransmittingContextSeeds:6,rejectedContexts:2,concurrency:$concurrency[0],kernelAdmitted:false,observedDelivery:false,productionAuthority:false,concurrentLifetimeVerified:false}'

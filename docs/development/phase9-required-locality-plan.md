@@ -97,6 +97,9 @@ remains next; concurrent lifetime and authenticated production admission stay op
 ADR 0370 verifies the identical Kind context/traffic gate, cleanup and retained
 log review. Both kernels pass this prerequisite; concurrent movement and the
 immutable, authenticated production consuming boundary remain open.
+ADR 0371 implements the next bounded concurrent target-peer movement fixture,
+with exact sequences/run tokens, per-CPU counters and independent receiver-loss
+checks. Local checks pass; the complete cl02-before-Kind gate remains pending.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
