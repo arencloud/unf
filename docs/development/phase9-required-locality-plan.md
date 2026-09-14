@@ -107,6 +107,9 @@ Kind and production lifetime/publication/consumption remain open.
 ADR 0373 verifies that matching Kind experiment and full current/rotated log
 review. Its 43 unobserved redirects remain a finding. Four-endpoint device-map
 invalidation is the next lifetime investigation; full L3 and Phase 9 stay open.
+ADR 0374 adds locally checked references for all four endpoints so peer
+unregister can invalidate admission until explicit rebind. The expanded serial,
+slot-readback and concurrent gates require cl02-before-Kind qualification.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

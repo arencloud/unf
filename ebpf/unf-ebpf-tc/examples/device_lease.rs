@@ -15,7 +15,8 @@ use aya_ebpf::{
 // Schema, skb device word, index/net/cookie/peer offsets, source/target host
 // indices, source/target peer indices, fabric/source/target cookies, reserved,
 // target peer/host MACs; flags offset, alias pointer/data offsets, reserved.
-// Schema 2 adds full alias matching and administrative-up checks.
+// Schema 3 requires device references for all four endpoints. Peer namespace
+// movement unregisters its binding even when it later returns unchanged.
 #[map]
 static P9LEASECFG: Array<[u64; 20]> = Array::with_max_entries(1, 0);
 // Only a target-context seed may write this private pointer. Never export it
@@ -23,7 +24,7 @@ static P9LEASECFG: Array<[u64; 20]> = Array::with_max_entries(1, 0);
 #[map]
 static P9LEASEPTR: Array<u64> = Array::with_max_entries(1, 0);
 #[map]
-static P9LEASEDEV: DevMap = DevMap::with_max_entries(2, 0);
+static P9LEASEDEV: DevMap = DevMap::with_max_entries(4, 0);
 // Exact NUL-terminated, zero-padded aliases: source host/peer, target host/peer.
 // A production publisher must derive these from independently verified CNI
 // ownership; matching caller-supplied strings alone is not authentication.
@@ -80,6 +81,7 @@ pub fn device_lease_seed(ctx: TcContext) -> i32 {
     };
     if valid_config(config)
         && P9LEASEDEV.get_ifindex(1).map(u64::from) == Some(config[7])
+        && P9LEASEDEV.get_ifindex(3).map(u64::from) == Some(config[9])
         && u64::from(ifindex(&ctx)) == config[7]
     {
         if let Ok(device) = context_device(&ctx, config) {
@@ -130,11 +132,15 @@ fn redirect(ctx: &TcContext) -> Result<i32, u64> {
     if !valid_config(config) || u64::from(ifindex(ctx)) != config[6] {
         return Err(1);
     }
-    // Both immutable bindings must still exist before reading the seeded raw
-    // target pointer. Unregister removes the entry; RCU delays dev_put/free.
+    // All four immutable bindings must exist before reading the seeded raw
+    // target pointer. Unregister removes the actual endpoint's entry, including
+    // a peer moving namespace; return does not implicitly restore that entry.
+    // RCU delays dev_put/free. Namespace FD polling is not the revocation path.
     // This is an experimental lifetime construction, not a production proof.
     if P9LEASEDEV.get_ifindex(0).map(u64::from) != Some(config[6])
         || P9LEASEDEV.get_ifindex(1).map(u64::from) != Some(config[7])
+        || P9LEASEDEV.get_ifindex(2).map(u64::from) != Some(config[8])
+        || P9LEASEDEV.get_ifindex(3).map(u64::from) != Some(config[9])
     {
         return Err(2);
     }
@@ -172,7 +178,7 @@ fn redirect(ctx: &TcContext) -> Result<i32, u64> {
 
 #[inline(always)]
 fn valid_config(c: &[u64; 20]) -> bool {
-    c[0] == 2
+    c[0] == 3
         && c[1] <= 7
         && c[2] <= 8192
         && c[3] <= 8192

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use aya::{
     Pod,
-    maps::{Array, Map, MapData, MapType},
+    maps::{Array, Map, MapData, MapError, MapType, xdp::DevMap},
     programs::{SchedClassifier, TestRun, TestRunOptions},
 };
 
@@ -114,7 +114,7 @@ fn main() -> Result<()> {
     let arguments: Vec<_> = std::env::args_os().skip(1).collect();
     ensure!(
         arguments.len() == 2,
-        "expected private bpffs directory and device index"
+        "expected private bpffs directory and device index or bindings"
     );
     let directory = PathBuf::from(&arguments[0]);
     ensure!(
@@ -127,6 +127,31 @@ fn main() -> Result<()> {
                     .starts_with("unf-device-observation.")),
         "unexpected private pin directory"
     );
+    if arguments[1] == "bindings" {
+        let data = MapData::from_pin(directory.join("maps/P9LEASEDEV"))?;
+        ensure!(
+            data.info()?.map_type()? == MapType::DevMap,
+            "unexpected device map type"
+        );
+        let devices = DevMap::try_from(Map::DevMap(data))?;
+        ensure!(devices.len() == 4, "unexpected device binding capacity");
+        let mut bindings = Vec::with_capacity(4);
+        for index in 0..4 {
+            match devices.get(index, 0) {
+                Ok(value) => {
+                    ensure!(
+                        value.if_index > 1 && value.prog_id.is_none(),
+                        "unexpected device binding"
+                    );
+                    bindings.push(Some(value.if_index));
+                }
+                Err(MapError::KeyNotFound) => bindings.push(None),
+                Err(error) => return Err(error.into()),
+            }
+        }
+        println!("{}", serde_json::to_string(&bindings)?);
+        return Ok(());
+    }
     let ifindex: u32 = arguments[1]
         .to_str()
         .context("non-UTF8 device index")?

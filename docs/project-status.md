@@ -734,6 +734,9 @@ production consuming boundary remain open; no lossless-handoff claim is made.
 ADR 0373 verifies the identical bounded Kind gate with zero foreign/socket-loss
 observations and 43 unobserved redirects retained. Both baseline experiments
 pass; four-endpoint invalidation, attribution and production consumption are next.
+ADR 0374 implements the locally checked four-endpoint reference experiment,
+with sticky peer move/return invalidation, exact slot readback and explicit
+recovery. Its expanded 70-attempt and 40,000-packet gates await cl02 then Kind.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

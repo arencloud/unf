@@ -142,7 +142,7 @@ set_config() {
     [[ ${#bytes[@]} == 160 ]]
     bpftool map update pinned "$directory/bpffs/maps/P9LEASECFG" key hex 00 00 00 00 value hex "${bytes[@]}"
 }
-set_config 2
+set_config 3
 for owner in 0 1 2 3; do
     hex=$(printf '%s' "${aliases[$owner]}" | od -An -v -tx1 | tr '\n' ' ')
     read -r -a bytes <<< "$hex"
@@ -152,6 +152,12 @@ for owner in 0 1 2 3; do
     bpftool map update pinned "$directory/bpffs/maps/P9LEASEOWN" key hex "$key" 00 00 00 value hex "${bytes[@]}"
 done
 ip netns exec "$fabric" bpftool map update pinned "$directory/bpffs/maps/P9LEASEDEV" key hex 00 00 00 00 value hex c9 00 00 00 00 00 00 00
+ip netns exec "$source_ns" bpftool map update pinned "$directory/bpffs/maps/P9LEASEDEV" key hex 02 00 00 00 value hex ca 00 00 00 00 00 00 00
+require_bindings() {
+    local name=$1 expected=$2
+    device-context-seed "$directory/bpffs" bindings > "$directory/$name-bindings.json"
+    jq -e --argjson expected "$expected" '.==$expected' "$directory/$name-bindings.json" >/dev/null
+}
 read_result() {
     local name=$1
     bpftool -j map lookup pinned "$directory/bpffs/maps/P9LEASERES" key hex 00 00 00 00 > "$directory/$name-map.json"
@@ -170,12 +176,14 @@ seed_target() {
     jq -e '.[3]=="6400000000000000"' "$directory/$name-seed-words.json" >/dev/null
 }
 bind_target() {
-    local name=$1
+    local name=$1 peer_namespace=${2:-$target_ns}
     # The isolated sender is idle during explicit rebind. Production must use
     # distinct immutable incarnation entries/banks, not this serial test reset.
     bpftool map update pinned "$directory/bpffs/maps/P9LEASEPTR" key hex 00 00 00 00 value hex 00 00 00 00 00 00 00 00
     ip netns exec "$fabric" bpftool map update pinned "$directory/bpffs/maps/P9LEASEDEV" key hex 01 00 00 00 value hex 2d 01 00 00 00 00 00 00
+    ip netns exec "$peer_namespace" bpftool map update pinned "$directory/bpffs/maps/P9LEASEDEV" key hex 03 00 00 00 value hex 2e 01 00 00 00 00 00 00
     seed_target "$name"
+    require_bindings "$name" '[201,301,202,302]'
 }
 stage=initial-seed
 bind_target initial
@@ -255,17 +263,26 @@ pair renamed "$source_ns" "$target_ns" yes 1 0
 stage=target-peer-move
 ip -n "$target_ns" link set eth0 netns "$foreign"
 configure_target "$foreign"
-pair target-moved "$source_ns" "$foreign" no 0 6
+require_bindings target-moved '[201,301,202,null]'
+pair target-moved "$source_ns" "$foreign" no 0 2
 ip -n "$foreign" link set eth0 netns "$target_ns"
 configure_target "$target_ns"
-pair target-returned "$source_ns" "$target_ns" yes 1 0
+require_bindings target-returned '[201,301,202,null]'
+pair target-returned "$source_ns" "$target_ns" no 0 2
+bind_target target-peer-rebound
+pair target-peer-rebound "$source_ns" "$target_ns" yes 1 0
 stage=source-peer-move
 ip -n "$source_ns" link set eth0 netns "$foreign"
 configure_source "$foreign"
-pair source-moved "$foreign" "$target_ns" no 0 4
+require_bindings source-moved '[201,301,null,302]'
+pair source-moved "$foreign" "$target_ns" no 0 2
 ip -n "$foreign" link set eth0 netns "$source_ns"
 configure_source "$source_ns"
-pair source-returned "$source_ns" "$target_ns" yes 1 0
+require_bindings source-returned '[201,301,null,302]'
+pair source-returned "$source_ns" "$target_ns" no 0 2
+ip netns exec "$source_ns" bpftool map update pinned "$directory/bpffs/maps/P9LEASEDEV" key hex 02 00 00 00 value hex ca 00 00 00 00 00 00 00
+require_bindings source-peer-rebound '[201,301,202,302]'
+pair source-peer-rebound "$source_ns" "$target_ns" yes 1 0
 stage=peer-down
 ip -n "$target_ns" -j addr show eth0 > "$directory/peer-before-down-addresses.json"
 ip -n "$target_ns" link set eth0 down
@@ -297,11 +314,11 @@ pair replacement-unbound "$source_ns" "$target_ns" no 0 2
 bind_target replacement
 pair replacement-rebound "$source_ns" "$target_ns" yes 1 0
 stage=invalid-config
-set_config 1
-pair invalid-config "$source_ns" "$target_ns" no 0 1
 set_config 2
+pair invalid-config "$source_ns" "$target_ns" no 0 1
+set_config 3
 pair restored-config "$source_ns" "$target_ns" yes 1 0
-[[ $seen == 62 && $redirects == 28 && $rejected == 34 && $delivered == 28 && $denied == 34 ]]
+[[ $seen == 66 && $redirects == 28 && $rejected == 38 && $delivered == 28 && $denied == 38 ]]
 stage=concurrent-target-movement
 ip netns exec "$fabric" tc filter replace dev "$source_host" ingress pref 1 handle 1 bpf da pinned "$directory/bpffs/concurrent"
 read_concurrent() {
@@ -350,15 +367,15 @@ finish_traffic() {
 # this private diagnostic configuration temporarily names the foreign cookie.
 ip -n "$target_ns" link set eth0 netns "$foreign"
 configure_target "$foreign"
-set_config 2 "$foreign"
-seed_target foreign-control
+set_config 3 "$foreign"
+bind_target foreign-control "$foreign"
 start_receivers control 20 3
 start_senders control 20 5000
 finish_traffic control
 ip -n "$foreign" link set eth0 netns "$target_ns"
 configure_target "$target_ns"
-set_config 2
-seed_target concurrent-recovered
+set_config 3
+bind_target concurrent-recovered
 start_receivers stress 20000 30
 start_senders stress 20000 1000
 sleep 1
@@ -366,10 +383,12 @@ for round in $(seq 1 10); do
     ip -n "$target_ns" link set eth0 netns "$foreign"
     configure_target "$foreign"
     ip -n "$foreign" -j -details link show eth0 > "$directory/concurrent-$round-foreign-links.json"
+    require_bindings "concurrent-$round-foreign" '[201,301,202,null]'
     sleep 0.2
     ip -n "$foreign" link set eth0 netns "$target_ns"
     configure_target "$target_ns"
     ip -n "$target_ns" -j -details link show eth0 > "$directory/concurrent-$round-original-links.json"
+    require_bindings "concurrent-$round-original" '[201,301,202,null]'
     sleep 0.2
 done
 finish_traffic stress
@@ -377,5 +396,11 @@ ip netns exec "$fabric" tc -j -s filter show dev "$source_host" ingress > "$dire
 jq -n -L /usr/local/share/unf-qualification --slurpfile control "$directory/control-traffic.json" --slurpfile stress "$directory/stress-traffic.json" \
   'include "device-lease-concurrency-gate"; {control:$control[0],stress:$stress[0]}|device_lease_concurrency_gate' > "$directory/concurrency-result.json"
 jq -e -s --arg alias "${aliases[3]}" 'length==20 and all(.[];length==1 and .[0].ifindex==302 and .[0].ifalias==$alias and (.[0].flags|index("UP"))!=null)' "$directory"/concurrent-*-links.json >/dev/null
+stage=post-movement-explicit-recovery
+ip netns exec "$fabric" tc filter replace dev "$source_host" ingress pref 1 handle 1 bpf da pinned "$directory/bpffs/program"
+pair concurrent-returned-unbound "$source_ns" "$target_ns" no 0 2
+bind_target post-movement-rebound
+pair concurrent-rebound "$source_ns" "$target_ns" yes 1 0
+[[ $seen == 70 && $redirects == 30 && $rejected == 40 && $delivered == 30 && $denied == 40 ]]
 stage=verified
-jq -n --slurpfile concurrency "$directory/concurrency-result.json" '{schemaVersion:4,result:"passed",scope:"isolated-two-ended-device-lease",positiveDeliveries:28,deniedDeliveries:34,requestedRedirects:28,guardRejections:34,fullOwnershipAliasComparison:true,nonTransmittingContextSeeds:6,rejectedContexts:2,concurrency:$concurrency[0],kernelAdmitted:false,observedDelivery:false,productionAuthority:false,concurrentLifetimeVerified:false}'
+jq -n --slurpfile concurrency "$directory/concurrency-result.json" '{schemaVersion:5,result:"passed",scope:"isolated-four-endpoint-device-lease",positiveDeliveries:30,deniedDeliveries:40,requestedRedirects:30,guardRejections:40,fullOwnershipAliasComparison:true,nonTransmittingContextSeeds:8,rejectedContexts:2,stickyPeerInvalidation:true,concurrency:$concurrency[0],kernelAdmitted:false,observedDelivery:false,productionAuthority:false,concurrentLifetimeVerified:false}'
