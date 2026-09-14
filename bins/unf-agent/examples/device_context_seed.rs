@@ -1,10 +1,14 @@
 //! Non-transmitting context acquisition for the isolated device-lease fixture.
-use std::path::{Path, PathBuf};
+use std::{
+    io::Read as _,
+    os::fd::{AsFd as _, AsRawFd as _},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{Context, Result, ensure};
 use aya::{
     Pod,
-    maps::{Array, Map, MapData, MapError, MapType, xdp::DevMap},
+    maps::{Array, Map, MapData, MapError, MapType, ProgramArray, xdp::DevMap},
     programs::{SchedClassifier, TestRun, TestRunOptions},
 };
 
@@ -106,17 +110,7 @@ fn seed(directory: &Path, ifindex: u32) -> Result<()> {
     result
 }
 
-fn main() -> Result<()> {
-    ensure!(
-        std::env::var("UNF_DEVICE_OBSERVATION_ISOLATED_CONTAINER").as_deref() == Ok("yes"),
-        "isolated fixture opt-in required"
-    );
-    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
-    ensure!(
-        arguments.len() == 2,
-        "expected private bpffs directory and device index or bindings"
-    );
-    let directory = PathBuf::from(&arguments[0]);
+fn private_directory(directory: &Path) -> Result<()> {
     ensure!(
         directory.file_name().is_some_and(|name| name == "bpffs")
             && directory
@@ -127,6 +121,160 @@ fn main() -> Result<()> {
                     .starts_with("unf-device-observation.")),
         "unexpected private pin directory"
     );
+    Ok(())
+}
+
+fn frozen_fdinfo(value: &str) -> bool {
+    let rows: Vec<_> = value
+        .lines()
+        .filter_map(|line| line.strip_prefix("frozen:"))
+        .collect();
+    rows.len() == 1 && rows[0].trim() == "1"
+}
+
+fn exact_bank_maps(mut actual: Vec<u32>, mut expected: Vec<u32>) -> bool {
+    actual.sort_unstable();
+    expected.sort_unstable();
+    expected.len() == 7
+        && expected[0] != 0
+        && expected.windows(2).all(|pair| pair[0] != pair[1])
+        && actual == expected
+}
+
+fn publish(directory: &Path, bank: &Path) -> Result<()> {
+    private_directory(bank)?;
+    let mut expected_maps = Vec::with_capacity(7);
+    let mut held_maps = Vec::with_capacity(6);
+    let mut held_tag: Option<Array<MapData, u32>> = None;
+    for (name, kind, entries, bytes) in [
+        ("P9LEASECFG", MapType::Array, 1, 160),
+        ("P9LEASEPTR", MapType::Array, 1, 8),
+        ("P9LEASEDEV", MapType::DevMap, 4, 8),
+        ("P9LEASEOWN", MapType::Array, 4, 104),
+        ("P9LEASETAG", MapType::Array, 1, 4),
+    ] {
+        let map = MapData::from_pin(bank.join("maps").join(name))?;
+        let info = map.info()?;
+        expected_maps.push(info.id());
+        ensure!(
+            info.map_type()? == kind
+                && info.max_entries() == entries
+                && info.key_size() == 4
+                && info.value_size() == bytes,
+            "unexpected bank map shape"
+        );
+        let mut text = String::new();
+        std::fs::File::open(format!(
+            "/proc/self/fdinfo/{}",
+            map.fd().as_fd().as_raw_fd()
+        ))?
+        .take(4097)
+        .read_to_string(&mut text)?;
+        ensure!(
+            text.len() <= 4096 && frozen_fdinfo(&text),
+            "bank is not sealed"
+        );
+        if name == "P9LEASETAG" {
+            held_tag = Some(Array::try_from(Map::Array(map))?);
+        } else {
+            held_maps.push(map);
+        }
+    }
+    let tag = held_tag.context("missing sealed tag descriptor")?;
+    ensure!((1..=2).contains(&tag.get(&0, 0)?), "invalid bank tag");
+    for (name, kind, entries, bytes) in [
+        ("P9LEASECON", MapType::PerCpuArray, 1, 24),
+        ("P9LEASESEQ", MapType::Array, 65536, 8),
+    ] {
+        let map = MapData::from_pin(bank.join("maps").join(name))?;
+        let info = map.info()?;
+        ensure!(
+            info.map_type()? == kind
+                && info.max_entries() == entries
+                && info.key_size() == 4
+                && info.value_size() == bytes,
+            "unexpected bank observer map"
+        );
+        expected_maps.push(info.id());
+        held_maps.push(map);
+    }
+    let data = MapData::from_pin(directory.join("maps/P9LEASENEXT"))?;
+    let info = data.info()?;
+    ensure!(
+        info.map_type()? == MapType::ProgramArray && info.max_entries() == 1,
+        "unexpected dispatcher map"
+    );
+    let mut dispatch = ProgramArray::try_from(Map::ProgramArray(data))?;
+    let program = SchedClassifier::from_pin(bank.join("concurrent"))?;
+    let program_info = program.info()?;
+    let actual_maps = program_info
+        .map_ids()?
+        .context("unavailable program map identities")?;
+    ensure!(
+        exact_bank_maps(actual_maps, expected_maps),
+        "classifier does not own this exact bank"
+    );
+    let id = program_info.id();
+    dispatch.set(0, program.fd()?, 0)?;
+    // Hold every checked descriptor through the publication syscall. A removed
+    // pin cannot turn a checked map ID into a replacement object in this gap.
+    drop(tag);
+    drop(held_maps);
+    println!(
+        "{}",
+        serde_json::json!({"schemaVersion":1,"publishedProgramId":id,
+        "scope":"isolated-device-generation","productionAuthority":false})
+    );
+    Ok(())
+}
+
+fn ledger(directory: &Path) -> Result<()> {
+    let data = MapData::from_pin(directory.join("maps/P9LEASESEQ"))?;
+    ensure!(
+        data.info()?.map_type()? == MapType::Array,
+        "unexpected sequence map type"
+    );
+    let sequences: Array<_, [u32; 2]> = Array::try_from(Map::Array(data))?;
+    ensure!(sequences.len() == 65_536, "unexpected sequence capacity");
+    let mut entries = Vec::new();
+    for key in 0..sequences.len() {
+        let value = sequences.get(&key, 0)?;
+        if value != [0, 0] {
+            ensure!(
+                (1..=2).contains(&value[0]) && (1..=2).contains(&value[1]),
+                "invalid sequence observation"
+            );
+            entries.push([key, value[0], value[1]]);
+        }
+    }
+    println!(
+        "{}",
+        serde_json::json!({"schemaVersion":1,"capacity":65536,
+        "entries":entries,"productionAuthority":false})
+    );
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    ensure!(
+        std::env::var("UNF_DEVICE_OBSERVATION_ISOLATED_CONTAINER").as_deref() == Ok("yes"),
+        "isolated fixture opt-in required"
+    );
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    ensure!(
+        arguments.len() == 2 || (arguments.len() == 3 && arguments[1] == "publish"),
+        "expected private bpffs directory and index|bindings|ledger, or publish and a bank directory"
+    );
+    let directory = PathBuf::from(&arguments[0]);
+    private_directory(&directory)?;
+    if arguments[1] == "publish" {
+        ensure!(arguments.len() == 3, "publish requires a bank directory");
+        let bank = PathBuf::from(&arguments[2]);
+        return publish(&directory, &bank);
+    }
+    if arguments[1] == "ledger" {
+        return ledger(&directory);
+    }
     if arguments[1] == "bindings" {
         let data = MapData::from_pin(directory.join("maps/P9LEASEDEV"))?;
         ensure!(
@@ -168,6 +316,38 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sealing_requires_one_exact_frozen_fdinfo_field() {
+        assert!(frozen_fdinfo("map_type:\t2\nfrozen:\t1\n"));
+        for invalid in [
+            "",
+            "frozen:\t0\n",
+            "frozen:\t1\nfrozen:\t1\n",
+            "notfrozen:\t1\n",
+            "frozen:\t10\n",
+        ] {
+            assert!(!frozen_fdinfo(invalid));
+        }
+    }
+
+    #[test]
+    fn publication_requires_the_exact_distinct_generation_maps() {
+        let expected: Vec<_> = (1..=7).collect();
+        assert!(exact_bank_maps((1..=7).rev().collect(), expected.clone()));
+        for actual in [
+            vec![],
+            (1..=6).collect(),
+            (1..=8).collect(),
+            (2..=8).collect(),
+            vec![1, 2, 3, 4, 5, 6, 6],
+        ] {
+            assert!(!exact_bank_maps(actual, expected.clone()));
+        }
+        for invalid in [vec![], vec![0, 1, 2, 3, 4, 5, 6], vec![1, 2, 3, 4, 5, 6, 6]] {
+            assert!(!exact_bank_maps(invalid.clone(), invalid));
+        }
+    }
 
     #[test]
     fn context_exposes_only_the_requested_device_coordinate() {

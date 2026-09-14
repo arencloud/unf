@@ -118,6 +118,10 @@ ADR 0376 verifies that matching Kind gate, including all seventy serial checks,
 40,000 concurrent packets, sticky slot invalidation and explicit recovery.
 Generation-coherent publication and authenticated production consumption are next;
 full Phase 9 and stabilization remain open.
+ADR 0377 implements a locally checked whole-program dispatch experiment for
+generation-coherent publication and retirement, retaining sealed map descriptors
+and exact sequence attribution. The complete cl02-before-Kind gate is next;
+authenticated production attachment/address/route consumption remains open.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

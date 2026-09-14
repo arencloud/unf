@@ -8,7 +8,7 @@ use aya_ebpf::{
     bindings::TC_ACT_SHOT,
     helpers::{bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_redirect_peer},
     macros::{classifier, map},
-    maps::{Array, DevMap, PerCpuArray},
+    maps::{Array, DevMap, PerCpuArray, ProgramArray},
     programs::TcContext,
 };
 
@@ -38,6 +38,34 @@ static P9LEASERES: Array<[u64; 4]> = Array::with_max_entries(1, 0);
 // only after both senders stop; serial seed/status counters are never shared.
 #[map]
 static P9LEASECON: PerCpuArray<[u64; 3]> = PerCpuArray::with_max_entries(1, 0);
+// Whole-program publication experiment. Each classifier instance owns its
+// binding/configuration maps; only this dispatcher slot selects the instance.
+#[map]
+static P9LEASENEXT: ProgramArray = ProgramArray::with_max_entries(1, 0);
+#[map]
+static P9LEASEDIS: PerCpuArray<[u64; 3]> = PerCpuArray::with_max_entries(1, 0);
+// Optional private sequence ledger: tag 0 disables recording, 1/2 name the
+// two fixture generations. No packet-sized log stream or kernel pointer output.
+#[map]
+static P9LEASETAG: Array<u32> = Array::with_max_entries(1, 0);
+#[map]
+static P9LEASESEQ: Array<[u32; 2]> = Array::with_max_entries(65_536, 0);
+
+#[classifier]
+pub fn device_lease_dispatch(ctx: TcContext) -> i32 {
+    if !probe(&ctx, 17778) {
+        return TC_ACT_SHOT;
+    }
+    let Some(output) = P9LEASEDIS.get_ptr_mut(0) else {
+        return TC_ACT_SHOT;
+    };
+    unsafe { (*output)[0] = (*output)[0].saturating_add(1) };
+    // Successful tail calls do not return. An empty/incompatible/exhausted
+    // dispatch remains an explicit drop, never a native routing fallback.
+    unsafe { P9LEASENEXT.tail_call(&ctx, 0) };
+    unsafe { (*output)[2] = (*output)[2].saturating_add(1) };
+    TC_ACT_SHOT
+}
 
 #[classifier]
 pub fn device_lease_concurrent(ctx: TcContext) -> i32 {
@@ -48,16 +76,63 @@ pub fn device_lease_concurrent(ctx: TcContext) -> i32 {
         return TC_ACT_SHOT;
     };
     unsafe { (*output)[0] = (*output)[0].saturating_add(1) };
+    let ledger = match sequence_slot(&ctx) {
+        Ok(value) => value,
+        Err(()) => {
+            unsafe { (*output)[2] = (*output)[2].saturating_add(1) };
+            return TC_ACT_SHOT;
+        }
+    };
     match redirect(&ctx) {
         Ok(action) => {
+            if let Some((slot, tag)) = ledger {
+                unsafe { *slot = [tag, 1] };
+            }
             unsafe { (*output)[1] = (*output)[1].saturating_add(1) };
             action
         }
         Err(_) => {
+            if let Some((slot, tag)) = ledger {
+                unsafe { *slot = [tag, 2] };
+            }
             unsafe { (*output)[2] = (*output)[2].saturating_add(1) };
             TC_ACT_SHOT
         }
     }
+}
+
+#[inline(always)]
+fn sequence_slot(ctx: &TcContext) -> Result<Option<(*mut [u32; 2], u32)>, ()> {
+    let tag = P9LEASETAG.get(0).copied().ok_or(())?;
+    if tag == 0 {
+        return Ok(None);
+    }
+    if tag > 2 {
+        return Err(());
+    }
+    let (payload, family) = match u16::from_be(ctx.load::<u16>(12).map_err(|_| ())?) {
+        0x0800 => (42, 4_u8),
+        0x86dd => (62, 6_u8),
+        _ => return Err(()),
+    };
+    if ctx.load::<[u8; 8]>(payload).map_err(|_| ())? != *b"UNFDL001"
+        || ctx.load::<u8>(payload + 28).map_err(|_| ())? != family
+        || ctx.load::<[u8; 3]>(payload + 29).map_err(|_| ())? != [0; 3]
+    {
+        return Err(());
+    }
+    let sequence = u32::from_be(ctx.load::<u32>(payload + 24).map_err(|_| ())?);
+    if sequence >= 32_768 {
+        return Err(());
+    }
+    let key = sequence * 2 + u32::from(family == 6);
+    let slot = P9LEASESEQ.get_ptr_mut(key).ok_or(())?;
+    // Each bounded fixture sequence/family is sent once. A duplicate is an
+    // observer failure; counters will no longer reconcile with the ledger.
+    if unsafe { *slot } != [0, 0] {
+        return Err(());
+    }
+    Ok(Some((slot, tag)))
 }
 
 #[classifier]

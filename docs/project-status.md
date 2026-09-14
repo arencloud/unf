@@ -744,6 +744,10 @@ stays revoked after movement; this is not transparent handoff. Kind is next.
 ADR 0376 verifies the identical complete Kind four-endpoint gate and retained
 log audit. Both kernels pass the isolated sticky-invalidation mechanism; safe
 generation publication and authenticated production consuming integration remain.
+ADR 0377 adds a locally verified whole-program publication experiment, with
+sealed generation maps, exact retained map identities, per-sequence attribution
+and last-reference retirement under traffic. Its full cl02-before-Kind gate is
+pending; this does not activate a production locality consumer.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

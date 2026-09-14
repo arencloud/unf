@@ -23,5 +23,7 @@ COPY --from=builder /src/target/release/examples/device_lease_traffic /usr/local
 COPY .artifacts/unf-device-lease /usr/local/lib/unf/device-lease
 COPY hack/device-observation-layout.jq /usr/local/share/unf-qualification/device-observation-layout.jq
 COPY hack/device-lease-concurrency-gate.jq /usr/local/share/unf-qualification/device-lease-concurrency-gate.jq
+COPY hack/device-lease-publication-gate.jq /usr/local/share/unf-qualification/device-lease-publication-gate.jq
+COPY hack/verify-device-lease-publication.sh /usr/local/share/unf-qualification/verify-device-lease-publication.sh
 COPY hack/verify-device-lease.sh /usr/local/bin/verify-device-observation
 ENTRYPOINT ["bash", "/usr/local/bin/verify-device-observation"]

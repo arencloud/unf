@@ -402,5 +402,7 @@ pair concurrent-returned-unbound "$source_ns" "$target_ns" no 0 2
 bind_target post-movement-rebound
 pair concurrent-rebound "$source_ns" "$target_ns" yes 1 0
 [[ $seen == 70 && $redirects == 30 && $rejected == 40 && $delivered == 30 && $denied == 40 ]]
+UNF_DEVICE_LEASE_PARENT_FIXTURE=yes
+source /usr/local/share/unf-qualification/verify-device-lease-publication.sh
 stage=verified
-jq -n --slurpfile concurrency "$directory/concurrency-result.json" '{schemaVersion:5,result:"passed",scope:"isolated-four-endpoint-device-lease",positiveDeliveries:30,deniedDeliveries:40,requestedRedirects:30,guardRejections:40,fullOwnershipAliasComparison:true,nonTransmittingContextSeeds:8,rejectedContexts:2,stickyPeerInvalidation:true,concurrency:$concurrency[0],kernelAdmitted:false,observedDelivery:false,productionAuthority:false,concurrentLifetimeVerified:false}'
+jq -n --slurpfile concurrency "$directory/concurrency-result.json" --slurpfile publication "$directory/publication-result.json" '{schemaVersion:6,result:"passed",scope:"isolated-four-endpoint-device-lease",positiveDeliveries:30,deniedDeliveries:40,requestedRedirects:30,guardRejections:40,fullOwnershipAliasComparison:true,nonTransmittingContextSeeds:9,rejectedContexts:2,stickyPeerInvalidation:true,concurrency:$concurrency[0],publication:$publication[0],kernelAdmitted:false,observedDelivery:false,productionAuthority:false,concurrentLifetimeVerified:false}'

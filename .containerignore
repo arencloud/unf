@@ -19,4 +19,6 @@ hack/*
 !hack/verify-device-lease.sh
 !hack/device-observation-layout.jq
 !hack/device-lease-concurrency-gate.jq
+!hack/device-lease-publication-gate.jq
+!hack/verify-device-lease-publication.sh
 tests/
