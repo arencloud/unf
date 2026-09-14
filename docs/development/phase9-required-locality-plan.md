@@ -91,6 +91,9 @@ lifetime and the authenticated/banked production consumer remain open.
 ADR 0368 replaces fixture target seeding with a non-transmitting kernel-context
 invocation. Local adapter/workspace checks pass; wrong-context and full traffic
 qualification remain pending on cl02 before retained Kind.
+ADR 0369 verifies the complete cl02 context-acquisition and 62-probe traffic
+gate, including cleanup, fresh convergence and reviewed logs. Matching Kind
+remains next; concurrent lifetime and authenticated production admission stay open.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
