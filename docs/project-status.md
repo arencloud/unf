@@ -687,6 +687,9 @@ packets are dropped; no locality permission is enabled. Matching Kind is next.
 ADR 0360 records the matching Kind failure before BPF load on repeated split-
 module BTF definitions. A bounded all-layout agreement check passes two positive
 and 32 negative local cases; corrected cl02-before-Kind qualification is pending.
+ADR 0359 records the complete corrected-image cl02 rerun on `03984e9`, including
+all ten probes, cleanup, reviewed logs and eventual fresh convergence. The
+identical revised image remains pending on Kind.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

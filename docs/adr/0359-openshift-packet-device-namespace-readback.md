@@ -46,3 +46,27 @@ and incarnation binding, target discovery/lifetime, concurrent movement,
 banked generation publication, post-policy/Service/egress forwarding and measured
 cost remain open. `kernelAdmitted` and `observedDelivery` stay false. The same
 immutable fixture must pass retained Kind next; full Phase 9/S1–S5 stays open.
+
+## Split-module correction rerun
+
+After the failed first Kind gate and ADR 0360's checked metadata correction,
+source `03984e9` passes the full cl02 gate again on immutable image
+`quay.io/arencloud/unf-test-tools-dev@sha256:6ca231f6a4b26674bb16caa57eea671388150e884182e57b1aa5a8d30ee46ade`.
+The diagnostic BPF object hash, RHCOS offsets and program sizes above remain
+unchanged. Nine positive readbacks plus one invalid-configuration rejection
+pass at 00:22:27 UTC. All packets remain dropped.
+
+Evidence: `.artifacts/p9-device-observation-03984e9-cl02`, raw archive SHA-256
+`f3b33a0156df0fd77b5468cdd1da63f5612c2cbb2496654e487d2e3d98beb8d2`.
+Private resources and the Kubernetes Namespace are removed; Node UID is
+preserved. The first cleanup state read catches policy 462→463 reconciliation;
+the subsequent retained read confirms all five reports fresh/converged at
+policy 463 / Service 203. All live containers remain Ready with zero restarts.
+
+Before and final controller/all-agent/installer log windows cover the run and
+cleanup without reaching the byte cap. The final window has 422 bounded flow-
+history warnings, eight proof-assistance retries, three topology-history
+warnings and one reciprocal-key attestation rejection preceding this fixture.
+No live UNF ERROR, panic, OOM or verifier rejection is observed. These warnings
+remain stabilization findings, not clean-log evidence. The identical corrected
+image must now pass retained Kind; no full Phase 9 or stabilization claim changes.

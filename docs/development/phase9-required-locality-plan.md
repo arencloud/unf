@@ -66,6 +66,8 @@ continuous safe delivery and authenticated source/target ownership stay open.
 ADR 0360 records Kind's split-module metadata failure before BPF load and a
 locally checked all-layout agreement correction. The revised immutable fixture
 must pass cl02 before Kind; neither full platform row is closed by this repair.
+ADR 0359 records the corrected `03984e9` image's complete cl02 rerun; matching
+retained Kind remains required before this isolated readback primitive closes.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
