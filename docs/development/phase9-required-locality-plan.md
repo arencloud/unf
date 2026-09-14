@@ -135,6 +135,9 @@ ADR 0380 implements the locally verified joint attachment/route snapshot API,
 with descriptor-anchored route reads and sticky recheck/cancellation retirement.
 Its isolated cl02-before-Kind gate is next. Journal/placement authentication,
 bank consumption and scale-efficient inventory integration remain open.
+ADR 0381 verifies the complete isolated cl02 joint observation gate, including
+all 28 drift/recovery/cancellation checks and full log/state review. Matching
+Kind remains required before this snapshot prerequisite closes.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

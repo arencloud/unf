@@ -765,6 +765,9 @@ ADR 0380 adds locally verified opaque joint attachment/route observations using
 retained namespace descriptors and sticky failure/cancellation retirement.
 The 28-check isolated cl02-before-Kind gate is pending; no live packet path or
 production locality permission is changed.
+ADR 0381 verifies all 28 joint attachment/route observation checks on cl02,
+including exact missing route/neighbor roles and sticky cancellation retirement.
+Matching retained Kind is next; live journal/placement integration remains open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
