@@ -690,6 +690,10 @@ and 32 negative local cases; corrected cl02-before-Kind qualification is pending
 ADR 0359 records the complete corrected-image cl02 rerun on `03984e9`, including
 all ten probes, cleanup, reviewed logs and eventual fresh convergence. The
 identical revised image remains pending on Kind.
+ADR 0361 verifies that identical revised Kind fixture, all ten checks, exact
+cleanup and current/rotated log review. Packet-device/peer namespace readback
+is qualified on both kernels; authenticated lifetime-safe locality consumption,
+full Phase 9 qualification and S1–S5 remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

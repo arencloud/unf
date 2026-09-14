@@ -68,6 +68,9 @@ locally checked all-layout agreement correction. The revised immutable fixture
 must pass cl02 before Kind; neither full platform row is closed by this repair.
 ADR 0359 records the corrected `03984e9` image's complete cl02 rerun; matching
 retained Kind remains required before this isolated readback primitive closes.
+ADR 0361 verifies the matching corrected Kind gate with all ten checks and
+current/rotated logs. Both kernels support this isolated readback primitive;
+source/target ownership binding and lifetime-safe consumption remain next.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
