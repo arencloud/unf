@@ -15,6 +15,7 @@ hack/*
 !hack/verify-local-delivery-device-lifetime.sh
 !hack/local-delivery-device-gate.jq
 !hack/verify-veth-observation.sh
+!hack/verify-native-attachment-observation.sh
 !hack/verify-device-observation.sh
 !hack/verify-device-lease.sh
 !hack/device-observation-layout.jq

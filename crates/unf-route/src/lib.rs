@@ -8,7 +8,10 @@ use unf_cni_state::AttachmentRecord;
 use unf_link::{AssignedAddress, LinkReadback};
 
 mod kernel;
+mod observation;
 mod remote;
+
+pub use observation::NativeAttachmentObservation;
 
 pub use remote::{
     MAX_REMOTE_NODES, NativeIpv4NextHop, NativeIpv6NextHop, NativeRemoteNode,

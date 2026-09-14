@@ -761,6 +761,10 @@ next; production locality consumption and full Phase 9/S1–S5 remain open.
 ADR 0379 verifies the matching Kind publication gate and retained-log audit on
 the identical digest. Both isolated publication gates pass; authenticated
 production attachment/address/route integration is next, not Phase 9 closure.
+ADR 0380 adds locally verified opaque joint attachment/route observations using
+retained namespace descriptors and sticky failure/cancellation retirement.
+The 28-check isolated cl02-before-Kind gate is pending; no live packet path or
+production locality permission is changed.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

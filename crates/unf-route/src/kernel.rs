@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::Path;
 
 use futures::TryStreamExt;
@@ -148,6 +148,43 @@ impl NativeRoutePlan {
                 .chain(self.container_neighbors.iter())
                 .copied()
                 .collect(),
+        })
+    }
+
+    // Both connections are opened after entering the retained descriptor's
+    // namespace. Neither role is reopened from a pathname or inferred from
+    // the async executor thread's current namespace. This is still a snapshot.
+    pub(super) async fn readback_in_namespaces(
+        &self,
+        host: BorrowedFd<'_>,
+        peer: BorrowedFd<'_>,
+    ) -> Result<RouteReadback, RouteError> {
+        let duplicate = |fd: BorrowedFd<'_>| {
+            fd.try_clone_to_owned().map(File::from).map_err(|error| {
+                RouteError::Readback(format!("duplicate observed namespace: {error}"))
+            })
+        };
+        // Duplicate both before the first await; callers retain their originals.
+        let host_namespace = duplicate(host)?;
+        let peer_namespace = duplicate(peer)?;
+        let host_routes = self.host_routes;
+        let host_neighbors = self.host_neighbors;
+        let peer_routes = self.container_routes;
+        let peer_neighbors = self.container_neighbors;
+        let host = run_in_namespace(host_namespace, move || async move {
+            let handle = connect("open observed host route connection")?;
+            let state = inspect_local(&handle, &host_routes, &host_neighbors).await?;
+            require_complete(&state, NetworkNamespace::Host)
+        });
+        let peer = run_in_namespace(peer_namespace, move || async move {
+            let handle = connect("open observed peer route connection")?;
+            let state = inspect_local(&handle, &peer_routes, &peer_neighbors).await?;
+            require_complete(&state, NetworkNamespace::Container)
+        });
+        tokio::try_join!(host, peer)?;
+        Ok(RouteReadback {
+            routes: host_routes.into_iter().chain(peer_routes).collect(),
+            neighbors: host_neighbors.into_iter().chain(peer_neighbors).collect(),
         })
     }
 

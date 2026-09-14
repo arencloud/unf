@@ -131,6 +131,10 @@ Matching retained Kind is next; no production locality permission is enabled.
 ADR 0379 verifies that identical Kind publication/retirement gate, with complete
 sequence attribution and current/rotated log review. Both isolated mechanisms
 pass; authenticated production attachment/address/route consumption remains open.
+ADR 0380 implements the locally verified joint attachment/route snapshot API,
+with descriptor-anchored route reads and sticky recheck/cancellation retirement.
+Its isolated cl02-before-Kind gate is next. Journal/placement authentication,
+bank consumption and scale-efficient inventory integration remain open.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
