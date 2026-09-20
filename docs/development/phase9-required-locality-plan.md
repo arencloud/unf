@@ -149,6 +149,9 @@ exact address/UID matching, stale-cut checks, bounded selected copies and
 candidate-only counts. All 820 workspace tests and strict Clippy pass; no live rollout or
 kernel/packet admission is claimed. The retained Kind runtime is unavailable
 after the workstation reboot; fresh qualification cannot replace continuity evidence.
+ADR 0385 adds the locally verified opt-in live inventory counter/retirement
+observer, requiring the existing CNI UID/nonce and locality placement gates.
+Its complete cl02-first runtime gate remains pending; counts are not kernel proof.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

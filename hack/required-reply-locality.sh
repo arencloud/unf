@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Sourced by the reply gate. Read-only candidate observation, not packet proof.
 required_reply_locality_wait() {
-    local mode=$1 deadline=$((SECONDS+120)) attempt=0 attempt_dir node pod uid minimum valid
+    local mode=$1 deadline=$((SECONDS+120)) attempt=0 attempt_dir node pod uid minimum valid observed_after
+    observed_after=$(date +%s%3N)
     local -a records
     while (( SECONDS < deadline )); do
         attempt=$((attempt+1))
@@ -26,6 +27,16 @@ required_reply_locality_wait() {
             else
                 if ! jq -L "$project_root/hack" -e 'include "required-reply-locality"; locality_absent_valid' \
                     "$attempt_dir/$node-status.json" > "$attempt_dir/$node-check.json"; then valid=false; fi
+            fi
+            if [[ ${require_locality_inventory:-false} == true ]]; then
+                minimum=2; [[ $node != "$source_node" ]] || minimum=4
+                if ! jq -L "$project_root/hack" -e --arg mode "$mode" \
+                    --argjson minimum "$minimum" --argjson observed_after "$observed_after" '
+                    include "required-reply-locality";
+                    .observation.observedAtUnixMs >= $observed_after
+                    and (if $mode == "required" then locality_inventory_valid($minimum)
+                         else locality_inventory_absent_valid end)
+                ' "$attempt_dir/$node-status.json" > "$attempt_dir/$node-inventory-check.json"; then valid=false; fi
             fi
             records+=("$attempt_dir/$node-status.json")
         done

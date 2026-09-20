@@ -16,6 +16,11 @@ require_cni_ownership=${UNF_REQUIRED_REPLY_REQUIRE_CNI_OWNERSHIP:-false}
 [[ $require_cni_ownership == true || $require_cni_ownership == false ]]
 require_locality_candidate=${UNF_REQUIRED_REPLY_REQUIRE_LOCALITY_CANDIDATE:-false}
 [[ $require_locality_candidate == true || $require_locality_candidate == false ]]
+require_locality_inventory=${UNF_REQUIRED_REPLY_REQUIRE_LOCALITY_INVENTORY:-false}
+[[ $require_locality_inventory == true || $require_locality_inventory == false ]]
+if [[ $require_locality_inventory == true ]]; then
+    [[ $require_locality_candidate == true && $require_cni_ownership == true ]]
+fi
 [[ -z $(git -C "$project_root" status --porcelain) ]]
 git -C "$project_root" merge-base --is-ancestor "$UNF_REQUIRED_REPLY_RUNTIME_REVISION" HEAD
 context=${KUBE_CONTEXT:-$(kubectl --kubeconfig "$KUBECONFIG" config current-context)}
@@ -287,7 +292,8 @@ if [[ $require_locality_candidate == true ]]; then
     stage=locality-native-retirement
     required_reply_locality_wait native
     jq -n --slurpfile candidate "$directory/locality-required.json" --slurpfile retired "$directory/locality-native.json" \
-      '{scope:"placement-candidate-only",replayedAgents:($candidate[0]|length),retiredAgents:($retired[0]|length),kernelAdmitted:false,observedDelivery:false}' > "$directory/locality-candidate.json"
+      --argjson inventory "$require_locality_inventory" \
+      '{scope:"placement-candidate-only",replayedAgents:($candidate[0]|length),retiredAgents:($retired[0]|length),journalInventoryCountsVerified:$inventory,kernelAdmitted:false,observedDelivery:false}' > "$directory/locality-candidate.json"
 else
     printf 'null\n' > "$directory/locality-candidate.json"
 fi

@@ -780,6 +780,9 @@ address/UID matching and bounded selected copies. All 820 workspace tests and
 strict Clippy pass; cl02-first runtime qualification and kernel/packet consumption remain
 pending. The retained Kind runtime is unavailable after the workstation reboot;
 no fresh cluster or retained-state pass has been substituted.
+ADR 0385 adds the opt-in live journal-inventory observer: four positive and
+47 negative local cases pass alongside the existing locality regressions.
+The complete cl02 runtime/traffic gate remains pending, followed by Kind.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

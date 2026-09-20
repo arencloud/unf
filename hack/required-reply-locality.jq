@@ -35,3 +35,23 @@ def locality_absent_valid:
   and .matchesReportedIdentityAndRouting == false
   and .kernelAdmitted == false and .observedDelivery == false
   and .dataplaneReady == true;
+
+# Candidate counters only: never substitute these for per-attachment kernel
+# proof or for the separate API UID/nonce ownership gate.
+def locality_inventory_valid($minimum_addresses):
+  try (
+    .observation as $o
+    | ([$o.journalSelectedAttachments, $o.journalSelectedAddresses,
+        $o.journalSelectedPayloadBytes]
+       | all(.[]; type == "number" and . > 0 and . == floor))
+    and $o.journalSelectedAddresses >= $minimum_addresses
+    and $o.journalSelectedAddresses <= $o.localAddresses
+    and $o.journalSelectedAttachments <= $o.journalSelectedAddresses
+    and $o.journalSelectedAddresses <= (2 * $o.journalSelectedAttachments)
+    and $o.journalSelectedPayloadBytes <= 16777216
+  ) catch false;
+
+def locality_inventory_absent_valid:
+  .observation.journalSelectedAttachments == 0
+  and .observation.journalSelectedAddresses == 0
+  and .observation.journalSelectedPayloadBytes == 0;
