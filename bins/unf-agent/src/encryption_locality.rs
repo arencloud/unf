@@ -18,6 +18,7 @@ pub(super) struct PlacementCache {
     candidate: Option<(AdmittedNodeLocalPlanDigest, VerifiedEncryptionLocality)>,
     pending: Option<PendingPlacement>,
     work_slot: std::sync::Arc<tokio::sync::Semaphore>,
+    attachments: Option<super::cni_inventory::InventorySelection>,
 }
 
 struct PendingPlacement {
@@ -38,6 +39,7 @@ impl Default for PlacementCache {
             candidate: None,
             pending: None,
             work_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+            attachments: None,
         }
     }
 }
@@ -46,6 +48,7 @@ impl PlacementCache {
     pub(super) fn clear(&mut self) {
         self.candidate = None;
         self.pending = None;
+        self.attachments = None;
     }
 
     fn matches(&self, plan: &AdmittedNodeLocalPlan, context: &EncryptionLocalityContext) -> bool {
@@ -74,6 +77,9 @@ pub(super) struct PlacementObservation {
     context: Option<EncryptionLocalityContext>,
     plan_digest: Option<AdmittedNodeLocalPlanDigest>,
     local_addresses: usize,
+    journal_selected_attachments: usize,
+    journal_selected_addresses: usize,
+    journal_selected_payload_bytes: usize,
 }
 
 pub(super) fn record_observation(cache: &PlacementCache, state: &AgentState, failed: bool) {
@@ -88,6 +94,13 @@ pub(super) fn record_observation(cache: &PlacementCache, state: &AgentState, fai
         observation.context = Some(evidence.certificate().context().clone());
         observation.plan_digest = Some(*digest);
         observation.local_addresses = evidence.certificate().addresses().len();
+        if let Some(selected) = &cache.attachments {
+            (
+                observation.journal_selected_attachments,
+                observation.journal_selected_addresses,
+                observation.journal_selected_payload_bytes,
+            ) = selected.counts();
+        }
     } else if let Some(pending) = &cache.pending {
         observation.phase = PlacementPhase::Fetching;
         observation.context = Some(pending.context.clone());
@@ -225,6 +238,7 @@ pub(super) async fn synchronize(
         return Ok(());
     };
     if plans.locality.matches(plan, &context) {
+        refresh_attachments(&mut plans.locality, state, plan, &context).await?;
         return Ok(());
     }
     if let Some(pending) = &plans.locality.pending {
@@ -252,6 +266,7 @@ pub(super) async fn synchronize(
                 "replayed locality placement candidate; kernel admission remains separate"
             );
             plans.locality.candidate = Some((plan.admitted_digest, evidence));
+            refresh_attachments(&mut plans.locality, state, plan, &context).await?;
             return Ok(());
         }
     }
@@ -302,6 +317,30 @@ pub(super) async fn synchronize(
         plan_digest: plan.admitted_digest,
         task,
     });
+    Ok(())
+}
+
+async fn refresh_attachments(
+    cache: &mut PlacementCache,
+    state: &AgentState,
+    plan: &AdmittedNodeLocalPlan,
+    context: &EncryptionLocalityContext,
+) -> Result<()> {
+    let Some(inventory) = state.cni_inventory.get() else {
+        cache.attachments = None;
+        return Ok(());
+    };
+    let Some((_, evidence)) = &cache.candidate else {
+        cache.attachments = None;
+        return Ok(());
+    };
+    inventory
+        .refresh(&mut cache.attachments, evidence, context)
+        .await?;
+    if applied_context(plan, &context.cluster_id, state).as_ref() != Some(context) {
+        cache.attachments = None;
+        bail!("applied locality cut changed during journal selection");
+    }
     Ok(())
 }
 

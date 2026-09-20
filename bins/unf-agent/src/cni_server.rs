@@ -31,6 +31,10 @@ pub struct CniTransactionServer {
 }
 
 impl CniTransactionServer {
+    pub(super) fn inventory(&self) -> super::cni_inventory::CniAttachmentInventory {
+        super::cni_inventory::CniAttachmentInventory::new(Arc::clone(&self.journal))
+    }
+
     /// Opens durable state and binds the opt-in local transaction endpoint.
     ///
     /// # Errors

@@ -1,3 +1,4 @@
+mod cni_inventory;
 mod encryption_locality;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -907,6 +908,7 @@ struct AgentMetrics {
 }
 
 struct AgentState {
+    cni_inventory: std::sync::OnceLock<cni_inventory::CniAttachmentInventory>,
     node_name: String,
     pod_name: String,
     pod_uid: String,
@@ -2021,6 +2023,7 @@ async fn main() -> Result<()> {
     let egress_path_provider = native_egress_path_provider(&args)?;
     supervised_service_configured |= spawn_cni_transaction_server(
         &args,
+        &state,
         cni_provider,
         &cancellation,
         &mut tasks,
@@ -3012,6 +3015,7 @@ fn record_remote_route_error(state: &AgentState) {
 
 fn spawn_cni_transaction_server(
     args: &Args,
+    state: &AgentState,
     resolved: Option<ResolvedCniProvider>,
     cancellation: &CancellationToken,
     tasks: &mut JoinSet<()>,
@@ -3030,6 +3034,10 @@ fn spawn_cni_transaction_server(
         args.cni_status_lease_path.clone(),
         heartbeat,
     )?;
+    state
+        .cni_inventory
+        .set(server.inventory())
+        .map_err(|_| anyhow!("CNI attachment inventory was already bound to another server"))?;
     let server_cancellation = cancellation.clone();
     let failure_tx = failure_tx.clone();
     info!(
@@ -6649,6 +6657,7 @@ fn new_state(
     let mut registry = Registry::default();
     register_agent_metrics(&mut registry, &metrics);
     let state = AgentState {
+        cni_inventory: std::sync::OnceLock::new(),
         node_name,
         pod_name,
         pod_uid,
@@ -16746,7 +16755,7 @@ async fn consume_events(
                         ).await;
                         encryption_locality::record_observation(&encryption_plans.locality, state, locality_result.is_err());
                         if let Err(error) = locality_result {
-                            warn!(%error, "locality placement fetch failed; no local packet authority admitted");
+                            warn!(%error, "locality candidate preparation failed; no local packet authority admitted");
                         }
                     }
                     Err(error) => {

@@ -144,6 +144,11 @@ next; neither snapshot API alone grants production locality permission.
 ADR 0383 adds locally verified stale-safe journal cuts and bounded read copies.
 Actual agent inventory selection and locked consumption must use the cut; it is
 not itself journal/placement joining or a packet permission. Runtime gates remain.
+ADR 0384 joins the actual transaction-server journal to replayed placement with
+exact address/UID matching, stale-cut checks, bounded selected copies and
+candidate-only counts. All 820 workspace tests and strict Clippy pass; no live rollout or
+kernel/packet admission is claimed. The retained Kind runtime is unavailable
+after the workstation reboot; fresh qualification cannot replace continuity evidence.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

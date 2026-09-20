@@ -1,6 +1,6 @@
 # Phase 9 attested encryption-fabric execution plan
 
-Last reviewed: **2026-09-13**
+Last reviewed: **2026-09-21**
 
 Phase 9 implements master-prompt §25 as an identity-bound encryption fabric.
 It starts with kernel WireGuard for intra-cluster L3 transport and prepares a
@@ -26,7 +26,16 @@ separately revisioned. The authoritative state remains in
 
 ## Accepted Phase 9 gate
 
-Current repair checkpoint (ADRs 0316–0318): Native expiry/empty-Namespace
+Current checkpoint: L3 consuming integration remains open. ADRs 0381–0382
+qualify the isolated joint attachment/route observation on cl02 then Kind;
+ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the
+actual agent journal/placement candidate join, locally verified and
+not yet runtime-qualified. These prerequisites do not grant local Required
+packet permission. L4/L5 locality/replica matrices and Q full lifecycle remain
+pending; follow the [Required locality closure plan](phase9-required-locality-plan.md).
+The retained Kind runtime is currently unavailable after the workstation reboot.
+
+Historical repair checkpoint (ADRs 0316–0318): Native expiry/empty-Namespace
 continuity passes cl02 then matching-image retained Kind on runtime `5ea1bd2`.
 Required policy-tracked reply contracts are locally verified with explicit
 initiating-pair provenance and schema 2. ADR 0322 qualifies the scoped live
@@ -184,6 +193,12 @@ control-plane encryption, production availability, or production scale. Those
 require independent architecture and gates.
 
 ## Immediate next slice
+
+Qualify ADR 0384's candidate inventory on cl02 before matching Kind. Complete authenticated
+attachment/route and banked packet consumption before L4/L5/Q. No historical
+snapshot, candidate or isolated device gate closes full production locality.
+
+### Historical repair sequence
 
 Phase 9's historical closure on `cb59e90` (ADR 0292) was reopened by S1's
 locality/isolated-return findings (ADR 0293). ADR 0294 implements explicit Native

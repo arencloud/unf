@@ -775,6 +775,11 @@ ADR 0383 adds locally verified process-local journal cuts with persistence-error
 revocation and borrowed inventory iteration. Read-only requests no longer clone
 the complete inventory; pagination seeks directly to its bounded range. Actual
 agent joining, runtime qualification and resource measurements remain pending.
+ADR 0384 implements the actual shared-journal candidate join with exact
+address/UID matching and bounded selected copies. All 820 workspace tests and
+strict Clippy pass; cl02-first runtime qualification and kernel/packet consumption remain
+pending. The retained Kind runtime is unavailable after the workstation reboot;
+no fresh cluster or retained-state pass has been substituted.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

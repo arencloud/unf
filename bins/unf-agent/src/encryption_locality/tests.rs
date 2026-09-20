@@ -173,6 +173,70 @@ async fn locality_status_is_observational_and_never_kernel_or_delivery_authority
     assert!(!report.kernel_admitted && !report.observed_delivery);
 }
 
+#[tokio::test]
+async fn journal_selection_counts_remain_observational_and_clear_with_candidate() {
+    let (_directory, inventory) = crate::cni_inventory::tests::ready_inventory("pod-a").await;
+    let (evidence, context) = crate::cni_inventory::tests::placement("pod-a", 17, true);
+    let state = state();
+    let mut plan = plan();
+    plan.controller_epoch = context.identity_epoch;
+    plan.snapshot.membership_revision = context.membership_revision;
+    for epoch in [
+        &state.desired_identity_epoch,
+        &state.applied_identity_epoch,
+        &state.desired_remote_route_epoch,
+        &state.applied_remote_route_epoch,
+    ] {
+        epoch.store(context.identity_epoch, Ordering::Release);
+    }
+    for revision in [
+        &state.desired_identity_revision,
+        &state.applied_identity_revision,
+    ] {
+        revision.store(context.identity_revision.get(), Ordering::Release);
+    }
+    for revision in [
+        &state.desired_remote_route_revision,
+        &state.applied_remote_route_revision,
+    ] {
+        revision.store(context.routing_revision.get(), Ordering::Release);
+    }
+    assert!(state.cni_inventory.set(inventory).is_ok());
+    let mut cache = PlacementCache {
+        candidate: Some((plan.admitted_digest, evidence)),
+        ..PlacementCache::default()
+    };
+    refresh_attachments(&mut cache, &state, &plan, &context)
+        .await
+        .unwrap();
+    record_observation(&cache, &state, false);
+    let report = status_for(&state);
+    assert_eq!(report.observation.journal_selected_attachments, 1);
+    assert_eq!(report.observation.journal_selected_addresses, 2);
+    assert!(report.observation.journal_selected_payload_bytes > 0);
+    assert!(!report.kernel_admitted && !report.observed_delivery);
+    state
+        .desired_remote_route_revision
+        .store(99, Ordering::Release);
+    assert!(
+        refresh_attachments(&mut cache, &state, &plan, &context)
+            .await
+            .is_err()
+    );
+    assert!(cache.attachments.is_none());
+    record_observation(&cache, &state, true);
+    assert_eq!(status_for(&state).observation.journal_selected_addresses, 0);
+    cache.clear();
+    assert!(cache.attachments.is_none());
+    record_observation(&cache, &state, false);
+    let report = status_for(&state);
+    assert_eq!(report.observation.phase, PlacementPhase::Absent);
+    assert_eq!(report.observation.journal_selected_attachments, 0);
+    assert_eq!(report.observation.journal_selected_addresses, 0);
+    assert_eq!(report.observation.journal_selected_payload_bytes, 0);
+    assert!(!report.kernel_admitted && !report.observed_delivery);
+}
+
 async fn http_response(
     headers: &'static str,
     chunks: usize,
