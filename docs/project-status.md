@@ -787,6 +787,12 @@ ADR 0386 verifies a fresh existing-runtime cl02 baseline: 24 allowed requests,
 eight reverse denials, positive ciphertext, zero captured Required plaintext,
 zero capture loss and exact cleanup. `d007071` images are built, provenance
 checked and pushed, not yet deployed. Slow admission/retry findings remain open.
+ADR 0387 subsequently verifies guarded `d007071` rollout and byte-identical
+preservation of all 116 CNI records on cl02. **The expanded Required gate fails
+at selective admission**, with unknown epoch 6117 and deferred key catch-up.
+Fixture resources retire, but four encryption generations remain pending;
+ordinary Ready/converged reports do not close that recovery boundary. Repair
+and complete cl02 requalification precede Kind or any verified promotion.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

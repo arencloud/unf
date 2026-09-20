@@ -33,7 +33,10 @@ actual agent journal/placement candidate join, locally verified and
 not yet runtime-qualified. These prerequisites do not grant local Required
 packet permission. L4/L5 locality/replica matrices and Q full lifecycle remain
 pending; follow the [Required locality closure plan](phase9-required-locality-plan.md).
-The retained Kind runtime is currently unavailable after the workstation reboot.
+ADR 0387 subsequently deploys `d007071` to cl02, preserving all CNI journals,
+but the expanded gate fails at Required admission with missing-key-epoch and
+drain/catch-up warnings. This is the immediate repair priority, not a verified
+inventory runtime. The retained Kind runtime is unavailable after the workstation reboot.
 
 Historical repair checkpoint (ADRs 0316–0318): Native expiry/empty-Namespace
 continuity passes cl02 then matching-image retained Kind on runtime `5ea1bd2`.
@@ -194,7 +197,9 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Qualify ADR 0384's candidate inventory on cl02 before matching Kind. Complete authenticated
+Investigate and repair ADR 0387's missing-epoch/pending-generation failure,
+then rerun the complete inventory/Required gate on cl02 before matching Kind.
+Preserve the failed run and all authority state. Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical
 snapshot, candidate or isolated device gate closes full production locality.
 

@@ -3,6 +3,15 @@
 Requested 2026-09-12. Phase 9's closure (ADR 0292) was reopened by S1's
 transport coverage findings (ADR 0293). Phase 9 and S1–S5 remain open.
 
+2026-09-21 resume: ADRs 0384–0387 add bounded real-journal candidate selection,
+verify local tests and guarded cl02 rollout, but preserve a failed Required
+admission gate (missing key epoch 6117 and drain/catch-up deferrals). Retiring
+container streams contain 7,779 warnings during the controller replacement;
+an isolated version-check container also exceeds its SIGTERM grace period.
+These are reliability/efficiency findings, not measured resource improvements.
+The retained Kind environment is unavailable; no fresh-cluster result may be
+substituted for its retained-state continuity evidence.
+
 Current checkpoint: ADRs 0353–0354 qualify runtime `f984db9` on cl02, then
 retained Kind with identical images. The complete expanded cross-worker
 Required reply gate verifies runtime CNI ownership and placement-candidate

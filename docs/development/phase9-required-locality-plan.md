@@ -1,8 +1,9 @@
 # Phase 9 Required locality and replica closure
 
-This completes the open boundary from ADRs 0293–0294 and 0324. Existing
-`f984db9` fleets remain Native by default while this work is implemented and
-qualified. A successful scoped reply gate is not full Phase 9 closure.
+This completes the open boundary from ADRs 0293–0294 and 0324. cl02 now runs
+`d007071` with an unchanged Native baseline; its expanded Required admission
+gate failed (ADR 0387). The historical `f984db9` Kind runtime is unavailable
+after the workstation reboot. A successful scoped reply gate is not full Phase 9 closure.
 
 ## Safety and efficiency boundary
 
@@ -155,6 +156,11 @@ Its complete cl02-first runtime gate remains pending; counts are not kernel proo
 ADR 0386 requalifies the existing `f984db9` cl02 Required reply baseline before
 rollout and verifies/pushes immutable `d007071` candidate images. Admission
 retries remain recorded; the new inventory runtime is not yet qualified.
+ADR 0387 verifies the guarded `d007071` cl02 rollout and exact journal
+preservation, but its complete Required gate fails at generation admission.
+Missing key epoch 6117 and deferred drain/catch-up warnings require investigation
+before another platform promotion. Fixture cleanup succeeds; four pending
+encryption generations remain despite fresh ordinary policy/Service reports.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;
