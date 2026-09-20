@@ -152,6 +152,9 @@ after the workstation reboot; fresh qualification cannot replace continuity evid
 ADR 0385 adds the locally verified opt-in live inventory counter/retirement
 observer, requiring the existing CNI UID/nonce and locality placement gates.
 Its complete cl02-first runtime gate remains pending; counts are not kernel proof.
+ADR 0386 requalifies the existing `f984db9` cl02 Required reply baseline before
+rollout and verifies/pushes immutable `d007071` candidate images. Admission
+retries remain recorded; the new inventory runtime is not yet qualified.
 
 L3a (ADR 0327) implements runtime Pod-UID capture, versioned durable attachment
 ownership and veth incarnation cookies. 778 workspace tests and strict Clippy pass;

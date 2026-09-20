@@ -783,6 +783,10 @@ no fresh cluster or retained-state pass has been substituted.
 ADR 0385 adds the opt-in live journal-inventory observer: four positive and
 47 negative local cases pass alongside the existing locality regressions.
 The complete cl02 runtime/traffic gate remains pending, followed by Kind.
+ADR 0386 verifies a fresh existing-runtime cl02 baseline: 24 allowed requests,
+eight reverse denials, positive ciphertext, zero captured Required plaintext,
+zero capture loss and exact cleanup. `d007071` images are built, provenance
+checked and pushed, not yet deployed. Slow admission/retry findings remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
