@@ -7,7 +7,10 @@ Current checkpoint (2026-09-21): ADRs 0389–0391 repair tombstone-aware catalog
 retention and qualify the expanded reply/inventory gate on identical `8db97bb`
 images, cl02 before the separately approved persistent Kind. ADRs 0392–0394
 repair SIGTERM handling and pass isolated PID-1 SIGTERM/SIGINT gates on both
-platforms. Configured fabric rollout/recovery remains pending. The workstation
+platforms. ADR 0395 qualifies configured Native controller/one-agent recovery
+and the full scoped reply/inventory gate on cl02; matching live Kind is next.
+It retains a failed direct-deletion qualifier, 35-observation Required admission
+and controller-replacement retry bursts, not a seamless-recovery claim. The workstation
 installer mock still fails on its host-socket SELinux permission boundary;
 static package rendering passes, but no full mock pass is claimed. No resource
 savings, sustained-load envelope, L3 consumption or S1–S5 closure is claimed.

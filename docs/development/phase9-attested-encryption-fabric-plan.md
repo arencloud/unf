@@ -209,7 +209,9 @@ the historical failure, retry warnings and all authority state. Address the
 observed missing SIGTERM shutdown handling: ADR 0392 implements and locally
 regression-tests the service drain path. ADRs 0393–0394 repair the terminal-phase
 observer and qualify isolated PID-1 shutdown on cl02 then matching Kind.
-Guarded configured-fabric rollout/recovery is next, cl02 before Kind.
+ADR 0395 qualifies guarded cl02 rollout, Native configured shutdown/recovery
+and the expanded reply/inventory gate. Matching live Kind is next. The failed
+direct-Pod-deletion qualifier and slow Required admission remain recorded.
 Continue L3 production integration.
 Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical

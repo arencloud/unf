@@ -822,7 +822,12 @@ SIGTERM/SIGINT for both isolated PID-1 services on cl02 then matching Kind:
 eight successful exits, lifecycle logs, zero restarts and exact fixture retirement.
 The terminal-phase observer failure and ambient monitoring-Pod replacement are
 retained and explained. Configured fabric rollout/recovery remains next;
-live fleets still run `8db97bb` and full Phase 9 remains open.
+ADR 0395 then qualifies `6d71a30` on cl02: configured controller/one-agent
+Native shutdown/recovery with proven zero exits, unchanged 116 CNI records,
+24 traffic allows/eight denials and 131 WireGuard frames with zero Required
+plaintext/capture loss. The failed direct-deletion workflow, NodePorts rejection
+Pods and slow admission/retry warnings remain recorded. Matching live Kind
+still runs `8db97bb`; full Phase 9 remains open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
