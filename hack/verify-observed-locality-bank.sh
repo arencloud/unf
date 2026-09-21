@@ -21,6 +21,7 @@ peer_a=unf-ob-p-a-$suffix
 peer_b=unf-ob-p-b-$suffix
 namespaces=()
 declare -A namespace_inodes=()
+stage=create-namespaces
 cleanup() {
     local result=$?
     trap - EXIT
@@ -32,7 +33,7 @@ cleanup() {
     if [[ $result == 0 ]]; then
         printf 'observed-locality-suite: PASS native-checks=28 bank-checks=true namespace-cleanup=true packet-delivery-tested=false\n'
     else
-        printf 'observed-locality-suite: FAIL exit=%s\n' "$result"
+        printf 'observed-locality-suite: FAIL exit=%s stage=%s\n' "$result" "$stage"
     fi
     exit "$result"
 }
@@ -48,6 +49,12 @@ if [[ ${UNF_KERNEL_BANK_ISOLATED_CONTAINER:-} == yes ]]; then
     export UNF_KERNEL_BANK_BPFFS=$directory/bpffs
     mkdir "$UNF_KERNEL_BANK_BPFFS"
     mount -t bpf bpf "$UNF_KERNEL_BANK_BPFFS"
+    # Some kernels populate fresh bpffs with built-in iterator debug files.
+    # Preserve their exact identities; do not exclude names from the leak check.
+    LC_ALL=C find "$UNF_KERNEL_BANK_BPFFS" -mindepth 1 -printf '%y %D:%i %P\n' |
+        LC_ALL=C sort > "$directory/bpffs-before"
+    printf 'kernel-locality-bpffs-before:\n'
+    sed 's/^/  /' "$directory/bpffs-before"
     # Only the private fabric namespace changes forwarding, never host sysctls.
     ip netns exec "$fabric" bash -ec '
         printf "1\n" > /proc/sys/net/ipv4/ip_forward
@@ -58,13 +65,24 @@ fi
 host_cookie=$(ip netns exec "$fabric" kernel-netns-cookie)
 peer_a_cookie=$(ip netns exec "$peer_a" kernel-netns-cookie)
 peer_b_cookie=$(ip netns exec "$peer_b" kernel-netns-cookie)
+stage=bank-checks
 ip netns exec "$fabric" kernel-observed-bank "/var/run/netns/$peer_a" "/var/run/netns/$peer_b" "$host_cookie" "$peer_a_cookie" "$peer_b_cookie"
 for namespace in "${namespaces[@]}"; do
-    ip -n "$namespace" -j link show | jq -e 'length==1 and .[0].ifname=="lo"' >/dev/null
+    stage=check-links-$namespace
+    ip -n "$namespace" -j link show > "$directory/$namespace-links.json"
+    jq -c '{links:map({ifname,ifindex,link_index})}' "$directory/$namespace-links.json"
+    jq -e 'length==1 and .[0].ifname=="lo"' "$directory/$namespace-links.json" >/dev/null
 done
 if [[ ${UNF_KERNEL_BANK_ISOLATED_CONTAINER:-} == yes ]]; then
-    [[ -z $(find "$UNF_KERNEL_BANK_BPFFS" -mindepth 1 -print -quit) ]]
+    stage=check-bpffs-inventory
+    LC_ALL=C find "$UNF_KERNEL_BANK_BPFFS" -mindepth 1 -printf '%y %D:%i %P\n' |
+        LC_ALL=C sort > "$directory/bpffs-after"
+    printf 'kernel-locality-bpffs-after:\n'
+    sed 's/^/  /' "$directory/bpffs-after"
+    diff -u "$directory/bpffs-before" "$directory/bpffs-after"
+    stage=unmount-bpffs
     umount "$UNF_KERNEL_BANK_BPFFS"
     rmdir "$UNF_KERNEL_BANK_BPFFS"
     printf 'kernel-locality-suite: PASS bank-checks=true namespace-cleanup=true packet-delivery-tested=false\n'
 fi
+stage=delete-namespaces

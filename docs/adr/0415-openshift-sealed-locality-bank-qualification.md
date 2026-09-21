@@ -62,7 +62,20 @@ Complete fixture log SHA-256:
 `a9cb8af956e4be2df2778c1ce98d8f95f800e4f5c5eded6944c8ee4478ef5bb8`.
 All earlier failed attempts remain recorded in ADR 0414.
 
-Matching Kind must now pass the identical image. This fixture fabricates
+Matching Kind passed all 28 native checks and nineteen bank decisions but
+failed the final silent cleanup assertion. That complete attempt is retained
+under `.artifacts/p9-kernel-bank-b432bec-kind`; it is **not** a platform pass.
+Its temporary Namespace was removed and production journals remain identical.
+Read-only inspection of the Kind host finds kernel-created `maps.debug` and
+`progs.debug` entries in bpffs. The fixture now compares the exact typed,
+inode-bound inventory of its fresh private mount before/after the test,
+rather than assuming all kernels create empty filesystems. No filename is
+excluded and any new, missing or replaced object still fails. Stage and private
+link inventories make future cleanup failures explicit. Repeat the corrected
+immutable fixture on cl02 first, then Kind. Current Kind regular/init logs
+retain two peer-proof warnings and no ERROR; retained logs are also captured.
+
+This fixture fabricates
 trusted policy input and tests redirect requests, **not application delivery**.
 It does not close policy/Service/egress integration, protocol compatibility,
 real-agent startup/migration, restart continuity or L3/L4/L5/Q. No Phase 9 or
