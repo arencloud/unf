@@ -71,6 +71,9 @@ and measured stabilization remain pending.
 ADR 0431 qualifies mixed-MTU observation and actual selection readback with
 the complete startup/bank/socket diagnostic on cl02 then identical-image Kind.
 Production state is unchanged; full runtime and L3/L4/L5/Q remain open.
+ADR 0432 implements the policy-first forward bridge and dedicated continuation
+loading. Actual-main kernel qualification, reverse-Service composition, full
+publisher/writer delivery and restart continuity remain pending; no live rollout.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

@@ -1136,6 +1136,16 @@ pub const fn encryption_transport_is_usable(
 /// identity-pair decisions; missing authority remains fail closed.
 #[must_use]
 pub const fn encryption_config_is_active(config: &EncryptionMapConfig) -> bool {
+    encryption_config_has_admitted_cut(config) && config.decision_count > 0
+}
+
+/// Structural bounds for an admitted cut, including a wholly empty/quiescent
+/// generation. This is NOT transport authority: ordinary encryption still
+/// requires `encryption_config_is_active` and an exact usable decision. The
+/// local device consumer additionally requires current policy/Service revisions
+/// and independent per-address, per-incarnation kernel proofs.
+#[must_use]
+pub const fn encryption_config_has_admitted_cut(config: &EncryptionMapConfig) -> bool {
     config.schema_version == ENCRYPTION_MAP_ABI_VERSION
         && config.active_bank < ENCRYPTION_BANK_COUNT
         && config.generation != 0
@@ -1143,11 +1153,12 @@ pub const fn encryption_config_is_active(config: &EncryptionMapConfig) -> bool {
         && config.service_revision != 0
         && config.egress_revision != 0
         && config.epoch_count <= 2
-        && config.decision_count > 0
         && config.decision_count <= ENCRYPTION_DECISION_MAP_CAPACITY
         && config.transport_count <= ENCRYPTION_TRANSPORT_MAP_CAPACITY
         && (config.epoch_count > 0) == (config.transport_count > 0)
         && config.path_count <= ENCRYPTION_PATH_MAP_CAPACITY
+        && (config.decision_count > 0
+            || (config.transport_count == 0 && config.epoch_count == 0 && config.path_count == 0))
 }
 
 /// Replays the fixed-width identity decision invariants in the TC consumer.
@@ -1986,6 +1997,62 @@ mod tests {
             ENCRYPTION_DISPOSITION_REQUIRED
         ));
         assert!(!encryption_disposition_is_valid(0));
+    }
+
+    #[test]
+    fn empty_admitted_cut_is_not_transport_authority() {
+        let config = EncryptionMapConfig {
+            generation: 11,
+            policy_revision: 12,
+            service_revision: 13,
+            egress_revision: 14,
+            decision_count: 0,
+            transport_count: 0,
+            schema_version: ENCRYPTION_MAP_ABI_VERSION,
+            active_bank: 1,
+            epoch_count: 0,
+            path_count: 0,
+        };
+        assert!(encryption_config_has_admitted_cut(&config));
+        assert!(!encryption_config_is_active(&config));
+        for changed in [
+            EncryptionMapConfig {
+                generation: 0,
+                ..config
+            },
+            EncryptionMapConfig {
+                policy_revision: 0,
+                ..config
+            },
+            EncryptionMapConfig {
+                service_revision: 0,
+                ..config
+            },
+            EncryptionMapConfig {
+                egress_revision: 0,
+                ..config
+            },
+            EncryptionMapConfig {
+                schema_version: 0,
+                ..config
+            },
+            EncryptionMapConfig {
+                active_bank: ENCRYPTION_BANK_COUNT,
+                ..config
+            },
+            EncryptionMapConfig {
+                epoch_count: 1,
+                transport_count: 1,
+                ..config
+            },
+            EncryptionMapConfig {
+                path_count: 1,
+                ..config
+            },
+        ] {
+            assert!(!encryption_config_has_admitted_cut(&changed));
+            assert!(!encryption_config_is_active(&changed));
+        }
     }
 
     #[test]

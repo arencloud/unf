@@ -1,0 +1,21 @@
+# Actual main TC programs under BPF_PROG_TEST_RUN; no live TC attachment.
+ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
+ARG TEST_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:2e75bb2acb468f219fc852dcc46e5e09327ff15606a75ab896b2a085609364dd
+FROM ${RUST_IMAGE} AS builder
+ARG UNF_SOURCE_REVISION=unknown
+ENV UNF_BUILD_REVISION=${UNF_SOURCE_REVISION}
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY bins ./bins
+COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
+RUN cargo test --locked --release --package unf-agent --bin unf-agent --no-run \
+    && test "$(find target/release/deps -maxdepth 1 -type f -executable -name 'unf_agent-*' | wc -l)" = 1 \
+    && find target/release/deps -maxdepth 1 -type f -executable -name 'unf_agent-*' -exec cp '{}' /tmp/unf-main-tests ';'
+
+FROM ${TEST_IMAGE}
+ARG UNF_SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
+COPY --from=builder /tmp/unf-main-tests /usr/local/bin/unf-main-tests
+COPY .artifacts/unf-main-locality-test /usr/local/lib/unf/main-locality-test
+COPY hack/verify-main-locality-bridge.sh /usr/local/bin/verify-main-locality-bridge

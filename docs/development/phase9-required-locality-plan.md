@@ -162,6 +162,10 @@ qualification remains open, and this is not an S1 resource measurement.
 ADR 0431 passes the expanded mixed-MTU/selected-program diagnostic on cl02 then
 identical `5f03031` Kind, preserving journals and reviewing all retained logs.
 Actual publisher/writer/packet composition and L3/L4/L5/Q remain open.
+ADR 0432 adds the actual policy-first forward bridge and four dedicated
+continuations, including local DSR NAT revalidation and ordinary missing-bank
+fallback. Its real-main verifier/TestRun gate must pass cl02 before Kind.
+Reverse-Service composition and complete live delivery remain open; no rollout.
 
 ## Safety and efficiency boundary
 

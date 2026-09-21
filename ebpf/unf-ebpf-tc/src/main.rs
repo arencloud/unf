@@ -5,6 +5,8 @@
 #![feature(core_intrinsics)]
 #![allow(internal_features)]
 
+mod locality_runtime;
+
 use aya_ebpf::bindings::{
     BPF_F_MARK_MANGLED_0, BPF_F_PSEUDO_HDR, BPF_FIB_LKUP_RET_NO_NEIGH, BPF_FIB_LOOKUP_OUTPUT,
     BPF_FIB_LOOKUP_SRC, BPF_NOEXIST, TC_ACT_PIPE, TC_ACT_REDIRECT, TC_ACT_SHOT,
@@ -765,42 +767,30 @@ pub fn unf_policy_v6(ctx: TcContext) -> i32 {
 
 #[classifier]
 pub fn unf_encryption_v4(ctx: TcContext) -> i32 {
-    let action = encryption_finalizer::<false>(&ctx);
-    if action == ENCRYPTION_SECURE_NAT_DISPATCH {
+    let mut action = encryption_finalizer::<false>(&ctx);
+    if action == locality_runtime::DISPATCH {
         #[allow(unsafe_code)]
-        unsafe {
-            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, ENCRYPTION_SECURE_NAT_TAIL_V4)
-        };
-        return TC_ACT_SHOT;
+        unsafe { UL_DISPATCH_V1.tail_call(&ctx, 0) };
+        action = locality_runtime::TRANSPORT;
     }
-    if action == ENCRYPTION_DSR_DISPATCH {
-        #[allow(unsafe_code)]
-        unsafe {
-            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V4)
-        };
-        return dsr_route_failed();
+    if action == locality_runtime::TRANSPORT {
+        action = encryption_transport_finalizer::<false>(&ctx);
     }
-    action
+    locality_runtime::dispatch_transport::<false>(&ctx, action)
 }
 
 #[classifier]
 pub fn unf_encryption_v6(ctx: TcContext) -> i32 {
-    let action = encryption_finalizer::<true>(&ctx);
-    if action == ENCRYPTION_SECURE_NAT_DISPATCH {
+    let mut action = encryption_finalizer::<true>(&ctx);
+    if action == locality_runtime::DISPATCH {
         #[allow(unsafe_code)]
-        unsafe {
-            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, ENCRYPTION_SECURE_NAT_TAIL_V6)
-        };
-        return TC_ACT_SHOT;
+        unsafe { UL_DISPATCH_V1.tail_call(&ctx, 0) };
+        action = locality_runtime::TRANSPORT;
     }
-    if action == ENCRYPTION_DSR_DISPATCH {
-        #[allow(unsafe_code)]
-        unsafe {
-            SERVICE_DATAPLANE_TAIL_CALLS_V2.tail_call(&ctx, SERVICE_DSR_TAIL_V6)
-        };
-        return dsr_route_failed();
+    if action == locality_runtime::TRANSPORT {
+        action = encryption_transport_finalizer::<true>(&ctx);
     }
-    action
+    locality_runtime::dispatch_transport::<true>(&ctx, action)
 }
 
 #[classifier]
@@ -862,6 +852,26 @@ fn encryption_finalizer<const IPV6: bool>(ctx: &TcContext) -> i32 {
     if !observation.enforce {
         return TC_ACT_PIPE;
     }
+    if locality_runtime::prepare::<IPV6>(ctx, observation) {
+        return locality_runtime::DISPATCH;
+    }
+    // Return to the classifier before entering the ordinary transport island;
+    // do not add a retained BPF subprogram frame to that existing call chain.
+    locality_runtime::TRANSPORT
+}
+
+#[inline(never)]
+fn encryption_transport_finalizer<const IPV6: bool>(ctx: &TcContext) -> i32 {
+    let Some(observation_ptr) = FLOW_OBSERVATION_SCRATCH.get_ptr(0) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: same policy-authorized per-CPU observation; this continuation
+    // never repeats policy emission, frontend seeding or egress selection.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &*observation_ptr };
+    let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
+        return TC_ACT_SHOT;
+    };
     let selection = apply_encryption_selection::<IPV6>(ctx, observation);
     if selection != TC_ACT_PIPE {
         return selection;

@@ -12,7 +12,19 @@ umask 077
 image=$UNF_LOCALITY_GATE_IMAGE
 directory=$UNF_LOCALITY_GATE_DIAGNOSTICS
 suite=${UNF_LOCALITY_GATE_SUITE:-incarnation}
+memory_limit=256Mi
+cpu_limit=1
+deadline_seconds=180
+poll_attempts=100
 case $suite in
+    kernel-main-bridge)
+        test_command='["env","UNF_MAIN_LOCALITY_ISOLATED_CONTAINER=yes","bash","/usr/local/bin/verify-main-locality-bridge"]'
+        marker='main-locality-suite: PASS tests=4 actual-main=true missing-bank-fallback=true live-attachment=false bank-delivery=false$'
+        memory_limit=2Gi
+        cpu_limit=2
+        deadline_seconds=300
+        poll_attempts=160
+        ;;
     incarnation)
         test_command='["/usr/local/bin/kernel-incarnation-gate"]'
         marker='kernel-incarnation-gate: PASS schema=1 exact-revocation=true unrelated-preserved=true stale-serial-denied=true foreign-journal-denied=true cleanup=true packet-delivery-tested=false$'
@@ -82,6 +94,10 @@ cleanup() {
     if [[ $result == 0 ]]; then
         rg -q "$marker" "$directory/test.log" || result=1
     fi
+    if [[ $suite == kernel-main-bridge ]]; then
+        [[ $(rg -c 'main-locality-check: name=.* passed=true$' "$directory/test.log") == 4 ]] || result=1
+        [[ $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 4 ]] || result=1
+    fi
     if [[ $suite == kernel-delivery || $suite == kernel-admission || $suite == kernel-journal-floor || $suite == kernel-runtime-owner || $suite == kernel-agent-startup ]]; then
         if rg -q 'kernel-locality-delivery: PASS allowed=8 denied=16 protocols=tcp,udp families=4,6 request-bank=true reply-native=true production-policy=false$' "$directory/test.log" &&
             [[ $(rg -c 'kernel-locality-delivery: name=.* delivered=true ' "$directory/test.log") == 8 &&
@@ -115,10 +131,10 @@ namespace_uid=$(jq -er '.metadata.uid' "$directory/namespace.json")
 if [[ $UNF_LOCALITY_GATE_PLATFORM == cl02 ]]; then
     "${kc[@]}" -n "$namespace" create rolebinding gate-privileged --clusterrole=system:openshift:scc:privileged --serviceaccount="$namespace:default" >/dev/null
 fi
-jq -n --arg ns "$namespace" --arg node "$UNF_LOCALITY_GATE_NODE" --arg image "$image" --argjson command "$test_command" '{apiVersion:"v1",kind:"Pod",metadata:{name:"gate",namespace:$ns},spec:{nodeName:$node,hostNetwork:true,automountServiceAccountToken:false,restartPolicy:"Never",activeDeadlineSeconds:180,containers:[{name:"gate",image:$image,imagePullPolicy:"IfNotPresent",securityContext:{privileged:true,runAsUser:0},resources:{requests:{cpu:"100m",memory:"64Mi"},limits:{cpu:"1",memory:"256Mi"}},env:[{name:"UNF_LOCALITY_GATE_ISOLATED_CONTAINER",value:"yes"},{name:"UNF_OBSERVED_BANK_ISOLATED_CONTAINER",value:"yes"}],command:$command}]}}' > "$directory/pod.json"
+jq -n --arg ns "$namespace" --arg node "$UNF_LOCALITY_GATE_NODE" --arg image "$image" --argjson command "$test_command" --arg memory "$memory_limit" --arg cpu "$cpu_limit" --argjson deadline "$deadline_seconds" '{apiVersion:"v1",kind:"Pod",metadata:{name:"gate",namespace:$ns},spec:{nodeName:$node,hostNetwork:true,automountServiceAccountToken:false,restartPolicy:"Never",activeDeadlineSeconds:$deadline,containers:[{name:"gate",image:$image,imagePullPolicy:"IfNotPresent",securityContext:{privileged:true,runAsUser:0},resources:{requests:{cpu:"100m",memory:"64Mi"},limits:{cpu:$cpu,memory:$memory}},env:[{name:"UNF_LOCALITY_GATE_ISOLATED_CONTAINER",value:"yes"},{name:"UNF_OBSERVED_BANK_ISOLATED_CONTAINER",value:"yes"}],command:$command}]}}' > "$directory/pod.json"
 "${kc[@]}" create -f "$directory/pod.json" >/dev/null
 finished=false
-for _ in $(seq 1 100); do
+for _ in $(seq 1 "$poll_attempts"); do
     "${kc[@]}" -n "$namespace" get pod gate -o json > "$directory/pod-observation.json"
     phase=$(jq -r '.status.phase' "$directory/pod-observation.json")
     if [[ $phase == Succeeded ]]; then finished=true; break; fi

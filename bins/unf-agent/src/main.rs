@@ -7715,8 +7715,26 @@ fn attach_dataplane_programs<'ebpf>(
 }
 
 fn load_dataplane_tail_programs(ebpf: &mut Ebpf) -> Result<()> {
-    let mut program_fds = Vec::with_capacity(DATAPLANE_TAIL_PROGRAM_NAMES.len());
-    for program_name in DATAPLANE_TAIL_PROGRAM_NAMES {
+    load_tail_program_array(
+        ebpf,
+        DATAPLANE_TAIL_CALL_MAP_NAME,
+        &DATAPLANE_TAIL_PROGRAM_NAMES,
+    )?;
+    load_tail_program_array(
+        ebpf,
+        "UL_RESUME_V1",
+        &[
+            "unf_locality_resume_v4",
+            "unf_locality_resume_v6",
+            "unf_locality_nat_v4",
+            "unf_locality_nat_v6",
+        ],
+    )
+}
+
+fn load_tail_program_array(ebpf: &mut Ebpf, map_name: &str, names: &[&str]) -> Result<()> {
+    let mut program_fds = Vec::with_capacity(names.len());
+    for program_name in names {
         let program: &mut SchedClassifier = ebpf
             .program_mut(program_name)
             .with_context(|| format!("eBPF object does not contain program {program_name}"))?
@@ -7733,11 +7751,11 @@ fn load_dataplane_tail_programs(ebpf: &mut Ebpf) -> Result<()> {
                 .with_context(|| format!("clone {program_name} program descriptor"))?,
         );
     }
-    let mut tail_calls =
-        AyaProgramArray::try_from(ebpf.map_mut(DATAPLANE_TAIL_CALL_MAP_NAME).with_context(
-            || format!("eBPF object does not contain {DATAPLANE_TAIL_CALL_MAP_NAME}"),
-        )?)
-        .with_context(|| format!("open {DATAPLANE_TAIL_CALL_MAP_NAME} program array"))?;
+    let mut tail_calls = AyaProgramArray::try_from(
+        ebpf.map_mut(map_name)
+            .with_context(|| format!("eBPF object does not contain {map_name}"))?,
+    )
+    .with_context(|| format!("open {map_name} program array"))?;
     for (index, program_fd) in program_fds.iter().enumerate() {
         let index = u32::try_from(index).context("dataplane tail program index exceeds u32")?;
         tail_calls
@@ -23721,8 +23739,18 @@ mod tests {
 
     #[test]
     #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
-    #[allow(clippy::too_many_lines)]
     fn privileged_encryption_finalizer_is_dual_stack_late_bound_and_fail_closed() {
+        verify_encryption_finalizer(false);
+    }
+
+    #[test]
+    #[ignore = "requires root BPF program execution and UNF_EBPF_OBJECT"]
+    fn privileged_locality_bridge_missing_bank_keeps_exact_encryption_and_marks() {
+        verify_encryption_finalizer(true);
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn verify_encryption_finalizer(locality_bridge: bool) {
         const POLICY_REVISION: u64 = 12;
         const SERVICE_REVISION: u64 = 13;
         const EGRESS_REVISION: u64 = 14;
@@ -23969,6 +23997,26 @@ mod tests {
             .set(0, encryption_maps::encode_map_config(&config), 0)
             .unwrap();
 
+        let locality_input = if locality_bridge {
+            // Actual main runtime maps, not status flags. No bank is selected:
+            // the new bridge must populate its ABI and continue the ordinary
+            // Required/Native path without repeating the policy preamble.
+            let mut fence =
+                AyaArray::<_, [u8; 32]>::try_from(ebpf.take_map("UL_FENCE_V1").unwrap()).unwrap();
+            let mut value = [0; 32];
+            value[..8].copy_from_slice(&7_u64.to_ne_bytes());
+            value[8..16].copy_from_slice(&3_u64.to_ne_bytes());
+            value[16..24].copy_from_slice(&9_u64.to_ne_bytes());
+            value[24..26].copy_from_slice(&unf_ebpf_common::locality::ABI_VERSION.to_ne_bytes());
+            fence.set(0, value, 0).unwrap();
+            Some(
+                AyaPerCpuArray::<_, [u8; 80]>::try_from(ebpf.take_map("UL_INPUT_V1").unwrap())
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+
         let packet_v4 = ipv4_packet(6, source_v4, destination_v4, 40_000, 443);
         let packet_v6 = ipv6_packet(6, source_v6, destination_v6, 40_001, 443);
         let host_mark = 0x00aa_b100;
@@ -23995,10 +24043,24 @@ mod tests {
             run_tc(&mut ebpf, "unf_observe_ingress", &packet_v4).0,
             TC_ACT_PIPE
         );
+        if let Some(input) = &locality_input {
+            assert!(input.get(&0, 0).unwrap().iter().any(|row| row[70] == 4
+                && row[24..28] == source_v4.octets()
+                && row[40..44] == destination_v4.octets()
+                && row[72..74] == 40_000_u16.to_be_bytes()
+                && row[74..76] == 443_u16.to_be_bytes()));
+        }
         assert_eq!(
             run_tc(&mut ebpf, "unf_observe_ingress", &packet_v6).0,
             TC_ACT_PIPE
         );
+        if let Some(input) = &locality_input {
+            assert!(input.get(&0, 0).unwrap().iter().any(|row| row[70] == 6
+                && row[24..40] == source_v6.octets()
+                && row[40..56] == destination_v6.octets()
+                && row[72..74] == 40_001_u16.to_be_bytes()
+                && row[74..76] == 443_u16.to_be_bytes()));
+        }
         let native_syn = ipv4_packet(6, native_source_v4, native_destination_v4, 40_003, 8081);
         assert_eq!(
             run_tc(&mut ebpf, "unf_observe_ingress", &native_syn).0,
