@@ -1,0 +1,18 @@
+# Isolated real kernel bank fixture, never a production agent image.
+ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
+ARG TEST_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:6ce5d918c67fc5132065a94561d55112556fde5f04a95b96bc89d71cdd27ef0e
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY bins ./bins
+COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
+RUN cargo build --locked --release --package unf-locality --example kernel_observed_bank
+
+FROM ${TEST_IMAGE}
+ARG UNF_SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
+COPY --from=builder /src/target/release/examples/kernel_observed_bank /usr/local/bin/kernel-observed-bank
+COPY .artifacts/unf-locality-bank /usr/local/lib/unf/locality-bank
+COPY .artifacts/unf-locality-fixture /usr/local/lib/unf/locality-fixture
+COPY hack/verify-observed-locality-bank.sh /usr/local/bin/verify-observed-locality-bank

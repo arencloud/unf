@@ -2,6 +2,8 @@
 
 //! Versioned, fixed-layout data shared by eBPF programs and userspace.
 
+pub mod locality;
+
 use unf_common::{BackendId, IdentityId, PolicyId, RuleId, ServiceId, Verdict};
 
 pub use unf_common::PolicyDirection as Direction;

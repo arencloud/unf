@@ -7,6 +7,8 @@
 !.artifacts/unf-ebpf-tc
 !.artifacts/unf-device-observation
 !.artifacts/unf-device-lease
+!.artifacts/unf-locality-bank
+!.artifacts/unf-locality-fixture
 target/
 ebpf/unf-ebpf-tc/target/
 docs/

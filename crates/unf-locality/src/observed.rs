@@ -99,6 +99,7 @@ pub struct ObservedLocalityBank {
 pub struct LeasedLocalityBank {
     observed: ObservedLocalityBank,
     leases: Vec<IncarnationLease>,
+    cut: AttachmentJournalCut,
 }
 
 impl ObservedLocalityBank {
@@ -217,8 +218,11 @@ impl ObservedLocalityBank {
     }
 
     /// Bind every endpoint to the exact real journal under its transaction lock.
-    /// Call only after asynchronous observation, and retain this same lock/cut
-    /// through final publication. Supply freshly read applied placement context,
+    /// Call only after asynchronous observation. Kernel bank preparation may
+    /// release the transaction lock afterward, but final publication MUST call
+    /// `LeasedLocalityBank::validate_current` under that same journal's lock.
+    /// The saved original cut cannot be replaced with a later caller-supplied
+    /// cut. Supply freshly read applied placement context,
     /// not this object's saved context. No packet program is published here.
     ///
     /// # Errors
@@ -254,11 +258,54 @@ impl ObservedLocalityBank {
         Ok(LeasedLocalityBank {
             observed: self,
             leases,
+            cut: cut.clone(),
         })
     }
 }
 
 impl LeasedLocalityBank {
+    /// Final publication fence after off-lock kernel-bank preparation. Hold the
+    /// real CNI transaction lock through this check AND dispatch publication.
+    /// Supply freshly observed applied placement context, not the saved value.
+    ///
+    /// Checking the original journal cut makes this independent of inventory
+    /// size: any attempted retirement/mutation (including failed persistence)
+    /// invalidates that cut. This gate only issues/reuses leases for current
+    /// records; it cannot silently rearm a revoked lease at the same cut.
+    /// Kernel ownership/route checks and sealing are additional prerequisites.
+    ///
+    /// # Errors
+    /// Rejects retired observations, foreign/changed journals or gates, changed
+    /// applied placement and gates retired by ambiguous issuance failure.
+    pub fn validate_current(
+        &self,
+        journal: &AttachmentJournal,
+        gate: &IncarnationGate,
+        current: &EncryptionLocalityContext,
+    ) -> Result<(), LocalityBankError> {
+        if self.observed.endpoints.is_none()
+            || self.observed.context != *current
+            || !journal.is_current(&self.cut)
+            || !gate.matches_journal(journal)
+            || !gate.publication_live()?
+            || self
+                .leases
+                .first()
+                .is_some_and(|lease| !gate.owns_lease(lease))
+        {
+            return Err(LocalityBankError::Invalid(
+                "prepared bank publication fence",
+            ));
+        }
+        // All leases were issued by the same gate in bind; no public mutation
+        // or constructor can mix gates. Do not scan N records under this lock.
+        Ok(())
+    }
+
+    pub(crate) async fn recheck(&mut self) -> Result<(), LocalityBankError> {
+        self.observed.recheck().await
+    }
+
     #[must_use]
     pub const fn observed(&self) -> &ObservedLocalityBank {
         &self.observed

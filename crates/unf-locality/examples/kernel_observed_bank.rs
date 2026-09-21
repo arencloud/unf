@@ -17,6 +17,9 @@ use unf_link::VethPlan;
 use unf_locality::{IncarnationGate, LocalityObservationWorker, ObservedLocalityBank};
 use unf_route::{NativeRoutePlan, NativeRoutingProvider, RoutingProvider};
 
+#[path = "support/kernel_bank.rs"]
+mod kernel_bank;
+
 fn request(operation: TransactionOperation) -> TransactionRequest {
     TransactionRequest::new(CNI_TRANSACTION_SCHEMA_VERSION, operation)
 }
@@ -160,6 +163,7 @@ async fn verify_failure_retirement(
 }
 
 #[tokio::main(flavor = "current_thread")]
+#[allow(clippy::too_many_lines)] // One ordered disposable journal/namespace lifecycle.
 async fn main() {
     assert_eq!(
         std::env::var("UNF_OBSERVED_BANK_ISOLATED_CONTAINER").as_deref(),
@@ -220,6 +224,13 @@ async fn main() {
     let foreign_bank = prepare(provider, &records, &evidence, &context).await;
     assert!(foreign_bank.bind(&journal, &cut, &gate, &foreign).is_err());
     let pending = prepare(provider, &records, &evidence, &context).await;
+    if std::env::var("UNF_KERNEL_BANK_ISOLATED_CONTAINER").as_deref() == Ok("yes") {
+        let bank = prepare(provider, &records, &evidence, &context).await;
+        let leased = bank.bind(&journal, &cut, &gate, &context).unwrap();
+        kernel_bank::verify(leased, &mut journal, &gate, &context, &second_plan)
+            .await
+            .unwrap();
+    }
     journal
         .apply(request(TransactionOperation::BeginDelete {
             key: records[0].spec.key.clone(),

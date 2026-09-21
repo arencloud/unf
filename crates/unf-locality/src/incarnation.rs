@@ -50,6 +50,16 @@ pub struct IncarnationLease {
 }
 
 impl IncarnationLease {
+    pub(crate) fn duplicate_map_fd(&self) -> Result<OwnedFd, LocalityGateError> {
+        use aya::maps::IterableMap as _;
+        Ok(lock(&self.gate)?
+            .map
+            .map()
+            .fd()
+            .as_fd()
+            .try_clone_to_owned()?)
+    }
+
     #[must_use]
     pub const fn nonce(&self) -> &[u8; 32] {
         &self.nonce
@@ -77,6 +87,14 @@ impl AttachmentRetirement for Retirer {
 }
 
 impl IncarnationGate {
+    pub(crate) fn owns_lease(&self, lease: &IncarnationLease) -> bool {
+        Arc::ptr_eq(&self.state, &lease.gate)
+    }
+
+    pub(crate) fn publication_live(&self) -> Result<bool, LocalityGateError> {
+        Ok(!lock(&self.state)?.issuance_retired)
+    }
+
     pub(crate) fn matches_journal(&self, journal: &AttachmentJournal) -> bool {
         journal.retirement_matches(&self.registration)
     }

@@ -43,6 +43,13 @@ for namespace in "$fabric" "$peer_a" "$peer_b"; do
     namespace_inodes[$namespace]=$(stat -Lc '%d:%i' "/var/run/netns/$namespace")
     ip -n "$namespace" link set lo up
 done
+if [[ ${UNF_KERNEL_BANK_ISOLATED_CONTAINER:-} == yes ]]; then
+    # Dedicated mount inside this disposable Pod; no host bpffs bind mount.
+    mkdir -p /sys/fs/bpf/unf-isolated-bank
+    mount -t bpf bpf /sys/fs/bpf/unf-isolated-bank
+    # Only the private fabric namespace changes forwarding, never host sysctls.
+    ip netns exec "$fabric" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
+fi
 host_cookie=$(ip netns exec "$fabric" kernel-netns-cookie)
 peer_a_cookie=$(ip netns exec "$peer_a" kernel-netns-cookie)
 peer_b_cookie=$(ip netns exec "$peer_b" kernel-netns-cookie)
@@ -50,3 +57,9 @@ ip netns exec "$fabric" kernel-observed-bank "/var/run/netns/$peer_a" "/var/run/
 for namespace in "${namespaces[@]}"; do
     ip -n "$namespace" -j link show | jq -e 'length==1 and .[0].ifname=="lo"' >/dev/null
 done
+if [[ ${UNF_KERNEL_BANK_ISOLATED_CONTAINER:-} == yes ]]; then
+    [[ -z $(find /sys/fs/bpf/unf-isolated-bank -mindepth 1 -print -quit) ]]
+    umount /sys/fs/bpf/unf-isolated-bank
+    rmdir /sys/fs/bpf/unf-isolated-bank
+    printf 'kernel-locality-suite: PASS bank-checks=true namespace-cleanup=true packet-delivery-tested=false\n'
+fi

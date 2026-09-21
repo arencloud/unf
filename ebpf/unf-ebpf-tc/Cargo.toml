@@ -18,6 +18,14 @@ unf-ebpf-common = { path = "../unf-ebpf-common" }
 name = "unf-ebpf-tc"
 path = "src/main.rs"
 
+[[bin]]
+name = "unf-ebpf-locality"
+path = "src/locality_bank.rs"
+
+[[bin]]
+name = "unf-ebpf-locality-fixture"
+path = "src/locality_fixture.rs"
+
 [profile.dev]
 panic = "abort"
 

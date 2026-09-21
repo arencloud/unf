@@ -906,6 +906,11 @@ common key activations 163/164, 24 allows/eight denials, 73 WireGuard/zero Requi
 plaintext frames and unchanged journals. All logs are reviewed (56 overlapping
 current/retained warnings, no ERROR). Both fleets now run `45d85d5`; production
 L3 bank/packet integration and full L4/L5/Q qualification are next, not verified.
+ADR 0414 implements the separate sealed endpoint-linear bank, bounded kernel
+preparation and exact-runtime/original-cut publisher. Its isolated consumer
+requires cl02-before-Kind qualification. Live agent integration, compatibility,
+restart continuity and application-delivery coverage remain open; Phase 9 is
+not promoted by this implementation slice.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

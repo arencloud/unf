@@ -3564,12 +3564,15 @@ dependencies = [
 name = "unf-locality"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "aya",
+ "rustix",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "unf-cni-state",
  "unf-common",
+ "unf-ebpf-common",
  "unf-encryption",
  "unf-ipam",
  "unf-link",

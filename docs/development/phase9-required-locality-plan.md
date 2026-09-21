@@ -88,6 +88,11 @@ Matching Kind is next; production locality integration and full lifecycle stay o
 ADR 0413 passes matching persistent Kind, including common activations 163/164,
 the full scoped reply/inventory gate and exact journal preservation. Both fleets
 run `45d85d5`; resume production L3 bank/packet consumption, then L4/L5/Q.
+ADR 0414 implements a separate sealed endpoint-linear bank, exact shared-FD
+binding, private device seeds, the bounded preparation worker and original-cut
+publication fence. Isolated kernel qualification is pending on cl02 before
+matching Kind. The actual agent packet path, compatibility/restart boundaries
+and L4/L5/Q remain open; a redirect request is not observed delivery.
 
 ## Safety and efficiency boundary
 

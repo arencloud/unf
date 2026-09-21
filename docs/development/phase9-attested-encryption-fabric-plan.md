@@ -32,6 +32,10 @@ rotation, configured recovery and the full reply/inventory gate after the
 retained ADR 0410 failure. ADR 0413 passes matching persistent Kind on identical
 `45d85d5` images, with common activations 163/164 and exact journal preservation.
 Production locality integration and full Phase 9 closure remain open.
+ADR 0414 adds the sealed endpoint-linear bank implementation and an isolated
+consumer qualifier. cl02-first kernel validation is pending. The production
+agent remains unchanged; policy/Service wiring, restart migration and actual
+delivery evidence remain prerequisites to any L3/Phase 9 closure.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

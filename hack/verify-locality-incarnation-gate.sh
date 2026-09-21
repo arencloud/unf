@@ -21,6 +21,10 @@ case $suite in
         test_command='["bash","/usr/local/bin/verify-observed-locality-bank"]'
         marker='observed-locality-suite: PASS native-checks=28 bank-checks=true namespace-cleanup=true packet-delivery-tested=false$'
         ;;
+    kernel-bank)
+        test_command='["env","UNF_KERNEL_BANK_ISOLATED_CONTAINER=yes","bash","/usr/local/bin/verify-observed-locality-bank"]'
+        marker='kernel-locality-suite: PASS bank-checks=true namespace-cleanup=true packet-delivery-tested=false$'
+        ;;
     *) exit 2;;
 esac
 [[ $image =~ ^quay.io/arencloud/unf-test-tools-dev@sha256:[0-9a-f]{64}$ ]]
