@@ -185,6 +185,7 @@ impl PrivateMountChannel {
 }
 
 impl PrivateMount {
+    #[allow(clippy::unnecessary_debug_formatting)] // Escape unexpected filenames in diagnostics.
     fn validate(directory: OwnedFd) -> Result<Self> {
         let stat = fstat(&directory)?;
         ensure!(
@@ -200,10 +201,9 @@ impl PrivateMount {
             "helper FD is not bpffs"
         );
         let mount = Self { directory };
-        ensure!(
-            std::fs::read_dir(mount.path())?.next().is_none(),
-            "helper mount is not empty"
-        );
+        if let Some(entry) = std::fs::read_dir(mount.path())?.next() {
+            anyhow::bail!("helper mount is not empty: {:?}", entry?.file_name());
+        }
         Ok(mount)
     }
 

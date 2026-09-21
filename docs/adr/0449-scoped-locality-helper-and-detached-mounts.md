@@ -65,3 +65,21 @@ from the first boundary. Helper failure must keep the consuming path withdrawn;
 there is no direct-privilege or shared-pin fallback. IPC belongs only to bounded
 control-plane preparation, never the per-packet path. S1–S5 measurements remain
 separate, including peak preparation memory, cancellation latency and load cost.
+
+## First platform attempt
+
+Source `f4c257e`, image
+`quay.io/arencloud/unf-test-tools-dev@sha256:87a520365345712989a8cdd651e1b249abd715f6847b01593bd99274b9e40369`,
+passes the cl02 kernel gate. The identical Kind attempt fails with a closed
+helper channel; the fixture's early client unwrap masked the helper error.
+Both diagnostic Namespaces were removed. All five cl02 journals are byte-exact,
+all production Pods retained zero restarts, and complete current/retained logs
+show no ERROR or partial/non-JSON observations. Existing warnings remain:
+425 flow-history retention, seven peer-proof, four topology-retention and one
+key-publication warning in the final current window; 13,831 retained WARNs in
+23 categories. Kind and the paired milestone are NOT Verified.
+
+The fixture now always joins/reports helper failure before unwrapping the client,
+and filesystem syscalls retain operation context. Preserve the original evidence
+under `.artifacts/p9-helper-mount-f4c257e-{cl02,kind}-gate`; do not attribute the
+Kind cause before the improved observation has run cl02 first and then Kind.

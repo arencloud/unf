@@ -1046,6 +1046,10 @@ credential-bound detached-bpffs FD exchange is implemented; the cl02-first
 kernel gate and separate-process supervisor, observation/seeding, integration
 and recovery gates remain required. This is not a deployed helper or Phase 9
 closure; see ADR 0449's explicit sub-milestone tracker.
+The first helper image (`f4c257e`) passes cl02 but fails identical-image Kind.
+The fixture masked the helper's underlying error with a client EOF; diagnostic
+ordering/context are corrected before another cl02-first attempt. Journals and
+live permissions remain unchanged; the paired helper boundary is not Verified.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

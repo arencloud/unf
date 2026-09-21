@@ -227,9 +227,11 @@ fn privileged_private_mount_descriptor_survives_helper_exit_and_reclaims_pins() 
             restrict_thread(rustix::thread::CapabilitySet::SYS_ADMIN);
             server.serve()
         });
-        let mount = client.request().unwrap();
+        // Join and report the helper first even if the client sees EOF; a
+        // transport symptom must not hide the allocator's actual kernel error.
+        let mount = client.request();
         worker.join().unwrap().unwrap();
-        mount
+        mount.unwrap()
     });
     assert_eq!(
         std::fs::read_link("/proc/thread-self/ns/mnt").unwrap(),
