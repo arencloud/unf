@@ -989,6 +989,10 @@ ADR 0437 adds the actual publisher/main-hook TCP/UDP dual-stack socket gate,
 including policy-first Service delivery, withdrawal/republication and CNI
 retirement. Local checks pass; the thirty ignored privileged cases are not
 platform passes. Actual cl02-first execution and L3/L4/L5/Q remain open.
+ADR 0438 passes all seven actual-main/reverse-Service checks on cl02 then
+identical `b87d050` Kind. Live state is unchanged and all current/retained
+regular/init logs are reviewed. Actual publisher/main-hook sockets follow;
+Phase 9 and stabilization remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

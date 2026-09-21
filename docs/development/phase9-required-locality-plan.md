@@ -186,6 +186,9 @@ ADR 0437 adds actual publisher/main-hook socket composition in private namespace
 sixteen positive and twenty negative dual-stack TCP/UDP cases, including Service
 translation, writer withdrawal, policy denial and live-link journal retirement.
 Local checks pass; platform execution is pending after corrected reply checks.
+ADR 0438 passes all seven corrected actual-main checks on cl02 then identical
+`b87d050` Kind, preserving live state and reviewing full logs. Actual publisher/
+main-hook sockets are next; no L3/L4/L5/Q or stabilization promotion.
 
 ## Safety and efficiency boundary
 

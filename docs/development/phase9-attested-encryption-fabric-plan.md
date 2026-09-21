@@ -90,6 +90,9 @@ Corrected cl02-first qualification remains required; Kind has not advanced.
 ADR 0437 implements the actual journal-bound publisher/main-hook socket gate
 with bounded private namespace resources and exact cleanup. Local checks pass;
 cl02-first execution and full live controller/recovery integration remain open.
+ADR 0438 passes the corrected seven-test main/reverse-Service gate on cl02 then
+identical-image Kind, with journal preservation and full log review. Actual
+publisher/main-hook sockets, live integration and recovery remain next.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the
