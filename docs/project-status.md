@@ -938,6 +938,10 @@ ADR 0424 passes that full owned-runtime gate on cl02 then identical-image Kind.
 All prior native/kernel/socket/reader-floor tests pass, production journals are
 unchanged and current/retained logs reviewed. Actual early agent integration,
 full locality/replica/restart and L3/L4/L5/Q remain open.
+ADR 0425 integrates actual early agent ownership/boot fencing and real CNI
+retirement before bind/readiness, plus exact main loader map IDs. The disposable
+real-process cl02-before-Kind gate remains pending; production packet dispatch,
+writer/bank integration and L3/L4/L5/Q remain open. No release pin is changed.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

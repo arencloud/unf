@@ -1,5 +1,6 @@
 mod cni_inventory;
 mod encryption_locality;
+mod locality_runtime;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -909,6 +910,7 @@ struct AgentMetrics {
 
 struct AgentState {
     cni_inventory: std::sync::OnceLock<cni_inventory::CniAttachmentInventory>,
+    locality_runtime: std::sync::OnceLock<locality_runtime::LocalityRuntime>,
     node_name: String,
     pod_name: String,
     pod_uid: String,
@@ -2012,6 +2014,7 @@ async fn main() -> Result<()> {
     let mut tasks = JoinSet::new();
     let service_dataplane =
         args.ebpf_object.is_some() && (args.interface.is_some() || args.all_interfaces);
+    locality_runtime::initialize(&args, &state, service_dataplane)?;
     spawn_control_plane_tasks(&args, &state, &cancellation, &mut tasks, service_dataplane)?;
     let (service_failure_tx, mut service_failure_rx) = mpsc::channel(1);
     let mut supervised_service_configured = false;
@@ -3034,12 +3037,16 @@ fn spawn_cni_transaction_server(
     let resolved = resolved.context("CNI node-block provider was not resolved")?;
     let provider = resolved.provider;
     let heartbeat = Duration::from_secs(args.cni_status_heartbeat_seconds);
-    let server = CniTransactionServer::bind(
+    let server = CniTransactionServer::bind_with_initializer(
         socket_path.clone(),
         &args.cni_state_path,
         provider,
         args.cni_status_lease_path.clone(),
         heartbeat,
+        |journal| match state.locality_runtime.get() {
+            Some(runtime) => runtime.install_journal(journal),
+            None => Ok(()),
+        },
     )?;
     state
         .cni_inventory
@@ -6665,6 +6672,7 @@ fn new_state(
     register_agent_metrics(&mut registry, &metrics);
     let state = AgentState {
         cni_inventory: std::sync::OnceLock::new(),
+        locality_runtime: std::sync::OnceLock::new(),
         node_name,
         pod_name,
         pod_uid,
@@ -7289,7 +7297,7 @@ async fn run_dataplane(
 
     // Compatibility is checked before this call because opening the persistent
     // map set may create pins or adopt existing kernel state.
-    let (mut ebpf, pins_existed, encryption_pins_existed) = load_persistent_ebpf(&config)?;
+    let (mut ebpf, pins_existed, encryption_pins_existed) = load_persistent_ebpf(&config, &state)?;
     let flow_ring = RingBuf::try_from(
         ebpf.take_map("FLOW_EVENTS")
             .context("eBPF object does not contain FLOW_EVENTS ring buffer")?,
@@ -11376,7 +11384,10 @@ async fn await_background_task(task: Option<tokio::task::JoinHandle<()>>, name: 
     }
 }
 
-fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool, bool)> {
+fn load_persistent_ebpf(
+    config: &DataplaneConfig,
+    state: &AgentState,
+) -> Result<(Ebpf, bool, bool)> {
     if !config.bpf_pin_path.is_absolute() {
         bail!(
             "BPF pin path must be absolute: {}",
@@ -11413,6 +11424,11 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool, bool)> 
     validate_tail_program_pin_directory(&tail_program_pin_root)?;
 
     let mut loader = EbpfLoader::new();
+    let locality = state
+        .locality_runtime
+        .get()
+        .context("early locality runtime absent")?;
+    locality.admission.configure_loader(&mut loader)?;
     loader.override_global(
         "SERVICE_DSR_TRANSPORT_INTERFACES",
         &config.service_dsr_transport_interfaces,
@@ -11431,6 +11447,7 @@ fn load_persistent_ebpf(config: &DataplaneConfig) -> Result<(Ebpf, bool, bool)> 
     let ebpf = loader
         .load_file(&config.object)
         .with_context(|| format!("load eBPF object {}", config.object.display()))?;
+    locality.admission.verify_loaded(&ebpf)?;
     Ok((
         ebpf,
         existing == PERSISTENT_MAP_NAMES.len(),

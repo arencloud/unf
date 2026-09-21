@@ -1,5 +1,6 @@
 //! Owned disposable startup pins. No production path, map or attachment.
 use std::os::fd::AsFd as _;
+use std::process::Command;
 use std::{fs, path::Path};
 
 use anyhow::{Context as _, Result, ensure};
@@ -170,6 +171,159 @@ pub fn verify(bpffs: &Path, context: &EncryptionLocalityContext) -> Result<()> {
     regular.close()?;
     println!(
         "kernel-locality-runtime-owner: PASS atomic-create=true exclusive-owner=true reopen-withdrawn=true exact-bindings=true partial-rejected=true foreign-preserved=true cleanup=true"
+    );
+    Ok(())
+}
+
+/// Execute the current real agent with only private pins/journal and a missing
+/// ELF. It must establish early ownership/CNI retirement, then fail before any
+/// attachment. No controller, credentials, uplink or production path is passed.
+fn startup_agent(bpffs: &Path, state: &Path, expected: &str) -> Result<String> {
+    let output = Command::new("/usr/bin/timeout")
+        .args(["15s", "/usr/local/bin/unf-startup-agent"])
+        .args(["--listen", "127.0.0.1:0", "--node-name", "fixture-startup"])
+        .arg("--ebpf-object")
+        .arg(state.join("missing-elf"))
+        .args(["--interface", "unf-no-device"])
+        .arg("--bpf-pin-path")
+        .arg(bpffs.join("v15"))
+        .arg("--cni-socket")
+        .arg(state.join("cni.sock"))
+        .arg("--cni-state-path")
+        .arg(state.join("attachments.json"))
+        .arg("--cni-status-lease-path")
+        .arg(state.join("readiness"))
+        .args([
+            "--cni-ipv4-block",
+            "10.250.0.0/24",
+            "--cni-ipv6-block",
+            "fd00:250::/120",
+        ])
+        .arg("--encryption-generation-state-path")
+        .arg(state.join("generations.json"))
+        .arg("--encryption-plan-state-path")
+        .arg(state.join("plans.json"))
+        .arg("--encryption-key-state-path")
+        .arg(state.join("keys.json"))
+        .env_clear()
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("RUST_LOG", "info")
+        .env("TOKIO_WORKER_THREADS", "2")
+        .output()?;
+    ensure!(
+        output.stdout.len() + output.stderr.len() <= 128 * 1024,
+        "startup output budget"
+    );
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8(output.stdout)?,
+        String::from_utf8(output.stderr)?
+    );
+    ensure!(
+        output.status.code() == Some(1) && combined.contains(expected),
+        "unexpected isolated agent startup: {combined}"
+    );
+    // Retain full real-process output, including the deliberate terminal error.
+    println!("kernel-locality-agent-startup-process: expected={expected}\n{combined}");
+    Ok(combined)
+}
+
+pub fn verify_agent_startup(bpffs: &Path, context: &EncryptionLocalityContext) -> Result<()> {
+    ensure!(
+        bpffs.starts_with("/tmp") && bpffs.file_name().is_some_and(|name| name == "bpffs"),
+        "fixture bpffs scope"
+    );
+    let root = tempfile::Builder::new()
+        .prefix("unf-agent-startup-")
+        .tempdir_in(bpffs)?;
+    let state = tempfile::tempdir()?;
+    let pins = root.path().join("locality/v1");
+    let owner = state.path().join("locality-runtime.lock");
+    let checkpoint = state.path().join("locality-runtime.json");
+    let journal = state.path().join("attachments.json");
+    let first = startup_agent(root.path(), state.path(), "load eBPF object")?;
+    let owner_message = first
+        .find("locality runtime owned and withdrawn before route/CNI startup")
+        .context("early owner log")?;
+    let serving = first
+        .find("root-authenticated CNI transaction API enabled")
+        .context("CNI startup log")?;
+    ensure!(owner_message < serving, "CNI preceded startup fence");
+    ensure!(first.contains("Create"), "first startup did not create");
+    let before_checkpoint = fs::read(&checkpoint)?;
+    let before_journal = fs::read(&journal)?;
+    let reopened_journal = unf_cni_state::AttachmentJournal::open(
+        &journal,
+        unf_ipam::NodeBlockProvider::new("10.250.0.0/24".parse()?, "fd00:250::/120".parse()?),
+    )?;
+    ensure!(
+        reopened_journal.retirement_required()
+            && reopened_journal.is_empty()
+            && reopened_journal.cut().is_none(),
+        "real CNI gate did not persist empty reader floor"
+    );
+    drop(reopened_journal);
+    let mut runtime = LocalityRuntimeMaps::open_owned(&pins, &owner)?;
+    let object = load(&runtime)?;
+    assert_withdrawn(&object)?;
+    runtime.set_applied(context)?;
+    let mut dispatch = ProgramArray::try_from(Map::ProgramArray(aya::maps::MapData::from_fd(
+        data(&object, "UL_DISPATCH_V1")?
+            .fd()
+            .as_fd()
+            .try_clone_to_owned()?,
+    )?))?;
+    dispatch.set(0, program(&object)?.fd()?, 0)?;
+    drop(dispatch);
+    drop(runtime);
+    let reopened = startup_agent(root.path(), state.path(), "load eBPF object")?;
+    ensure!(reopened.contains("Reopen"), "same boot did not reopen");
+    assert_withdrawn(&object)?;
+    ensure!(
+        fs::read(&checkpoint)? == before_checkpoint && fs::read(&journal)? == before_journal,
+        "reopen changed journal/checkpoint bytes"
+    );
+
+    let fence = pins.join("UL_FENCE_V1");
+    fs::remove_file(&fence)?;
+    let partial = startup_agent(
+        root.path(),
+        state.path(),
+        "partial or foreign locality pin inventory",
+    )?;
+    ensure!(
+        !partial.contains("root-authenticated CNI") && !fence.exists(),
+        "partial startup served or repaired"
+    );
+    data(&object, "UL_FENCE_V1")?.pin(&fence)?;
+    for name in NAMES {
+        let path = pins.join(name);
+        ensure!(
+            aya::maps::MapData::from_pin(&path)?.info()?.id() == data(&object, name)?.info()?.id(),
+            "cleanup pin substituted"
+        );
+        fs::remove_file(path)?;
+    }
+    fs::remove_dir(&pins)?;
+    // Old maps/program remain held by object: missing pins do NOT mean dead BPF.
+    let missing = startup_agent(
+        root.path(),
+        state.path(),
+        "locality pins missing during the same kernel boot",
+    )?;
+    ensure!(
+        !missing.contains("root-authenticated CNI") && !pins.exists(),
+        "same-boot missing inventory served or recreated"
+    );
+    ensure!(
+        fs::read(&checkpoint)? == before_checkpoint && fs::read(&journal)? == before_journal,
+        "rejection changed durable state"
+    );
+    drop(object);
+    root.close()?;
+    state.close()?;
+    println!(
+        "kernel-locality-agent-startup: PASS actual-agent=true early-owner=true real-journal-floor=5 armed-reopen-withdrawn=true partial-rejected=true missing-same-boot-rejected=true bytes-preserved=true packet-attachment=false cleanup=true"
     );
     Ok(())
 }

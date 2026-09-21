@@ -30,6 +30,7 @@ unf-egress = { path = "../../crates/unf-egress" }
 unf-gobgp = { path = "../../crates/unf-gobgp" }
 unf-ipam = { path = "../../crates/unf-ipam" }
 unf-link = { path = "../../crates/unf-link" }
+unf-locality = { path = "../../crates/unf-locality" }
 unf-loadbalancer = { path = "../../crates/unf-loadbalancer" }
 unf-route = { path = "../../crates/unf-route" }
 unf-runtime = { path = "../../crates/unf-runtime" }

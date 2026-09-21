@@ -3372,6 +3372,7 @@ dependencies = [
  "unf-ipam",
  "unf-link",
  "unf-loadbalancer",
+ "unf-locality",
  "unf-route",
  "unf-runtime",
  "unf-service",

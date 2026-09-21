@@ -41,6 +41,7 @@ impl CniTransactionServer {
     ///
     /// Returns an error when the paths are unsafe, durable state is invalid, or
     /// the socket cannot be bound with owner-only permissions.
+    #[cfg(test)]
     pub fn bind(
         socket_path: PathBuf,
         state_path: &Path,
@@ -48,14 +49,39 @@ impl CniTransactionServer {
         readiness_lease_path: PathBuf,
         readiness_heartbeat: Duration,
     ) -> Result<Self> {
+        Self::bind_with_initializer(
+            socket_path,
+            state_path,
+            provider,
+            readiness_lease_path,
+            readiness_heartbeat,
+            |_| Ok(()),
+        )
+    }
+
+    /// Initialize retirement while exclusively owning startup and before any
+    /// socket/readiness publication. Existing live sockets reject first, before
+    /// schema migration. An unhooked schema-5 journal must never report Ready.
+    pub(super) fn bind_with_initializer(
+        socket_path: PathBuf,
+        state_path: &Path,
+        provider: NodeBlockProvider,
+        readiness_lease_path: PathBuf,
+        readiness_heartbeat: Duration,
+        initialize: impl FnOnce(&mut AttachmentJournal) -> Result<()>,
+    ) -> Result<Self> {
         validate_socket_path(&socket_path)?;
         validate_readiness_lease_path(&readiness_lease_path)?;
         if readiness_heartbeat.is_zero() {
             bail!("CNI readiness heartbeat must be greater than zero");
         }
-        let journal = AttachmentJournal::open(state_path, provider)
-            .with_context(|| format!("open CNI attachment journal {}", state_path.display()))?;
         prepare_socket_path(&socket_path)?;
+        let mut journal = AttachmentJournal::open(state_path, provider)
+            .with_context(|| format!("open CNI attachment journal {}", state_path.display()))?;
+        initialize(&mut journal)?;
+        if journal.retirement_required() && journal.cut().is_none() {
+            bail!("CNI retirement-required journal has no live startup gate");
+        }
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind CNI transaction socket {}", socket_path.display()))?;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
@@ -369,6 +395,99 @@ mod tests {
             "10.42.0.0/24".parse().expect("IPv4 node block"),
             "fd00:42::/120".parse().expect("IPv6 node block"),
         )
+    }
+
+    struct NoopRetirement;
+    impl unf_cni_state::AttachmentRetirement for NoopRetirement {
+        fn retire(&self, _: &[u8; 32]) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn required_journal_without_initializer_never_binds_or_reports_ready() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("attachments.json");
+        let socket = directory.path().join("cni.sock");
+        let lease = directory.path().join("readiness");
+        let mut journal = AttachmentJournal::open(&journal_path, provider()).unwrap();
+        journal
+            .install_required_retirement(Box::new(NoopRetirement))
+            .unwrap();
+        drop(journal);
+        let before = fs::read(&journal_path).unwrap();
+        assert!(
+            CniTransactionServer::bind(
+                socket.clone(),
+                &journal_path,
+                provider(),
+                lease.clone(),
+                Duration::from_secs(1)
+            )
+            .is_err()
+        );
+        assert!(!socket.exists() && !lease.exists());
+        assert_eq!(fs::read(&journal_path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn initializer_precedes_socket_and_readiness_but_not_live_owner_check() {
+        let directory = tempfile::tempdir().unwrap();
+        let journal_path = directory.path().join("attachments.json");
+        let socket = directory.path().join("cni.sock");
+        let lease = directory.path().join("readiness");
+        let server = CniTransactionServer::bind_with_initializer(
+            socket.clone(),
+            &journal_path,
+            provider(),
+            lease.clone(),
+            Duration::from_secs(1),
+            |journal| {
+                assert!(!socket.exists() && !lease.exists());
+                journal.install_required_retirement(Box::new(NoopRetirement))?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(server.journal.lock().await.cut().is_some());
+        let before = fs::read(&journal_path).unwrap();
+        let mut called = false;
+        assert!(
+            CniTransactionServer::bind_with_initializer(
+                socket.clone(),
+                &journal_path,
+                provider(),
+                lease.clone(),
+                Duration::from_secs(1),
+                |_| {
+                    called = true;
+                    Ok(())
+                }
+            )
+            .is_err()
+        );
+        assert!(!called && !lease.exists());
+        assert_eq!(fs::read(&journal_path).unwrap(), before);
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn failed_initializer_stops_before_socket_and_readiness() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("cni.sock");
+        let lease = directory.path().join("readiness");
+        assert!(
+            CniTransactionServer::bind_with_initializer(
+                socket.clone(),
+                &directory.path().join("attachments.json"),
+                provider(),
+                lease.clone(),
+                Duration::from_secs(1),
+                |_| bail!("injected gate failure")
+            )
+            .is_err()
+        );
+        assert!(!socket.exists() && !lease.exists());
     }
 
     fn request(operation: TransactionOperation) -> Vec<u8> {

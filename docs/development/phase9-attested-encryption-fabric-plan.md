@@ -49,6 +49,9 @@ qualification and actual early agent startup integration remain pending.
 ADR 0424 qualifies the complete owned-startup diagnostic on cl02 then matching
 Kind with unchanged production state and reviewed logs. Actual agent startup,
 writer and packet integration remain open; no Phase 9 row is promoted.
+ADR 0425 implements actual early startup and CNI journal binding, with an
+explicit boot/path checkpoint and exact main-ELF map IDs. Paired real-process
+qualification is pending; no local packet dispatch or fleet rollout occurs.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

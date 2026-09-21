@@ -4,17 +4,21 @@ ARG TEST_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:6ce5d918c67fc5132065a
 ARG LEGACY_AGENT_IMAGE=quay.io/arencloud/unf-agent-dev@sha256:74f80c81d5a208dcfe8904ca406ca174e35a1bdeccb04ebfcecd856a13938a45
 FROM ${LEGACY_AGENT_IMAGE} AS legacy-agent
 FROM ${RUST_IMAGE} AS builder
+ARG UNF_SOURCE_REVISION=unknown
+ENV UNF_BUILD_REVISION=${UNF_SOURCE_REVISION}
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
 COPY bins ./bins
 COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
-RUN cargo build --locked --release --package unf-locality --example kernel_observed_bank
+RUN cargo build --locked --release --package unf-locality --example kernel_observed_bank \
+    && cargo build --locked --release --package unf-agent
 
 FROM ${TEST_IMAGE}
 ARG UNF_SOURCE_REVISION
 LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
 COPY --from=builder /src/target/release/examples/kernel_observed_bank /usr/local/bin/kernel-observed-bank
+COPY --from=builder /src/target/release/unf-agent /usr/local/bin/unf-startup-agent
 COPY --from=legacy-agent /usr/local/bin/unf-component /usr/local/bin/unf-legacy-agent
 COPY .artifacts/unf-locality-bank /usr/local/lib/unf/locality-bank
 COPY .artifacts/unf-locality-fixture /usr/local/lib/unf/locality-fixture

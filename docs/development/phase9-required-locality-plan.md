@@ -133,6 +133,10 @@ ADR 0424 passes the full runtime-owner gate on cl02 then identical-image Kind,
 including armed reopen withdrawal, exact bindings and retained failure cases.
 Production journals/runtime remain unchanged and logs are reviewed. Actual
 agent startup/boot fencing and consuming integration are next; L3/L4/L5/Q stay open.
+ADR 0425 wires the real agent's early owned startup, durable kernel-boot/path
+checkpoint, actual CNI retirement hook before bind/readiness, and exact main
+loader bindings. Paired disposable real-agent qualification is pending; packet
+dispatch and real applied writers remain unwired and production unchanged.
 
 ## Safety and efficiency boundary
 

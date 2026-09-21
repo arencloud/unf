@@ -20,6 +20,7 @@ use aya_ebpf::maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, ProgramAr
 use aya_ebpf::programs::TcContext;
 use core::intrinsics::{AtomicOrdering, atomic_cxchg};
 use unf_common::{BackendId, IdentityId, PolicyId, PolicyReason, RuleId, ServiceId, Verdict};
+use unf_ebpf_common::locality::{PacketInput as LocalityPacketInput, PlacementFence};
 use unf_ebpf_common::{
     AddressFamily, ConnectionKey, ConnectionState, Direction, EGRESS_ADMISSION_ACTIVE,
     EGRESS_ADMISSION_FENCED, EGRESS_BANK_COUNT, EGRESS_CONFIG_FLAG_GATEWAY_NAT,
@@ -154,6 +155,17 @@ static FLOW_EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
 
 #[map]
 static FLOW_COUNTERS: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+// Separate locality ABI island: owned and withdrawn before route/CNI startup.
+// Packet dispatch is not wired until policy-first continuations are installed.
+#[map]
+static UL_INPUT_V1: PerCpuArray<LocalityPacketInput> = PerCpuArray::with_max_entries(1, 0);
+#[map]
+static UL_FENCE_V1: Array<PlacementFence> = Array::with_max_entries(1, 128);
+#[map]
+static UL_RESUME_V1: ProgramArray = ProgramArray::with_max_entries(4, 0);
+#[map]
+static UL_DISPATCH_V1: ProgramArray = ProgramArray::with_max_entries(1, 0);
 
 #[map]
 static FLOW_EVENT_SCRATCH: PerCpuArray<FlowEvent> = PerCpuArray::with_max_entries(1, 0);

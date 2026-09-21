@@ -204,6 +204,13 @@ async fn main() {
         )
         .unwrap();
     }
+    if std::env::var("UNF_LOCALITY_AGENT_STARTUP_TEST").as_deref() == Ok("yes") {
+        runtime_owner::verify_agent_startup(
+            Path::new(&std::env::var("UNF_KERNEL_BANK_BPFFS").unwrap()),
+            &context,
+        )
+        .unwrap();
+    }
     let gate = IncarnationGate::install(&mut journal, 8).unwrap();
     if std::env::var("UNF_LOCALITY_JOURNAL_FLOOR_TEST").as_deref() == Ok("yes") {
         journal_floor::verify(
