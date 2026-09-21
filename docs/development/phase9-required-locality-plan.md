@@ -121,6 +121,10 @@ ADR 0421 adds the durable schema-5 journal reader floor before locality lease
 issuance, preserving records while blocking unhooked reopen/older CNI writers.
 The complete diagnostic adds a frozen-old-agent rejection check; immutable
 cl02-before-Kind qualification and actual startup fencing remain required.
+ADR 0422 passes that complete reader-floor gate on cl02 then matching Kind,
+including the frozen old executable's rejection, all kernel/socket checks,
+unchanged production journals and log review. Actual early runtime-map fencing
+and production agent/packet wiring remain next; L3/L4/L5/Q stay open.
 
 ## Safety and efficiency boundary
 

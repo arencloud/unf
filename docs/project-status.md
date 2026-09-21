@@ -927,6 +927,10 @@ ADRs 0419–0420 add and qualify coordinated identity/routing admission on cl02
 then identical-image Kind. Cancelled/failed writers cannot be masked by another
 writer's success; all prior socket and kernel gates remain green. Actual agent
 hooks, durable startup/rollback fencing and packet composition remain open.
+ADRs 0421–0422 add and qualify the durable journal reader floor on cl02 then
+matching Kind. The actual old agent rejects the private schema-5 journal before
+CNI bind; all prior kernel/socket checks pass. Production journals remain
+unchanged. Early runtime-map fencing and real agent/packet integration are next.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -32,13 +32,17 @@ rotation, configured recovery and the full reply/inventory gate after the
 retained ADR 0410 failure. ADR 0413 passes matching persistent Kind on identical
 `45d85d5` images, with common activations 163/164 and exact journal preservation.
 Production locality integration and full Phase 9 closure remain open.
-ADR 0414 adds the sealed endpoint-linear bank implementation and an isolated
-consumer qualifier. cl02-first kernel validation is pending. The production
-agent remains unchanged; policy/Service wiring, restart migration and actual
-delivery evidence remain prerequisites to any L3/Phase 9 closure.
-ADR 0415 passes the complete repaired bank diagnostic on cl02, including
-nineteen non-transmitting kernel decisions and all 28 native checks. Matching
-Kind on the identical `b432bec` image is next; production integration stays open.
+ADRs 0414–0416 implement and qualify the sealed endpoint-linear bank on cl02
+then matching Kind. ADRs 0417–0418 add actual TCP/UDP dual-stack sockets: eight
+successful exchanges and sixteen denials per platform. ADRs 0419–0420 qualify
+coordinated identity/routing admission across pending/cancelled writers.
+ADRs 0421–0422 qualify the durable schema-5 CNI reader floor and actual frozen
+old-agent rejection, retaining all native/kernel/socket checks. Production
+journals and live runtime remain unchanged. These isolated gates use synthetic
+trusted policy input and native replies, not production packet composition.
+Early runtime-map fencing before route/CNI startup, actual writer/bank wiring,
+policy/Service/egress/reverse-path composition and restart continuity remain
+prerequisites to L3/Phase 9 closure.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the
