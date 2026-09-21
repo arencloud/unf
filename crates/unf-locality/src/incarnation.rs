@@ -77,6 +77,10 @@ impl AttachmentRetirement for Retirer {
 }
 
 impl IncarnationGate {
+    pub(crate) fn matches_journal(&self, journal: &AttachmentJournal) -> bool {
+        journal.retirement_matches(&self.registration)
+    }
+
     /// Creates an empty, bounded, program-read-only map and installs its callback
     /// under the caller's journal lock. No nonce becomes live during install.
     /// There is intentionally no constructor from a pinned or serialized map.

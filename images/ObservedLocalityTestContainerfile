@@ -1,0 +1,18 @@
+ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
+ARG TEST_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:9f3db2b9b2d50b054d21f25b2bdb260ca68926ab9719b55d8bede7180a7fa81e
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY bins ./bins
+COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
+RUN cargo build --locked --release --package unf-locality --example kernel_observed_bank \
+    && cargo build --locked --release --package unf-route --example native_attachment_observation
+
+FROM ${TEST_IMAGE}
+ARG UNF_SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
+COPY --from=builder /src/target/release/examples/kernel_observed_bank /usr/local/bin/kernel-observed-bank
+COPY --from=builder /src/target/release/examples/native_attachment_observation /usr/local/bin/native-attachment-observation
+COPY hack/verify-native-attachment-observation.sh /usr/local/bin/verify-native-attachment-observation
+COPY hack/verify-observed-locality-bank.sh /usr/local/bin/verify-observed-locality-bank

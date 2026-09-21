@@ -57,6 +57,11 @@ Kind is next; this is not yet production packet consumption.
 ADR 0405 passes matching Kind on the identical immutable image, preserving
 existing journals and reviewing retained logs. The kernel/journal gate is now
 qualified on both kernels; authenticated bank/packet integration remains next.
+ADR 0406 adds typed observed-bank preparation, exact placement/journal joining,
+batched route scans, same-socket namespace coordinates and cancellation-safe
+bounded work. Local regressions pass; the combined real-kernel fixture must
+pass cl02 then Kind. Frozen device maps, packet publication and agent consumption
+remain pending; this preparation does not admit packets.
 
 ## Safety and efficiency boundary
 

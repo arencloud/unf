@@ -235,6 +235,10 @@ ADR 0404 verifies the disposable kernel/journal incarnation gate on cl02.
 Run the identical image on retained Kind before consuming the new gate.
 ADR 0405 passes matching Kind. Continue the authenticated immutable bank and
 packet-policy-first production consumer; full Phase 9 remains open.
+ADR 0406 implements typed placement/kernel/journal bank preparation with bounded
+batch observation and cancellation-safe worker draining. Local verification
+passes; cl02-before-Kind qualification and actual immutable packet publication
+remain required. The agent has not enabled this new library yet.
 Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical
 snapshot, candidate or isolated device gate closes full production locality.

@@ -15,6 +15,36 @@ pub struct VethObservation {
     plan: VethPlan,
     readback: LinkReadback,
     namespaces: Option<NamespaceDescriptors>,
+    cookies: NamespaceCookies,
+}
+
+/// Socket-observed namespace coordinates, not placement or lifetime authority.
+/// Multiple workload interfaces may legitimately share one peer cookie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamespaceCookies {
+    host: u64,
+    peer: u64,
+}
+
+impl NamespaceCookies {
+    pub(super) fn new(host: u64, peer: u64) -> Result<Self, LinkError> {
+        if host == 0 || peer == 0 || host == peer {
+            return Err(LinkError::Readback(
+                "invalid or identical host/peer namespace cookies".into(),
+            ));
+        }
+        Ok(Self { host, peer })
+    }
+
+    #[must_use]
+    pub const fn host(self) -> u64 {
+        self.host
+    }
+
+    #[must_use]
+    pub const fn peer(self) -> u64 {
+        self.peer
+    }
 }
 
 struct NamespaceDescriptors {
@@ -28,10 +58,12 @@ impl VethObservation {
         readback: LinkReadback,
         host_namespace: File,
         peer_namespace: File,
+        cookies: NamespaceCookies,
     ) -> Self {
         Self {
             plan,
             readback,
+            cookies,
             namespaces: Some(NamespaceDescriptors {
                 host_namespace,
                 peer_namespace,
@@ -56,6 +88,13 @@ impl VethObservation {
         })
     }
 
+    /// Coordinates come from the same netlink sockets used for strict readback
+    /// in the retained descriptor contexts. No extra socket/thread is opened.
+    #[must_use]
+    pub fn namespace_cookies(&self) -> Option<NamespaceCookies> {
+        self.namespaces.as_ref().map(|_| self.cookies)
+    }
+
     /// Rechecks through the retained descriptors, without replacing them from
     /// the pathname. No link, route or attachment state is changed.
     ///
@@ -76,10 +115,19 @@ impl VethObservation {
 
     async fn recheck_inner(&self, namespaces: &NamespaceDescriptors) -> Result<(), LinkError> {
         self.check_paths_against(namespaces)?;
-        let current = self
+        let (current, cookies) = self
             .plan
-            .readback_in_namespaces(&namespaces.peer_namespace, &namespaces.host_namespace)
+            .readback_with_namespace_cookies(
+                &namespaces.peer_namespace,
+                &namespaces.host_namespace,
+                true,
+            )
             .await?;
+        if cookies != Some(self.cookies) {
+            return Err(LinkError::Readback(
+                "observed namespace cookies changed".into(),
+            ));
+        }
         require_same_readback(&self.readback, &current)?;
         self.check_paths_against(namespaces)
     }
@@ -237,10 +285,13 @@ mod tests {
             },
             peer_identity::open_current_namespace().unwrap(),
             peer_identity::open_current_namespace().unwrap(),
+            NamespaceCookies::new(1, 2).unwrap(),
         );
         assert!(observation.namespace_descriptors().is_some());
+        assert!(observation.namespace_cookies().is_some());
         assert!(observation.recheck().await.is_err());
         assert!(observation.namespace_descriptors().is_none());
+        assert!(observation.namespace_cookies().is_none());
         assert!(
             observation
                 .recheck()

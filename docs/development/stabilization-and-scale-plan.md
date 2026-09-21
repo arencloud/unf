@@ -27,6 +27,12 @@ ADR 0402 replaces whole-inventory CNI rollback copies with one-record snapshots
 while adding pre-persistence incarnation retirement. Failure/retry regressions
 pass locally. Full-document persistence and allocation scans remain; there is
 no measured heavy-load improvement or live kernel-retirement claim yet.
+ADRs 0403–0405 qualify the kernel incarnation gate on cl02 then Kind, without
+growing a retired-nonce inventory or changing live admission. ADR 0406 adds
+observed-bank preparation with selected-key streaming route scans and work
+permits retained through actual namespace-worker completion. These are bounded
+structural changes, not measured resource savings or S1–S5 closure; the combined
+kernel fixture and live consumer still require qualification.
 
 Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required

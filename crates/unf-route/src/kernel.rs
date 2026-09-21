@@ -22,6 +22,8 @@ use super::{
     RouteError, RouteReadback, RouteScope, RouteSpec,
 };
 
+pub(super) mod batch;
+
 #[derive(Debug)]
 struct ObservedState {
     routes: Vec<Option<RouteMessage>>,

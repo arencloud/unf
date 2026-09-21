@@ -2,5 +2,12 @@
 //! kernel device/route proof, policy permission or observed packet delivery.
 
 mod incarnation;
+mod observed;
+mod worker;
 
 pub use incarnation::{IncarnationGate, IncarnationLease, LocalityGateError};
+pub use observed::{
+    LeasedLocalityBank, LocalityAddress, LocalityBankError, ObservedLocalityBank,
+    ObservedLocalityEndpoint,
+};
+pub use worker::{LocalityObservationTask, LocalityObservationWorker};

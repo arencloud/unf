@@ -3567,8 +3567,13 @@ dependencies = [
  "aya",
  "tempfile",
  "thiserror 2.0.20",
+ "tokio",
  "unf-cni-state",
+ "unf-common",
+ "unf-encryption",
  "unf-ipam",
+ "unf-link",
+ "unf-route",
 ]
 
 [[package]]

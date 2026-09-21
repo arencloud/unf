@@ -874,6 +874,11 @@ ADR 0405 passes matching Kind's kernel/journal gate with preserved journals,
 three fresh converged reports, one current / 75 retained warnings and no ERROR.
 This prerequisite is qualified on both kernels; authenticated bank/packet
 integration, migration and L4/L5/Q remain open.
+ADR 0406 implements the typed observed-bank join and journal lease binding,
+single host-table scans for a cohort, same-socket namespace-cookie readback and
+bounded cancellation-safe observation work. All 863 workspace tests and strict
+Clippy pass. The combined kernel fixture is pending cl02 then Kind; live agent
+consumption, frozen-bank publication and Phase 9 closure remain unimplemented.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -9,7 +9,12 @@ repository.workspace = true
 [dependencies]
 aya.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 unf-cni-state = { path = "../unf-cni-state" }
+unf-common = { path = "../unf-common" }
+unf-encryption = { path = "../unf-encryption" }
+unf-link = { path = "../unf-link" }
+unf-route = { path = "../unf-route" }
 
 [dev-dependencies]
 tempfile = "3.27.0"

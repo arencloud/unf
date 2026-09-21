@@ -30,10 +30,11 @@ pub const EGRESS_GATEWAY_INTERFACE: &str = "unf-egress0";
 const MAX_GATEWAY_ADDRESSES: usize = 4_096;
 
 pub mod kernel_layout;
+mod namespace_cookie;
 mod observation;
 mod peer_identity;
 
-pub use observation::VethObservation;
+pub use observation::{NamespaceCookies, VethObservation};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct AssignedAddress {
@@ -562,10 +563,13 @@ impl VethPlan {
     pub async fn observe(&self) -> Result<VethObservation, LinkError> {
         let namespace = open_namespace(&self.netns)?;
         let host_namespace = peer_identity::open_current_namespace()?;
-        let readback = self
-            .readback_in_namespaces(&namespace, &host_namespace)
+        let (readback, cookies) = self
+            .readback_with_namespace_cookies(&namespace, &host_namespace, true)
             .await?;
-        let observation = VethObservation::new(self.clone(), readback, host_namespace, namespace);
+        let cookies = cookies
+            .ok_or_else(|| LinkError::Readback("missing observed namespace cookies".into()))?;
+        let observation =
+            VethObservation::new(self.clone(), readback, host_namespace, namespace, cookies);
         observation.check_namespace_paths()?;
         Ok(observation)
     }
@@ -575,25 +579,43 @@ impl VethPlan {
         namespace: &File,
         host_namespace: &File,
     ) -> Result<LinkReadback, LinkError> {
-        let (connection, handle, _) =
+        self.readback_with_namespace_cookies(namespace, host_namespace, false)
+            .await
+            .map(|(links, _)| links)
+    }
+
+    async fn readback_with_namespace_cookies(
+        &self,
+        namespace: &File,
+        host_namespace: &File,
+        collect_cookies: bool,
+    ) -> Result<(LinkReadback, Option<NamespaceCookies>), LinkError> {
+        let (mut connection, handle, _) =
             new_connection().map_err(|source| LinkError::OpenNetlink {
                 operation: "open host connection",
                 source,
             })?;
+        let host_cookie = collect_cookies
+            .then(|| namespace_cookie::socket_cookie(connection.socket_mut()))
+            .transpose()?;
         tokio::spawn(connection);
         let plan = self.clone();
         let host_namespace =
             clone_namespace(host_namespace, Path::new("/proc/thread-self/ns/net"))?;
-        let peer = run_in_namespace(
+        let (peer, peer_cookie) = run_in_namespace_with_deadline(
             clone_namespace(namespace, &self.netns)?,
+            collect_cookies.then_some(std::time::Duration::from_secs(10)),
             move || async move {
-                let (connection, handle, _) =
+                let (mut connection, handle, _) =
                     new_connection().map_err(|source| LinkError::OpenNetlink {
                         operation: "open container connection",
                         source,
                     })?;
+                let cookie = collect_cookies
+                    .then(|| namespace_cookie::socket_cookie(connection.socket_mut()))
+                    .transpose()?;
                 tokio::spawn(connection);
-                read_peer(&handle, &plan, &host_namespace).await
+                Ok((read_peer(&handle, &plan, &host_namespace).await?, cookie))
             },
         )
         .await?;
@@ -607,16 +629,28 @@ impl VethPlan {
         )?;
         let peer_namespace_id = peer_identity::namespace_id(&handle, namespace).await?;
         peer_identity::validate_pair(&host, &peer.link, peer_namespace_id, peer.host_namespace_id)?;
-        Ok(LinkReadback {
-            host_index: host.header.index,
-            peer_index: peer.index,
-            host_name: self.host_name.clone(),
-            peer_name: self.container_name.clone(),
-            host_address: self.host_address,
-            peer_address: self.peer_address,
-            mtu: self.mtu,
-            addresses: peer.addresses,
-        })
+        let cookies = match (host_cookie, peer_cookie) {
+            (Some(host), Some(peer)) => Some(NamespaceCookies::new(host, peer)?),
+            (None, None) => None,
+            _ => {
+                return Err(LinkError::Readback(
+                    "incomplete namespace cookie observation".into(),
+                ));
+            }
+        };
+        Ok((
+            LinkReadback {
+                host_index: host.header.index,
+                peer_index: peer.index,
+                host_name: self.host_name.clone(),
+                peer_name: self.container_name.clone(),
+                host_address: self.host_address,
+                peer_address: self.peer_address,
+                mtu: self.mtu,
+                addresses: peer.addresses,
+            },
+            cookies,
+        ))
     }
 
     /// Reads ownership and interface indexes for exact route-first cleanup.
@@ -1750,6 +1784,19 @@ where
     Fut: std::future::Future<Output = Result<T, LinkError>> + 'static,
     T: Send + 'static,
 {
+    run_in_namespace_with_deadline(namespace, None, operation).await
+}
+
+async fn run_in_namespace_with_deadline<F, Fut, T>(
+    namespace: File,
+    deadline: Option<std::time::Duration>,
+    operation: F,
+) -> Result<T, LinkError>
+where
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<T, LinkError>> + 'static,
+    T: Send + 'static,
+{
     tokio::task::spawn_blocking(move || {
         std::thread::spawn(move || {
             move_into_link_name_space(namespace.as_fd(), Some(LinkNameSpaceType::Network))
@@ -1758,7 +1805,19 @@ where
                 .enable_all()
                 .build()
                 .map_err(LinkError::NamespaceRuntime)?
-                .block_on(operation())
+                .block_on(async {
+                    if let Some(deadline) = deadline {
+                        tokio::time::timeout(deadline, operation())
+                            .await
+                            .map_err(|_| {
+                                LinkError::Readback(
+                                    "namespace observation deadline exceeded".into(),
+                                )
+                            })?
+                    } else {
+                        operation().await
+                    }
+                })
         })
         .join()
         .map_err(|_| LinkError::NamespaceWorkerPanicked)?

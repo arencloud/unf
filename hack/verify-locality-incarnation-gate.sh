@@ -11,6 +11,18 @@ umask 077
 : "${UNF_LOCALITY_GATE_PLATFORM:?cl02 or kind}"
 image=$UNF_LOCALITY_GATE_IMAGE
 directory=$UNF_LOCALITY_GATE_DIAGNOSTICS
+suite=${UNF_LOCALITY_GATE_SUITE:-incarnation}
+case $suite in
+    incarnation)
+        test_command='["/usr/local/bin/kernel-incarnation-gate"]'
+        marker='kernel-incarnation-gate: PASS schema=1 exact-revocation=true unrelated-preserved=true stale-serial-denied=true foreign-journal-denied=true cleanup=true packet-delivery-tested=false$'
+        ;;
+    observed-bank)
+        test_command='["bash","/usr/local/bin/verify-observed-locality-bank"]'
+        marker='observed-locality-suite: PASS native-checks=28 bank-checks=true namespace-cleanup=true packet-delivery-tested=false$'
+        ;;
+    *) exit 2;;
+esac
 [[ $image =~ ^quay.io/arencloud/unf-test-tools-dev@sha256:[0-9a-f]{64}$ ]]
 [[ ! -e $directory && -z $(git status --porcelain) ]]
 install -d -m 0700 "$directory"
@@ -23,7 +35,7 @@ case $UNF_LOCALITY_GATE_PLATFORM in
         ;;
     kind)
         : "${UNF_LOCALITY_GATE_CL02_EVIDENCE:?matching successful cl02 evidence required}"
-        jq -e --arg image "$image" '.result=="passed" and .platform=="cl02" and .image==$image and .cleanup==true' "$UNF_LOCALITY_GATE_CL02_EVIDENCE" >/dev/null
+        jq -e --arg image "$image" --arg suite "$suite" '.result=="passed" and .platform=="cl02" and .image==$image and (.suite // "incarnation")==$suite and .cleanup==true' "$UNF_LOCALITY_GATE_CL02_EVIDENCE" >/dev/null
         [[ $KUBE_CONTEXT == kind-unf-p9-20260921 ]]
         ;;
     *) exit 2;;
@@ -45,10 +57,10 @@ cleanup() {
         fi
     fi
     if [[ $result == 0 ]]; then
-        rg -q 'kernel-incarnation-gate: PASS schema=1 exact-revocation=true unrelated-preserved=true stale-serial-denied=true foreign-journal-denied=true cleanup=true packet-delivery-tested=false$' "$directory/test.log" || result=1
+        rg -q "$marker" "$directory/test.log" || result=1
     fi
-    jq -n --argjson code "$result" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" \
-        '{schemaVersion:1,result:(if $code==0 then "passed" else "failed" end),platform:$platform,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:($code==0),packetDeliveryTested:false}' > "$directory/evidence.json"
+    jq -n --argjson code "$result" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" \
+        '{schemaVersion:1,result:(if $code==0 then "passed" else "failed" end),platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:($code==0),packetDeliveryTested:false}' > "$directory/evidence.json"
     printf 'Incarnation gate result=%s evidence=%s\n' "$result" "$directory"
     exit "$result"
 }
@@ -59,7 +71,7 @@ namespace_uid=$(jq -er '.metadata.uid' "$directory/namespace.json")
 if [[ $UNF_LOCALITY_GATE_PLATFORM == cl02 ]]; then
     "${kc[@]}" -n "$namespace" create rolebinding gate-privileged --clusterrole=system:openshift:scc:privileged --serviceaccount="$namespace:default" >/dev/null
 fi
-jq -n --arg ns "$namespace" --arg node "$UNF_LOCALITY_GATE_NODE" --arg image "$image" '{apiVersion:"v1",kind:"Pod",metadata:{name:"gate",namespace:$ns},spec:{nodeName:$node,hostNetwork:true,automountServiceAccountToken:false,restartPolicy:"Never",activeDeadlineSeconds:180,containers:[{name:"gate",image:$image,imagePullPolicy:"IfNotPresent",securityContext:{privileged:true,runAsUser:0},resources:{requests:{cpu:"100m",memory:"64Mi"},limits:{cpu:"1",memory:"256Mi"}},env:[{name:"UNF_LOCALITY_GATE_ISOLATED_CONTAINER",value:"yes"}],command:["/usr/local/bin/kernel-incarnation-gate"]}]}}' > "$directory/pod.json"
+jq -n --arg ns "$namespace" --arg node "$UNF_LOCALITY_GATE_NODE" --arg image "$image" --argjson command "$test_command" '{apiVersion:"v1",kind:"Pod",metadata:{name:"gate",namespace:$ns},spec:{nodeName:$node,hostNetwork:true,automountServiceAccountToken:false,restartPolicy:"Never",activeDeadlineSeconds:180,containers:[{name:"gate",image:$image,imagePullPolicy:"IfNotPresent",securityContext:{privileged:true,runAsUser:0},resources:{requests:{cpu:"100m",memory:"64Mi"},limits:{cpu:"1",memory:"256Mi"}},env:[{name:"UNF_LOCALITY_GATE_ISOLATED_CONTAINER",value:"yes"},{name:"UNF_OBSERVED_BANK_ISOLATED_CONTAINER",value:"yes"}],command:$command}]}}' > "$directory/pod.json"
 "${kc[@]}" create -f "$directory/pod.json" >/dev/null
 finished=false
 for _ in $(seq 1 100); do
