@@ -1030,6 +1030,10 @@ including real map reclamation after error/panic/SIGKILL and the actual
 24-positive/24-negative socket matrix. Complete logs/cleanup and unchanged
 journals pass. The fleet privilege decision in ADR 0445 remains unresolved;
 Phase 9 and stabilization are not marked complete.
+ADR 0447 publishes immutable `762c980` controller/agent development candidates
+with exact diagnostic-qualified main/bank ELF bytes. Public digest/label and
+binary hashes are checked; no runtime is deployed. The privilege decision,
+isolated shutdown/version gate and full fleet/recovery validation remain pending.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
