@@ -90,7 +90,7 @@ pub fn unf_locality_seed(ctx: TcContext) -> i32 {
     {
         return TC_ACT_SHOT;
     }
-    if let Ok(device) = context_device(&ctx, config.geometry.skb_device / 8) {
+    if let Ok(device) = context_device(&ctx, u64::from(config.geometry.skb_device) / 8) {
         if live_endpoint(device, &config.geometry, endpoint).is_ok() {
             // The kernel TestRun context resolves/holds this actual host device.
             // Never expose the resulting pointer through userspace readback.
@@ -164,7 +164,7 @@ fn consume(ctx: &TcContext) -> Result<i32, ()> {
     {
         return Err(());
     }
-    let source_device = context_device(ctx, config.geometry.skb_device / 8)?;
+    let source_device = context_device(ctx, u64::from(config.geometry.skb_device) / 8)?;
     if UL_POINTER_V1.get(source.endpoint).copied() != Some(source_device) {
         return Err(());
     }
@@ -307,7 +307,7 @@ fn ownership(
 // alignment fact on the qualified 5.14 verifier. Do not bypass alignment checks
 // in BankConfig or guess an skb member offset.
 #[inline(never)]
-fn context_device(ctx: &TcContext, word: u32) -> Result<u64, ()> {
+fn context_device(ctx: &TcContext, word: u64) -> Result<u64, ()> {
     if word > 7 {
         return Err(());
     }

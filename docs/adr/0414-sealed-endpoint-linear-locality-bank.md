@@ -127,3 +127,10 @@ reads to bound subprogram stack usage. No layout/ownership check is removed.
 Compilation and disassembly are not verifier acceptance; repeat the complete
 cl02 gate before Kind. The full rejection/cleanup evidence is retained under
 `.artifacts/p9-kernel-bank-9f90681-cl02`.
+
+The `257c596` retry confirms alignment is visible, but the 5.14 verifier does
+not propagate the narrowed u32 callee comparison back to the original register
+used for indexing. Keep that bounded word argument u64 throughout the callee,
+matching the previously qualified device fixture. Do not mask an invalid index
+into range or remove the bound. This second verifier rejection remains in
+`.artifacts/p9-kernel-bank-257c596-cl02`; the bank has still not loaded/published.
