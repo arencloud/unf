@@ -804,6 +804,12 @@ targeted successful key-lifecycle logs without per-packet INFO amplification.
 The local suite passes 821 tests (26 privileged tests ignored); complete live
 cl02 qualification remains required before matching Kind. No Phase 9 closure
 or sole-cause diagnosis is inferred from this local repair.
+ADR 0390 verifies the complete `8db97bb` cl02 reply/inventory gate: 24 allows,
+eight denials, 312 WireGuard frames, zero Required plaintext/capture loss,
+three CNI retirements and both candidate/inventory retirements. All 116 existing
+CNI records remain byte-identical through guarded rollout and cleanup. The
+startup-socket observation failure and retry/log/shutdown findings are retained.
+Identical-image persistent Kind is next; full locality and Phase 9 remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -1,8 +1,9 @@
 # Phase 9 Required locality and replica closure
 
 This completes the open boundary from ADRs 0293–0294 and 0324. cl02 now runs
-`d007071` with an unchanged Native baseline; its expanded Required admission
-gate failed (ADR 0387). The historical `f984db9` Kind runtime is unavailable
+`8db97bb` with an unchanged Native baseline; its complete scoped Required reply
+and journal-inventory gate passes in ADR 0390 after the retained ADR 0387 failure.
+The matching persistent Kind gate is next. The historical `f984db9` Kind runtime is unavailable
 after the workstation reboot. ADR 0388 verifies a separately approved persistent
 Kind bootstrap on the prior cl02-passing `f984db9` Native runtime; current-runtime
 qualification must still pass cl02 first. Neither fresh bootstrap nor a successful
@@ -16,6 +17,9 @@ repair must reproduce the plan-retention/key-retirement boundary explicitly.
 ADR 0389 reproduces that retention gap and implements the positive authenticated
 tombstone check, preserving all successor/packet authority barriers. Local
 regressions pass; immutable runtime qualification remains cl02 first, then Kind.
+ADR 0390 verifies that complete cl02 runtime gate, including traffic/ciphertext,
+actual inventory counts, retirement and byte-identical existing journals. The
+matching Kind gate and production locality consumption remain required.
 
 ## Safety and efficiency boundary
 
