@@ -17,6 +17,7 @@ use unf_ipam::NodeBlockProvider;
 use unf_link::VethPlan;
 use unf_route::{NativeRoutePlan, NativeRoutingProvider, RoutingProvider as _};
 
+mod dsr;
 mod sockets;
 
 fn apply(journal: &mut AttachmentJournal, operation: TransactionOperation) {
@@ -138,13 +139,13 @@ fn evidence(records: &[AttachmentRecord]) -> (VerifiedEncryptionLocality, Admitt
     (verified, plan)
 }
 
-fn transport(maps: &mut encryption_maps::EncryptionMaps, revision: u64) {
+fn transport(maps: &mut encryption_maps::EncryptionMaps, revision: u64, service_revision: u64) {
     // Structurally admitted empty cut allows exact locality preparation only.
     // No Native or Required remote decision exists: a bank miss MUST drop.
     let config = unf_ebpf_common::EncryptionMapConfig {
         generation: 1,
         policy_revision: revision,
-        service_revision: 1,
+        service_revision,
         egress_revision: 1,
         decision_count: 0,
         transport_count: 0,
@@ -300,7 +301,7 @@ async fn privileged_publisher_main_hook_delivers_and_revokes_dual_stack() {
         .set(0, encode_policy_config(7, 1, 0, 0).unwrap(), 0)
         .unwrap();
     let mut encryption = take_encryption_maps(&mut object).unwrap();
-    transport(&mut encryption, 1);
+    transport(&mut encryption, 1, 1);
     sockets::attach(&records, &mut object).await;
     let mut sockets = sockets::Sockets::new(&records);
     sockets.matrix("unpublished", false, false);
@@ -342,13 +343,25 @@ async fn privileged_publisher_main_hook_delivers_and_revokes_dual_stack() {
     policy_config
         .set(0, encode_policy_config(7, 2, 2, 0).unwrap(), 0)
         .unwrap();
-    transport(&mut encryption, 2);
+    transport(&mut encryption, 2, 1);
     sockets.matrix("policy-deny-before-locality", true, false);
     policy_config
         .set(0, encode_policy_config(7, 3, 0, 0).unwrap(), 0)
         .unwrap();
-    transport(&mut encryption, 3);
+    transport(&mut encryption, 3, 1);
     sockets.matrix("policy-restored", false, true);
+    dsr::exercise(
+        &mut services,
+        &mut encryption,
+        &state,
+        &mut publisher,
+        &plan,
+        &evidence,
+        &object,
+        &records,
+        &mut sockets,
+    )
+    .await;
     let mut journal = state.cni_inventory.get().unwrap().journal.lock().await;
     apply(
         &mut journal,

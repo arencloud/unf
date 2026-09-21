@@ -54,4 +54,4 @@ LC_ALL=C find "$directory/bpffs" -mindepth 1 -printf '%y %D:%i %P\n' | LC_ALL=C 
 diff -u "$directory/before" "$directory/after"
 umount "$directory/bpffs"
 mounted=false
-printf 'main-composition-suite: PASS tests=3 allowed=16 denied=20 checkpoint-replay=true exact-cleanup=true controller-admission=false\n'
+printf 'main-composition-suite: PASS tests=3 allowed=24 denied=24 checkpoint-replay=true dsr-sockets=true exact-cleanup=true controller-admission=false\n'

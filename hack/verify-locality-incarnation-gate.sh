@@ -21,7 +21,7 @@ case $suite in
         : "${UNF_LOCALITY_GATE_SOURCE_REVISION:?exact expected compiled source revision}"
         [[ $UNF_LOCALITY_GATE_SOURCE_REVISION =~ ^[0-9a-f]{40}$ ]]
         test_command='["env","UNF_MAIN_COMPOSITION_ISOLATED=yes","bash","/usr/local/bin/verify-main-locality-composition"]'
-        marker='main-composition-suite: PASS tests=3 allowed=16 denied=20 checkpoint-replay=true exact-cleanup=true controller-admission=false$'
+        marker='main-composition-suite: PASS tests=3 allowed=24 denied=24 checkpoint-replay=true dsr-sockets=true exact-cleanup=true controller-admission=false$'
         memory_limit=2Gi
         cpu_limit=2
         deadline_seconds=300
@@ -114,10 +114,11 @@ cleanup() {
         [[ $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 7 ]] || result=1
     fi
     if [[ $suite == kernel-main-composition ]]; then
-        if [[ $(rg -c 'main-publisher-socket: case=.* allowed=true ' "$directory/test.log") == 16 &&
-              $(rg -c 'main-publisher-socket: case=.* allowed=false ' "$directory/test.log") == 20 &&
+        if [[ $(rg -c 'main-publisher-socket: case=.* allowed=true ' "$directory/test.log") == 24 &&
+              $(rg -c 'main-publisher-socket: case=.* allowed=false ' "$directory/test.log") == 24 &&
               $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 3 ]] &&
            rg -q 'locality-checkpoint: PASS offline-worker=true full-source-replay=true private-file=true symlink-hardlink-fifo-oversize-denied=true foreign-preserved=true bounded-worker=true kernel-authority=false$' "$directory/test.log" &&
+           rg -q 'main-locality-dsr: PASS socket-exchanges=8 withdrawn-denials=4 reversible-pairs=true backend-vip-bound=false$' "$directory/test.log" &&
            rg -q 'main-publisher-composition: PASS actual-publisher=true actual-main=true synthetic-packet-input=false controller-admission-tested=false$' "$directory/test.log" &&
            rg -q 'main-composition-cleanup: exit=0 namespaces=3$' "$directory/test.log"; then
             delivery=true

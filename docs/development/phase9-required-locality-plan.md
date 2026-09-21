@@ -458,5 +458,9 @@ one-shot offline acquisition and explicit source/durability status. Local tests
 pass; root-filesystem/worker qualification follows cl02 first, then identical
 Kind. Full process-restart packet recovery and persistence retry remain open.
 
+ADR 0441 adds local DSR LoadBalancer sockets and actual reversible connection
+state to the private composition gate. Local checks pass; the expanded
+24-positive/24-negative matrix awaits cl02 then identical Kind qualification.
+
 Commit and push each verified slice before the next. S1–S5 stabilization remains
 separate, with measured equal-workload comparisons and supported load envelopes.

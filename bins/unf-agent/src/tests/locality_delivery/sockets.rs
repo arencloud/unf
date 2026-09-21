@@ -50,6 +50,8 @@ pub(super) struct Sockets {
     target: OwnedFd,
     source_addresses: [IpAddr; 2],
     target_addresses: [IpAddr; 2],
+    service_addresses: [IpAddr; 2],
+    service_backend_ports: [u16; 2],
     sequence: u32,
     allowed: u32,
     denied: u32,
@@ -72,13 +74,24 @@ impl Sockets {
                 records[1].lease.ipv4.address.into(),
                 records[1].lease.ipv6.address.into(),
             ],
+            service_addresses: [
+                "10.96.0.10".parse().unwrap(),
+                "fd00:96::10".parse().unwrap(),
+            ],
+            service_backend_ports: [8080, 5353],
             sequence: 0,
             allowed: 0,
             denied: 0,
         }
     }
 
-    pub(super) fn matrix(&mut self, name: &str, service: bool, allow: bool) {
+    pub(super) fn matrix(
+        &mut self,
+        name: &str,
+        service: bool,
+        allow: bool,
+    ) -> std::ops::RangeInclusive<u16> {
+        let first_port = self.source_port() + 1;
         for family in 0..2 {
             for protocol in [6, 17] {
                 self.sequence += 1;
@@ -101,16 +114,27 @@ impl Sockets {
                 );
             }
         }
+        first_port..=self.source_port()
     }
 
-    fn remote(family: usize, backend: SocketAddr, service: bool, protocol: u8) -> SocketAddr {
+    pub(super) fn dsr_frontends(&mut self) {
+        self.service_addresses = [
+            "192.0.2.60".parse().unwrap(),
+            "2001:db8:ffff::60".parse().unwrap(),
+        ];
+        self.service_backend_ports = [80, 53];
+    }
+
+    fn remote(
+        &self,
+        family: usize,
+        backend: SocketAddr,
+        service: bool,
+        protocol: u8,
+    ) -> SocketAddr {
         if service {
             SocketAddr::new(
-                if family == 0 {
-                    "10.96.0.10".parse().unwrap()
-                } else {
-                    "fd00:96::10".parse().unwrap()
-                },
+                self.service_addresses[family],
                 if protocol == 6 { 80 } else { 53 },
             )
         } else {
@@ -122,7 +146,11 @@ impl Sockets {
         let receiver = in_namespace(&self.target, || {
             UdpSocket::bind(SocketAddr::new(
                 self.target_addresses[family],
-                if service { 5353 } else { 0 },
+                if service {
+                    self.service_backend_ports[1]
+                } else {
+                    0
+                },
             ))
             .unwrap()
         });
@@ -135,7 +163,7 @@ impl Sockets {
         });
         receiver.set_read_timeout(Some(TIMEOUT)).unwrap();
         sender.set_read_timeout(Some(TIMEOUT)).unwrap();
-        let remote = Self::remote(family, receiver.local_addr().unwrap(), service, 17);
+        let remote = self.remote(family, receiver.local_addr().unwrap(), service, 17);
         assert_eq!(sender.send_to(payload, remote).unwrap(), payload.len());
         let mut buffer = [0; 1500];
         match receiver.recv_from(&mut buffer) {
@@ -170,7 +198,11 @@ impl Sockets {
                 .bind(
                     &SocketAddr::new(
                         self.target_addresses[family],
-                        if service { 8080 } else { 0 },
+                        if service {
+                            self.service_backend_ports[0]
+                        } else {
+                            0
+                        },
                     )
                     .into(),
                 )
@@ -179,7 +211,7 @@ impl Sockets {
             TcpListener::from(socket)
         });
         listener.set_nonblocking(true).unwrap();
-        let remote = Self::remote(family, listener.local_addr().unwrap(), service, 6);
+        let remote = self.remote(family, listener.local_addr().unwrap(), service, 6);
         let connection = in_namespace(&self.source, || {
             let domain = if family == 0 {
                 socket2::Domain::IPV4
@@ -232,7 +264,7 @@ impl Sockets {
     }
 
     pub(super) fn finish(&self) {
-        assert_eq!((self.allowed, self.denied), (16, 20));
+        assert_eq!((self.allowed, self.denied), (24, 24));
         println!(
             "main-publisher-sockets: PASS allowed={} denied={} actual-policy=true bidirectional-main=true",
             self.allowed, self.denied

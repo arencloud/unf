@@ -1003,6 +1003,10 @@ background worker, with full-source/current-cut replay and truthful provenance
 and durability status. All 912 workspace tests and strict Clippy pass; the
 expanded privileged gate remains pending on cl02 then identical Kind. Saved
 input restores no bank authority; complete restart traffic remains open.
+ADR 0441 extends the actual socket fixture to local DSR LoadBalancer delivery,
+reversible replies and withdrawal/republication: 24 positive/24 negative cases
+are required. Local workspace tests and strict Clippy pass; live qualification
+is pending cl02 first. No fleet image or Phase 9 status is promoted.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
