@@ -202,6 +202,9 @@ require independent architecture and gates.
 
 Investigate and repair ADR 0387's missing-epoch/pending-generation failure,
 then rerun the complete inventory/Required gate on cl02 before matching Kind.
+ADR 0389 implements a regression-backed tombstone-aware catalog-retention
+repair and targeted lifecycle logging; immutable-image cl02 qualification is
+next. Local success does not establish that every live failure cause is fixed.
 Preserve the failed run and all authority state. Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical
 snapshot, candidate or isolated device gate closes full production locality.

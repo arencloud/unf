@@ -10668,18 +10668,14 @@ fn encryption_plan_cut_is_activated(
 }
 
 fn encryption_plan_cut_is_current(
+    state: &ControllerState,
     cut: &unf_encryption::NodeLocalPlanFleetCut,
     now_unix_ms: u64,
 ) -> bool {
-    cut.plans.iter().all(|plan| {
-        plan.epochs
-            .iter()
-            .filter(|epoch| epoch.state == unf_encryption::FastPathEpochState::Active)
-            .all(|epoch| {
-                now_unix_ms >= epoch.contract.valid_from_unix_ms
-                    && now_unix_ms < epoch.contract.valid_until_unix_ms
-            })
-    })
+    let keys = mutex_lock(&state.encryption_key_transparency);
+    cut.plans
+        .iter()
+        .all(|plan| plan.activation_window_is_current(now_unix_ms, &keys))
 }
 
 fn encryption_plan_catalog_requires_recovery(
@@ -11265,7 +11261,7 @@ fn encryption_plan_catalog_is_reusable(
         .is_some_and(|active| {
             active.membership_revision == source.membership_revision
                 && !encryption_plan_cut_is_activated(state, active)
-                && encryption_plan_cut_is_current(active, now_unix_ms)
+                && encryption_plan_cut_is_current(state, active, now_unix_ms)
         })
 }
 

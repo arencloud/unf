@@ -13,6 +13,9 @@ journals settled at generation `1789972093114`, without a state reset. This
 eventual recovery does not repair or requalify ADR 0387's Required failure.
 The WARN-only agent logs lack the successful key-lifecycle timeline; the next
 repair must reproduce the plan-retention/key-retirement boundary explicitly.
+ADR 0389 reproduces that retention gap and implements the positive authenticated
+tombstone check, preserving all successor/packet authority barriers. Local
+regressions pass; immutable runtime qualification remains cl02 first, then Kind.
 
 ## Safety and efficiency boundary
 

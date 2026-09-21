@@ -799,6 +799,11 @@ Nodes/UNF Pods are Ready, reports fresh/converged, CNI hashes exact, and all sev
 bootstrap log streams reviewed. This does not preserve the old Node identities
 or close restart, Required, locality or Phase 9 lifecycle qualification. See
 `docs/development/phase9-persistent-kind.md` for exact-store operations.
+ADR 0389 adds a regression-backed tombstone-aware catalog-retention check and
+targeted successful key-lifecycle logs without per-packet INFO amplification.
+The local suite passes 821 tests (26 privileged tests ignored); complete live
+cl02 qualification remains required before matching Kind. No Phase 9 closure
+or sole-cause diagnosis is inferred from this local repair.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

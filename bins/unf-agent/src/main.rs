@@ -8370,6 +8370,7 @@ impl EncryptionKeySynchronizer {
                 )
                 .context("durably activate mutually attested key epoch")?;
             info!(
+                target: "unf_agent::encryption_lifecycle",
                 epoch = target.epoch,
                 drain_seconds = self.drain_window.as_secs(),
                 "activated fleet-attested Node-local encryption key epoch"
@@ -10017,6 +10018,7 @@ fn retire_transport_free_drained_encryption_epoch(
         .retire_drained_epoch(&proof, now_unix_ms)
         .context("durably retire transport-free Node-local key epoch")?;
     info!(
+        target: "unf_agent::encryption_lifecycle",
         epoch,
         removed_expired_flow_leases = removed_flows,
         "retired transport-free drained encryption epoch after exact map and journal absence"
@@ -10147,6 +10149,7 @@ async fn retire_drained_encryption_epoch(
     let remaining_retirements = recovery.retiring.len();
     generations.recovery = recovery;
     info!(
+        target: "unf_agent::encryption_lifecycle",
         epoch = plan.epoch,
         key_retired = retire_key,
         remaining_retirements,
@@ -16685,9 +16688,13 @@ async fn consume_events(
                             let current = encryption_plans.current.as_ref()
                                 .context("adopted encryption plan disappeared")?;
                             info!(
+                                target: "unf_agent::encryption_lifecycle",
                                 generation = current.snapshot.generation.get(),
                                 membership_revision = current.snapshot.membership_revision.get(),
                                 node_uid = %current.snapshot.recipient.node_uid,
+                                epochs = ?current.snapshot.epochs.iter().filter_map(|epoch|
+                                    epoch.contract.plans.first().map(|plan| plan.source_key.epoch)
+                                ).collect::<Vec<_>>(),
                                 "durably adopted authenticated Node-local encryption plan"
                             );
                         }

@@ -144,6 +144,33 @@ pub enum NodeLocalPlanCompilerError {
 }
 
 impl NodeLocalPlanSnapshot {
+    /// Whether a previously verified snapshot remains inside its activation
+    /// window. A positive authenticated local retirement/revocation breaks
+    /// retention even before the original contract expires. Rotation, missing
+    /// publications and unrelated Nodes do not. This is only a retention hint,
+    /// never packet authority; exact successor admission remains mandatory.
+    #[must_use]
+    pub fn activation_window_is_current(
+        &self,
+        now_unix_ms: u64,
+        keys: &crate::NodeKeyTransparencyLedger,
+    ) -> bool {
+        self.epochs
+            .iter()
+            .filter(|epoch| epoch.state == FastPathEpochState::Active)
+            .all(|epoch| {
+                now_unix_ms >= epoch.contract.valid_from_unix_ms
+                    && now_unix_ms < epoch.contract.valid_until_unix_ms
+                    && contract_epoch(&epoch.contract).is_ok_and(|number| {
+                        !keys.epoch_is_tombstoned(
+                            &epoch.contract.local_node.cluster_id,
+                            &self.recipient,
+                            number,
+                        )
+                    })
+            })
+    }
+
     /// Canonicalizes and seals one all-or-nothing local compiler input.
     ///
     /// # Errors
@@ -1183,6 +1210,139 @@ mod tests {
             decisions: Vec::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn activation_window_rejects_authenticated_retirement_before_contract_expiry() {
+        let plan = manifold(20, false);
+        let mut keys = crate::NodeKeyTransparencyLedger::default();
+        keys.replace_membership(
+            "cluster-a".into(),
+            Revision::new(6),
+            vec![plan.recipient.clone()],
+        )
+        .unwrap();
+        let identity = crate::AuthenticatedNodeIdentity {
+            cluster_id: "cluster-a".into(),
+            node_name: "worker-a".into(),
+            node_uid: "uid-a".into(),
+        };
+        let mut authority = NodeKeyAuthority::new(
+            identity.cluster_id.clone(),
+            identity.node_name.clone(),
+            identity.node_uid.clone(),
+        )
+        .unwrap();
+        let mut generator = crate::OsWireGuardKeyGenerator;
+        assert!(
+            plan.activation_window_is_current(1_001, &keys),
+            "missing publications are not retirement evidence"
+        );
+        assert!(!plan.activation_window_is_current(949, &keys));
+        assert!(!plan.activation_window_is_current(2_500, &keys));
+        for epoch in 1..=7 {
+            assert_eq!(
+                authority
+                    .prepare_epoch(
+                        Revision::new(6),
+                        BTreeSet::new(),
+                        900,
+                        3_000,
+                        &mut generator
+                    )
+                    .unwrap(),
+                epoch,
+            );
+            if epoch < 7 {
+                authority
+                    .revoke_through(
+                        epoch,
+                        crate::EpochRevocationReason::FleetEpochSuperseded,
+                        901,
+                    )
+                    .unwrap();
+            }
+        }
+        authority
+            .activate_epoch(7, Revision::new(6), 1_000, 30)
+            .unwrap();
+        keys.observe(&identity, authority.publication().unwrap())
+            .unwrap();
+        assert!(plan.activation_window_is_current(1_001, &keys));
+        let mut revoked = authority.clone();
+        revoked
+            .revoke_through(7, crate::EpochRevocationReason::FleetEpochSuperseded, 1_002)
+            .unwrap();
+        let mut revoked_keys = crate::NodeKeyTransparencyLedger::default();
+        revoked_keys
+            .replace_membership(
+                "cluster-a".into(),
+                Revision::new(6),
+                vec![plan.recipient.clone()],
+            )
+            .unwrap();
+        revoked_keys
+            .observe(&identity, revoked.publication().unwrap())
+            .unwrap();
+        assert!(
+            !plan.activation_window_is_current(1_003, &revoked_keys),
+            "authenticated revocation also ends retention"
+        );
+        authority
+            .prepare_epoch(
+                Revision::new(6),
+                BTreeSet::new(),
+                1_010,
+                3_000,
+                &mut generator,
+            )
+            .unwrap();
+        authority
+            .activate_epoch(8, Revision::new(6), 1_011, 30)
+            .unwrap();
+        keys.observe(&identity, authority.publication().unwrap())
+            .unwrap();
+        assert!(
+            plan.activation_window_is_current(1_012, &keys),
+            "rotation alone must not discard an in-flight plan"
+        );
+        let proof =
+            crate::EpochDrainProof::issue("uid-a".into(), 7, Revision::new(21), 1_042, 0, 0)
+                .unwrap();
+        authority.retire_drained_epoch(&proof, 1_042).unwrap();
+        keys.observe(&identity, authority.publication().unwrap())
+            .unwrap();
+        assert!(
+            !plan.activation_window_is_current(1_043, &keys),
+            "a retired local key cannot activate an otherwise unexpired contract"
+        );
+        assert!(dormant_manifold(21).activation_window_is_current(1_043, &keys));
+        assert!(!keys.epoch_is_tombstoned("other-cluster", &plan.recipient, 7));
+        assert!(!keys.epoch_is_tombstoned("cluster-a", &plan.recipient, 0));
+        assert!(!keys.epoch_is_tombstoned("cluster-a", &plan.recipient, 8));
+        for recipient in [
+            EncryptionGenerationRecipient {
+                node_uid: "replaced-uid".into(),
+                ..plan.recipient.clone()
+            },
+            EncryptionGenerationRecipient {
+                node_name: "other-node".into(),
+                ..plan.recipient.clone()
+            },
+        ] {
+            assert!(!keys.epoch_is_tombstoned("cluster-a", &recipient, 7));
+        }
+        keys.replace_membership(
+            "cluster-a".into(),
+            Revision::new(7),
+            vec![plan.recipient.clone()],
+        )
+        .unwrap();
+        assert!(
+            plan.activation_window_is_current(1_043, &keys),
+            "membership replacement drops unjoined publications"
+        );
     }
 
     #[test]

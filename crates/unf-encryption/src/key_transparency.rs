@@ -213,6 +213,26 @@ impl EncryptionKeyBootstrap {
 }
 
 impl NodeKeyTransparencyLedger {
+    /// Positive, authenticated evidence that one exact member can no longer
+    /// supply an epoch. Missing publications are not tombstone evidence.
+    /// This borrowed lookup grants no replacement key or packet authority.
+    #[must_use]
+    pub fn epoch_is_tombstoned(
+        &self,
+        cluster_id: &str,
+        recipient: &EncryptionGenerationRecipient,
+        epoch: u64,
+    ) -> bool {
+        epoch != 0
+            && self.cluster_id.as_deref() == Some(cluster_id)
+            && self.publications.get(recipient).is_some_and(|publication| {
+                epoch
+                    <= publication
+                        .retired_through_epoch
+                        .max(publication.revoked_through_epoch)
+            })
+    }
+
     /// Returns the monotonic public epoch frontier observed for this exact
     /// membership. An empty controller starts at epoch one. A member that
     /// abandons an unactivated epoch raises the floor so every other member
