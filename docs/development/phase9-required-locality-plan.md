@@ -101,6 +101,10 @@ ADR 0416 closes that paired isolated bank gate on corrected `fd416df`, cl02
 first then identical-image Kind, including exact cleanup inventories, unchanged
 journals and full log review. Actual socket delivery and production L3
 integration remain next; L4/L5/Q are not promoted.
+ADR 0417 adds the bounded actual-socket gate: eight positive and sixteen
+negative TCP/UDP dual-stack cases, retaining every existing native/kernel
+check. cl02-before-Kind immutable qualification remains required; synthetic
+policy input and native replies do not qualify production composition.
 
 ## Safety and efficiency boundary
 

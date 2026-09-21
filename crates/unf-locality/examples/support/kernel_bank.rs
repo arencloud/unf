@@ -19,6 +19,10 @@ use unf_locality::{
 };
 use unf_route::NativeRoutePlan;
 
+#[path = "packet_delivery.rs"]
+mod packet_delivery;
+use packet_delivery::{Delivery, pair};
+
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 struct Input(PacketInput);
@@ -184,9 +188,22 @@ pub async fn verify(
         .host_address;
     let mut object = fixture()?;
     let mut runtime = runtime(&object)?;
+    let mut delivery = if std::env::var("UNF_KERNEL_BANK_PACKET_DELIVERY").as_deref() == Ok("yes") {
+        Some(Delivery::attach(&leased, &mut object)?)
+    } else {
+        None
+    };
     let wire4 = packet(v4);
     let wire6 = packet(v6);
     probe(&mut object, "unpublished-bank", v4, &wire4, 2)?;
+    pair(
+        &mut delivery,
+        &mut object,
+        "unpublished",
+        [v4, v6],
+        &[17],
+        false,
+    )?;
     let worker = LocalityObservationWorker::default();
     let pin_root = std::env::var("UNF_KERNEL_BANK_BPFFS")?;
     ensure!(
@@ -213,7 +230,40 @@ pub async fn verify(
     let id = bank.publish(&mut runtime, journal, gate, current)?;
     ensure!(id == bank.program_id()?, "publication identity");
     probe(&mut object, "unarmed-fence", v4, &wire4, 2)?;
+    pair(
+        &mut delivery,
+        &mut object,
+        "unarmed",
+        [v4, v6],
+        &[17],
+        false,
+    )?;
     runtime.set_applied(current)?;
+    pair(
+        &mut delivery,
+        &mut object,
+        "current",
+        [v4, v6],
+        &[6, 17],
+        true,
+    )?;
+    pair(
+        &mut delivery,
+        &mut object,
+        "wrong-source-identity",
+        [
+            PacketInput {
+                source_identity: 18,
+                ..v4
+            },
+            PacketInput {
+                source_identity: 18,
+                ..v6
+            },
+        ],
+        &[17],
+        false,
+    )?;
     for (name, input, wire, hop) in [
         ("ipv4-current", v4, &wire4, 22),
         ("ipv6-current", v6, &wire6, 21),
@@ -292,28 +342,71 @@ pub async fn verify(
     );
     runtime.withdraw()?;
     probe(&mut object, "withdrawn-dispatch", v4, &wire4, 2)?;
+    pair(
+        &mut delivery,
+        &mut object,
+        "withdrawn",
+        [v4, v6],
+        &[17],
+        false,
+    )?;
     bank.publish(&mut runtime, journal, gate, current)?;
     probe(&mut object, "publish-does-not-rearm-fence", v4, &wire4, 2)?;
+    pair(
+        &mut delivery,
+        &mut object,
+        "not-rearmed",
+        [v4, v6],
+        &[17],
+        false,
+    )?;
     runtime.set_applied(current)?;
     target_route.delete().await?;
     probe(&mut object, "target-route-absent-v4", v4, &wire4, 2)?;
     probe(&mut object, "target-route-absent-v6", v6, &wire6, 2)?;
+    pair(
+        &mut delivery,
+        &mut object,
+        "route-absent",
+        [v4, v6],
+        &[17],
+        false,
+    )?;
     target_route.apply().await?;
     // Restoring the identical route is safe while the exact device and nonce
     // remain live. Revoking the nonce below cannot be repaired by route state.
     probe(&mut object, "target-route-restored-v4", v4, &wire4, 7)?;
     probe(&mut object, "target-route-restored-v6", v6, &wire6, 7)?;
+    pair(
+        &mut delivery,
+        &mut object,
+        "route-restored",
+        [v4, v6],
+        &[6, 17],
+        true,
+    )?;
     journal.apply(TransactionRequest::new(
         CNI_TRANSACTION_SCHEMA_VERSION,
         TransactionOperation::BeginDelete { key: source_key },
     ))?;
     probe(&mut object, "revoked-source-nonce-v4", v4, &wire4, 2)?;
     probe(&mut object, "revoked-source-nonce-v6", v6, &wire6, 2)?;
+    pair(
+        &mut delivery,
+        &mut object,
+        "nonce-revoked",
+        [v4, v6],
+        &[6, 17],
+        false,
+    )?;
     ensure!(
         bank.publish(&mut runtime, journal, gate, current).is_err(),
         "stale original journal cut accepted"
     );
     runtime.withdraw()?;
+    if let Some(delivery) = &delivery {
+        delivery.finish()?;
+    }
     println!(
         "kernel-locality-bank: PASS endpoints=2 addresses=4 exact-runtime=true sealed=true seed-destroyed=true nonce-revoked=true packet-delivery-tested=false production-integration=false"
     );

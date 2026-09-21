@@ -21,6 +21,10 @@ case $suite in
         test_command='["bash","/usr/local/bin/verify-observed-locality-bank"]'
         marker='observed-locality-suite: PASS native-checks=28 bank-checks=true namespace-cleanup=true packet-delivery-tested=false$'
         ;;
+    kernel-delivery)
+        test_command='["env","UNF_KERNEL_BANK_ISOLATED_CONTAINER=yes","UNF_KERNEL_BANK_PACKET_DELIVERY=yes","bash","/usr/local/bin/verify-observed-locality-bank"]'
+        marker='kernel-locality-suite: PASS bank-checks=true namespace-cleanup=true packet-delivery-tested=true$'
+        ;;
     kernel-bank)
         test_command='["env","UNF_KERNEL_BANK_ISOLATED_CONTAINER=yes","bash","/usr/local/bin/verify-observed-locality-bank"]'
         marker='kernel-locality-suite: PASS bank-checks=true namespace-cleanup=true packet-delivery-tested=false$'
@@ -48,6 +52,7 @@ namespace=
 namespace_uid=
 cleanup() {
     local result=$?
+    local removed=false delivery=false
     trap - EXIT
     if [[ -n $namespace && -n $namespace_uid ]]; then
         "${kc[@]}" -n "$namespace" get pods -o json > "$directory/pods-after.json" || result=1
@@ -55,7 +60,9 @@ cleanup() {
         [[ $(wc -c < "$directory/test.log") -le 1048576 ]] || result=1
         "${kc[@]}" -n "$namespace" get events -o json > "$directory/events.json" || result=1
         if [[ $("${kc[@]}" get namespace "$namespace" -o jsonpath='{.metadata.uid}') == "$namespace_uid" ]]; then
-            "${kc[@]}" delete namespace "$namespace" --wait=true --timeout=90s > "$directory/cleanup.log" || result=1
+            if "${kc[@]}" delete namespace "$namespace" --wait=true --timeout=90s > "$directory/cleanup.log" &&
+                "${kc[@]}" get namespace "$namespace" --ignore-not-found -o name > "$directory/namespace-after.txt" &&
+                [[ ! -s $directory/namespace-after.txt ]]; then removed=true; else result=1; fi
         else
             result=1
         fi
@@ -63,8 +70,15 @@ cleanup() {
     if [[ $result == 0 ]]; then
         rg -q "$marker" "$directory/test.log" || result=1
     fi
-    jq -n --argjson code "$result" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" \
-        '{schemaVersion:1,result:(if $code==0 then "passed" else "failed" end),platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:($code==0),packetDeliveryTested:false}' > "$directory/evidence.json"
+    if [[ $suite == kernel-delivery ]]; then
+        if rg -q 'kernel-locality-delivery: PASS allowed=8 denied=16 protocols=tcp,udp families=4,6 request-bank=true reply-native=true production-policy=false$' "$directory/test.log" &&
+            [[ $(rg -c 'kernel-locality-delivery: name=.* delivered=true ' "$directory/test.log") == 8 &&
+               $(rg -c 'kernel-locality-delivery: name=.* delivered=false ' "$directory/test.log") == 16 ]]; then
+            delivery=true
+        else result=1; fi
+    fi
+    jq -n --argjson code "$result" --argjson removed "$removed" --argjson delivery "$delivery" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" \
+        '{schemaVersion:2,result:(if $code==0 then "passed" else "failed" end),platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:$removed,packetDeliveryTested:$delivery}' > "$directory/evidence.json"
     printf 'Incarnation gate result=%s evidence=%s\n' "$result" "$directory"
     exit "$result"
 }

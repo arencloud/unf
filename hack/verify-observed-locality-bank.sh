@@ -22,6 +22,11 @@ peer_b=unf-ob-p-b-$suffix
 namespaces=()
 declare -A namespace_inodes=()
 stage=create-namespaces
+packet_delivery=false
+if [[ ${UNF_KERNEL_BANK_PACKET_DELIVERY:-} == yes ]]; then
+    [[ ${UNF_KERNEL_BANK_ISOLATED_CONTAINER:-} == yes ]]
+    packet_delivery=true
+fi
 cleanup() {
     local result=$?
     trap - EXIT
@@ -31,7 +36,7 @@ cleanup() {
         else result=1; fi
     done
     if [[ $result == 0 ]]; then
-        printf 'observed-locality-suite: PASS native-checks=28 bank-checks=true namespace-cleanup=true packet-delivery-tested=false\n'
+        printf 'observed-locality-suite: PASS native-checks=28 bank-checks=true namespace-cleanup=true packet-delivery-tested=%s\n' "$packet_delivery"
     else
         printf 'observed-locality-suite: FAIL exit=%s stage=%s\n' "$result" "$stage"
     fi
@@ -83,6 +88,6 @@ if [[ ${UNF_KERNEL_BANK_ISOLATED_CONTAINER:-} == yes ]]; then
     stage=unmount-bpffs
     umount "$UNF_KERNEL_BANK_BPFFS"
     rmdir "$UNF_KERNEL_BANK_BPFFS"
-    printf 'kernel-locality-suite: PASS bank-checks=true namespace-cleanup=true packet-delivery-tested=false\n'
+    printf 'kernel-locality-suite: PASS bank-checks=true namespace-cleanup=true packet-delivery-tested=%s\n' "$packet_delivery"
 fi
 stage=delete-namespaces
