@@ -129,6 +129,10 @@ ADR 0423 adds exclusive owned runtime pins, atomic fresh creation, exact loaded
 map-ID verification and reopen withdrawal of fence/bank/continuations. Missing
 pins are never silently recreated. The complete paired diagnostic and actual
 agent startup/boot decision remain pending; production is still `45d85d5`.
+ADR 0424 passes the full runtime-owner gate on cl02 then identical-image Kind,
+including armed reopen withdrawal, exact bindings and retained failure cases.
+Production journals/runtime remain unchanged and logs are reviewed. Actual
+agent startup/boot fencing and consuming integration are next; L3/L4/L5/Q stay open.
 
 ## Safety and efficiency boundary
 

@@ -46,6 +46,9 @@ prerequisites to L3/Phase 9 closure.
 ADR 0423 implements owned startup pins and fail-closed reopen, including exact
 loader bindings and explicit fresh-create versus reopen decisions. Paired kernel
 qualification and actual early agent startup integration remain pending.
+ADR 0424 qualifies the complete owned-startup diagnostic on cl02 then matching
+Kind with unchanged production state and reviewed logs. Actual agent startup,
+writer and packet integration remain open; no Phase 9 row is promoted.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the
