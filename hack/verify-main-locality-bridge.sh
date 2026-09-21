@@ -13,7 +13,7 @@ for name in \
     privileged_egress_source_steering_is_policy_first_destination_exact_and_dual_stack \
     privileged_load_balancer_dsr_preserves_dual_stack_vips_and_direct_return \
     privileged_service_packets_translate_dual_stack_and_survive_churn \
-    service_reply::privileged_reverse_service_requires_current_forward_policy_witness; do
+    service_reply::privileged_reverse_service_requires_live_forward_policy_witness; do
     /usr/local/bin/unf-main-tests --ignored --exact "tests::$name" --nocapture --test-threads=1 | tee "$output"
     grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$output"
     printf 'main-locality-check: name=%s passed=true\n' "$name"

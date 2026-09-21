@@ -68,7 +68,7 @@ fn deny(source: u32, destination: u32, protocol: u8, port: u16) -> PolicyMapEntr
 
 #[test]
 #[ignore = "requires actual main BPF execution and UNF_EBPF_OBJECT"]
-fn privileged_reverse_service_requires_current_forward_policy_witness() {
+fn privileged_reverse_service_requires_live_forward_policy_witness() {
     for ipv6 in [false, true] {
         for protocol in [6, 17] {
             verify(ipv6, protocol);
@@ -214,8 +214,23 @@ fn verify(ipv6: bool, protocol: u8) {
     native_transport(&mut encryption, 2);
     assert_eq!(
         run_tc(&mut ebpf, "unf_observe_ingress", &reply).0,
+        3,
+        "ADR 0070 established reply was lost across policy revision churn"
+    );
+    let idle = unf_ebpf_common::connection_timeout_ns(protocol).unwrap();
+    let expired_at = monotonic_time_ns()
+        .unwrap()
+        .checked_sub(idle + 1_000_000_000)
+        .expect("fixture requires kernel uptime longer than the protocol timeout");
+    for key in connections.keys().collect::<Result<Vec<_>, _>>().unwrap() {
+        let mut value = connections.get(&key, 0).unwrap();
+        value[..8].copy_from_slice(&expired_at.to_ne_bytes());
+        connections.insert(key, value, 0).unwrap();
+    }
+    assert_eq!(
+        run_tc(&mut ebpf, "unf_observe_ingress", &reply).0,
         2,
-        "stale policy witness survived current revision"
+        "expired policy witness retained Service reply authority"
     );
     assert_eq!(run_tc(&mut ebpf, "unf_observe_ingress", &request).0, 3);
     assert_eq!(
@@ -243,6 +258,16 @@ fn verify(ipv6: bool, protocol: u8) {
     );
     native_transport(&mut encryption, 2);
     assert_eq!(run_tc(&mut ebpf, "unf_observe_ingress", &reply).0, 3);
+    policy_config.set(0, [0; 24], 0).unwrap();
+    assert_eq!(
+        run_tc(&mut ebpf, "unf_observe_ingress", &reply).0,
+        2,
+        "Service reply bypassed absent active policy configuration"
+    );
+    policy_config
+        .set(0, encode_policy_config(7, 2, 1, 0).unwrap(), 0)
+        .unwrap();
+    assert_eq!(run_tc(&mut ebpf, "unf_observe_ingress", &request).0, 3);
     let forward_deny = deny(11, 22, protocol, backend_port);
     policies
         .insert(
@@ -264,7 +289,7 @@ fn verify(ipv6: bool, protocol: u8) {
         "denied forward created unsolicited reply authority"
     );
     println!(
-        "service-reply-policy: family={} protocol={protocol} current-reply=true missing-witness-denied=true stale-witness-denied=true missing-transport-denied=true denied-forward-reply-denied=true backend-preserved=true",
+        "service-reply-policy: family={} protocol={protocol} current-reply=true revision-churn-preserved=true missing-witness-denied=true expired-witness-denied=true absent-policy-denied=true missing-transport-denied=true denied-forward-reply-denied=true backend-preserved=true",
         if ipv6 { 6 } else { 4 }
     );
 }

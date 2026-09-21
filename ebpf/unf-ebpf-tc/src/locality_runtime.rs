@@ -73,6 +73,9 @@ pub(super) fn prepare_service_reply<const IPV6: bool>(direction: Direction, tcp_
         populate_connection_keys(observation, key, reverse);
         #[allow(unsafe_code)]
         let now = unsafe { bpf_ktime_get_ns() };
+        // ADR 0070: a live established witness survives unrelated global
+        // revision churn; protocol expiry and nonzero current policy still
+        // apply. The common policy/transport stages remain authoritative.
         if !refresh_connection(reverse, active_policy_revision(), now) {
             return TC_ACT_SHOT;
         }

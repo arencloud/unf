@@ -83,6 +83,10 @@ log review. Reverse-Service, selected-bank delivery and recovery remain open.
 ADR 0435 implements the policy-tracked reverse-Service bridge and expands the
 actual-main diagnostic to seven tests. Local checks pass; immutable cl02-first
 qualification and live selected-bank delivery/recovery remain pending.
+ADR 0436 retains the first expanded cl02 gate failure: its revision-equality
+assertion contradicted ADR 0070. Explicit expiry/absent-policy negatives replace
+that mistaken expectation, while preserving established-flow continuity.
+Corrected cl02-first qualification remains required; Kind has not advanced.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

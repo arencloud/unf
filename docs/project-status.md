@@ -981,6 +981,10 @@ ADR 0435 adds current forward-policy witnesses to enforcing reverse-Service
 replies before normal policy/locality/transport handling. Backend ownership is
 preserved across VIP rewriting. Local checks pass; the expanded seven-test
 immutable gate must pass cl02 then Kind. Full runtime delivery remains open.
+ADR 0436 retains the failed cl02 reverse-Service assertion and corrects the
+fixture to the existing revision-churn-safe, protocol-bounded reply contract
+(ADR 0070), with explicit expiry and absent-policy negatives. No production
+permission changes or Kind advancement; corrected cl02 qualification is next.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

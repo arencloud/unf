@@ -178,6 +178,10 @@ ADR 0435 routes enforcing reverse-Service replies through current forward-policy
 witness checks and normal policy/locality/transport finalization, preserving
 backend ownership separately from rewritten VIP bytes. The expanded seven-test
 main-program diagnostic must pass cl02 before Kind; live composition is pending.
+ADR 0436 retains that cl02 gate's failure and corrects its revision-equality
+expectation to ADR 0070's existing live established-flow contract. Explicit
+expiry/absent-policy negatives are added. Corrected cl02 rerun is required;
+the failed image is not advanced to Kind and no live permission is weakened.
 
 ## Safety and efficiency boundary
 
