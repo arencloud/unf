@@ -1020,6 +1020,11 @@ ADR 0444 qualifies `4c47699` local DSR sockets on cl02 then identical Kind:
 24 positive exchanges/24 denials, exact reversible reply state, withdrawal and
 republication, full cleanup/log review and preserved journals. This closes the
 private DSR slice only; fleet, mixed replicas and restart closure remain open.
+ADR 0445 finds a fleet privilege boundary before rollout: cl02's actual agent
+and SCC omit SYS_ADMIN, required by namespace-bound observation/seeding and
+the private-mount loader. Fleet deployment is held pending an explicit choice
+of scoped privileged helper or approved lab capability expansion. Production
+stays `45d85d5`; privileged diagnostics do not establish restricted deployability.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

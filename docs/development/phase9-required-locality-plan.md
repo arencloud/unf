@@ -235,7 +235,7 @@ Current closure checklist (historical evidence follows):
 | Owned startup, journal reader floor and retirement | Paired isolated checks verified; production migration/recovery still requires the new fleet runtime |
 | Actual publisher + main classifier + PodIP/Service sockets | Verified cl02 then identical Kind in private networks, ADR 0439 |
 | Established Service reply provenance/transport | Paired actual-main checks verified, ADRs 0436/0438; revision churn preserved, protocol expiry enforced |
-| Full authenticated controller and real reconciliation loops | Pending new-runtime fleet validation; fixture-provided placement is not that proof |
+| Full authenticated controller and real reconciliation loops | Fleet rollout held on explicit privilege decision (ADR 0445): cl02 agent/SCC omit SYS_ADMIN required by namespace operations. Fixture-provided placement/privileged diagnostics are not restricted-runtime proof |
 | Offline restart, crash-stage resource cleanup and fresh re-observation | Private source filesystem/offline worker verified cl02 then Kind (ADR 0442); full restart traffic and crash-stage cleanup pending; never restore serialized bank/device authority |
 | DSR sockets, workload replacement, mixed replicas and remote Required ciphertext | Local DSR publisher/main-hook sockets verified cl02 then Kind (ADR 0444); replacement/mixed/remote Required and complete fleet L4/L5 matrix pending |
 | Kernel admission/status/explanation | Candidate status still explicitly separates placement from admission/delivery; finish consuming status integration |

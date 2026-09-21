@@ -364,6 +364,10 @@ remains pending; this paired slice grants no additional runtime permission.
 ADR 0444 also passes the identical-image local DSR publisher/socket gate on
 cl02 then Kind, with 24 positive exchanges/24 denials and actual reversible
 reply state. Full authenticated fleet, mixed replicas, restart and Q remain open.
+ADR 0445 holds fleet rollout before schema-5 migration: cl02's restricted agent
+and SCC lack the namespace operations' SYS_ADMIN capability. A scoped helper or
+explicitly approved lab privilege expansion must be selected and qualified;
+privileged diagnostic success alone cannot close this deployment boundary.
 
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
