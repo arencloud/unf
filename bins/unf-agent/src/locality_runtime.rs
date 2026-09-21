@@ -238,7 +238,10 @@ impl LocalityRuntime {
         let path = main_object.with_file_name("unf-ebpf-locality");
         let fd = rustix::fs::open(
             &path,
-            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC
+                | rustix::fs::OFlags::NONBLOCK,
             rustix::fs::Mode::empty(),
         )?;
         let file = fs::File::from(fd);

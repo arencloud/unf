@@ -26,6 +26,8 @@ use super::{
 };
 use crate::LeasedLocalityBank;
 
+mod private_pins;
+
 pub(crate) struct PreparationControl {
     pub cancelled: Arc<AtomicBool>,
     pub deadline: Instant,
@@ -84,38 +86,41 @@ pub(crate) async fn prepare(
     // Only four exact live shared FDs are briefly pinned. Bank maps and programs
     // are anonymous. Aya can CREATE missing pins, so exact ID checks below are
     // mandatory even after the pin syscall succeeds. Never trust names alone.
-    let pins = tempfile::Builder::new()
-        .prefix("unf-locality-")
-        .tempdir_in(pin_root)?;
-    let shared = [
-        ("UL_LEASE_V1", &gate),
-        ("UL_INPUT_V1", &runtime.input),
-        ("UL_FENCE_V1", &runtime.fence),
-        ("UL_RESUME_V1", &runtime.resume),
-    ];
-    let mut loader = EbpfLoader::new();
-    loader
-        .map_max_entries("UL_ADDRESS_V1", addresses)
-        .map_max_entries("UL_ENDPOINT_V1", count)
-        .map_max_entries("UL_DEVICE_V1", count * 2)
-        .map_max_entries("UL_POINTER_V1", count)
-        .map_max_entries("UL_SEEDED_V1", count)
-        .map_max_entries("UL_LEASE_V1", gate_capacity);
-    for (name, map) in shared {
-        let path = pins.path().join(name);
-        map.pin(&path)?;
-        loader.map_pin_path(name, path);
-    }
-    let mut object = loader.load(elf).context("load fresh locality ELF/maps")?;
-    for (name, expected) in shared {
-        ensure!(
-            data(&object, name)?.info()?.id() == expected.info()?.id(),
-            "substituted locality shared map {name}"
-        );
-    }
-    // Remove only our random, privately created pin directory. Explicit close
-    // surfaces cleanup errors; actual descriptors remain held by this object.
-    pins.close()?;
+    let mut object = private_pins::with_private_mount(pin_root, |pin_root| {
+        let pins = tempfile::Builder::new()
+            .prefix("unf-locality-")
+            .tempdir_in(pin_root)?;
+        let shared = [
+            ("UL_LEASE_V1", &gate),
+            ("UL_INPUT_V1", &runtime.input),
+            ("UL_FENCE_V1", &runtime.fence),
+            ("UL_RESUME_V1", &runtime.resume),
+        ];
+        let mut loader = EbpfLoader::new();
+        loader
+            .map_max_entries("UL_ADDRESS_V1", addresses)
+            .map_max_entries("UL_ENDPOINT_V1", count)
+            .map_max_entries("UL_DEVICE_V1", count * 2)
+            .map_max_entries("UL_POINTER_V1", count)
+            .map_max_entries("UL_SEEDED_V1", count)
+            .map_max_entries("UL_LEASE_V1", gate_capacity);
+        for (name, map) in shared {
+            let path = pins.path().join(name);
+            map.pin(&path)?;
+            loader.map_pin_path(name, path);
+        }
+        let object = loader.load(elf).context("load fresh locality ELF/maps")?;
+        for (name, expected) in shared {
+            ensure!(
+                data(&object, name)?.info()?.id() == expected.info()?.id(),
+                "substituted locality shared map {name}"
+            );
+        }
+        // Remove only our random, privately created pin directory. Explicit close
+        // surfaces cleanup errors; actual descriptors remain held by this object.
+        pins.close()?;
+        Ok(object)
+    })?;
     validate_shapes(&object, count, addresses)?;
     fill(&mut object, &leased, config, control)?;
     let seed: &mut SchedClassifier = object

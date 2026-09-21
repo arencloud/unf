@@ -1011,6 +1011,11 @@ ADR 0442 qualifies `a6eeb4c` private-filesystem/offline-worker recovery on cl02
 then identical Kind, along with all seven main checks and sixteen positive/
 twenty negative socket cases. All logs reviewed, journals preserved, production
 unchanged. Full restart and fleet qualification remain open.
+ADR 0443 places bank-loader adapter pins in a joined leaf thread's private
+mount namespace, with explicit success/error/panic/SIGKILL lifetime tests and
+foreign-residue preservation. All 913 workspace tests and strict Clippy pass;
+the expanded privileged diagnostic awaits cl02 then identical Kind. No fleet
+runtime has changed and full process recovery remains open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

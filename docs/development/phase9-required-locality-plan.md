@@ -462,5 +462,10 @@ ADR 0441 adds local DSR LoadBalancer sockets and actual reversible connection
 state to the private composition gate. Local checks pass; the expanded
 24-positive/24-negative matrix awaits cl02 then identical Kind qualification.
 
+ADR 0443 implements thread-lifetime private bpffs adapter pins, removing shared
+preparation-pin persistence from the loader design. Local checks pass; explicit
+kernel success/error/panic/SIGKILL reclamation and the socket matrix must pass
+cl02 before Kind. Whole-agent crash recovery remains separate.
+
 Commit and push each verified slice before the next. S1–S5 stabilization remains
 separate, with measured equal-workload comparisons and supported load envelopes.

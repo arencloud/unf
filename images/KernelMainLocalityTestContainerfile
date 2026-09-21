@@ -12,11 +12,15 @@ RUN export UNF_BUILD_REVISION="${UNF_SOURCE_REVISION}" \
     && cargo test --locked --release --package unf-agent --bin unf-agent --no-run \
     && test "$(find target/release/deps -maxdepth 1 -type f -executable -name 'unf_agent-*' | wc -l)" = 1 \
     && find target/release/deps -maxdepth 1 -type f -executable -name 'unf_agent-*' -exec cp '{}' /tmp/unf-main-tests ';'
+RUN cargo test --locked --release --package unf-locality --lib --no-run \
+    && test "$(find target/release/deps -maxdepth 1 -type f -executable -name 'unf_locality-*' | wc -l)" = 1 \
+    && find target/release/deps -maxdepth 1 -type f -executable -name 'unf_locality-*' -exec cp '{}' /tmp/unf-locality-tests ';'
 
 FROM ${TEST_IMAGE}
 ARG UNF_SOURCE_REVISION
 LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
 COPY --from=builder /tmp/unf-main-tests /usr/local/bin/unf-main-tests
+COPY --from=builder /tmp/unf-locality-tests /usr/local/bin/unf-locality-tests
 COPY .artifacts/unf-main-locality-test /usr/local/lib/unf/main-locality-test
 COPY hack/verify-main-locality-bridge.sh /usr/local/bin/verify-main-locality-bridge
 COPY hack/verify-main-locality-composition.sh /usr/local/bin/verify-main-locality-composition
