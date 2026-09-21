@@ -66,6 +66,9 @@ ADR 0407 passes the complete observed-bank fixture on cl02, preserving all
 116 existing records. Matching Kind follows. The log audit separately finds
 recurring key-floor/witness failures and an incomplete attestation cut; this
 encryption-health finding requires repair/requalification, not a state reset.
+ADR 0408 passes matching Kind on the identical diagnostic, preserving journals
+and reviewing retained logs. Observed-bank preparation is qualified on both
+kernels; production bank/packet integration and full lifecycle closure remain.
 
 ## Safety and efficiency boundary
 
