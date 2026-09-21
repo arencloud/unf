@@ -105,6 +105,10 @@ ADR 0417 adds the bounded actual-socket gate: eight positive and sixteen
 negative TCP/UDP dual-stack cases, retaining every existing native/kernel
 check. cl02-before-Kind immutable qualification remains required; synthetic
 policy input and native replies do not qualify production composition.
+ADR 0418 passes that complete `35f9e1b` gate on cl02 then identical-image Kind:
+eight actual successful exchanges and sixteen denials on each platform,
+complete cleanup, unchanged journals and reviewed logs. Production admission
+coordination and packet composition remain required; L3/L4/L5/Q stay open.
 
 ## Safety and efficiency boundary
 

@@ -918,6 +918,11 @@ production application delivery and full L3/L4/L5/Q remain unverified.
 ADR 0416 passes the corrected `fd416df` complete bank gate on cl02 then matching
 Kind, including exact private cleanup and journal preservation. Actual socket
 delivery and production L3 integration remain open; no Phase 9 gate is promoted.
+ADRs 0417–0418 implement and qualify isolated sealed-bank socket delivery on
+cl02 then identical-image Kind: TCP/UDP dual-stack, eight allowed and sixteen
+denied cases per platform, unchanged production journals and reviewed logs.
+Synthetic policy input/native replies are explicit; production composition,
+mixed replicas, restart continuity and L3/L4/L5/Q remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
