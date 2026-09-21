@@ -362,3 +362,26 @@ fn single_record_rollback_restores_failed_creation_commit_abort_and_removal() {
         );
     }
 }
+
+#[test]
+fn registration_is_bound_to_one_hook_and_open_journal_not_to_a_changing_cut() {
+    let directory = tempfile::tempdir().unwrap();
+    let first_path = directory.path().join("first.json");
+    let second_path = directory.path().join("second.json");
+    let mut first = AttachmentJournal::open(&first_path, provider()).unwrap();
+    let mut second = AttachmentJournal::open(&second_path, provider()).unwrap();
+    let (hook, _, _) = observer(&first_path);
+    let registration = first.install_retirement(Box::new(hook)).unwrap();
+    let (hook, _, _) = observer(&second_path);
+    let foreign = second.install_retirement(Box::new(hook)).unwrap();
+    assert!(first.retirement_matches(&registration));
+    assert!(!first.retirement_matches(&foreign));
+    assert!(!second.retirement_matches(&registration));
+    let cut = first.cut().unwrap();
+    ready(&mut first, "first");
+    assert!(!first.is_current(&cut));
+    assert!(first.retirement_matches(&registration));
+    drop(first);
+    let reopened = AttachmentJournal::open(&first_path, provider()).unwrap();
+    assert!(!reopened.retirement_matches(&registration));
+}

@@ -13,6 +13,7 @@ members = [
     "crates/unf-gobgp",
     "crates/unf-ipam",
     "crates/unf-link",
+    "crates/unf-locality",
     "crates/unf-loadbalancer",
     "crates/unf-route",
     "crates/unf-runtime",

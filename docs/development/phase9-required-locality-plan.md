@@ -47,6 +47,10 @@ ADR 0402 adds locally verified per-incarnation journal retirement before durable
 teardown, with failure/retry fences and single-record rollback. The kernel gate
 and actual bank publisher must install and consume this boundary; no live
 locality permission is enabled by the journal API alone.
+ADR 0403 adds the kernel-backed incarnation gate: exact journal registration,
+full-nonce/serial leases, synchronous scoped deletion and no tombstone growth.
+Local regressions pass; real kernel qualification is next on cl02 then Kind.
+The live authenticated bank consumer and restart fencing are still pending.
 
 ## Safety and efficiency boundary
 

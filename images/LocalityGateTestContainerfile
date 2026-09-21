@@ -1,0 +1,15 @@
+# Disposable kernel/journal revocation diagnostic; no cluster runtime install.
+ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
+ARG TEST_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:7dfb1ba3ff7078b6d004f50a7e2d7657f763483b3f5c9eb13724e88b0ec52948
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY bins ./bins
+COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
+RUN cargo build --locked --release --package unf-locality --example kernel_incarnation_gate
+
+FROM ${TEST_IMAGE}
+ARG UNF_SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
+COPY --from=builder /src/target/release/examples/kernel_incarnation_gate /usr/local/bin/kernel-incarnation-gate

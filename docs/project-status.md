@@ -863,6 +863,10 @@ durable deletion on revocation failure and eliminating whole-inventory rollback
 copies. All 843 workspace tests and strict Clippy pass; the kernel-backed hook
 and immutable publisher remain pending. No live locality or performance claim
 is promoted by this locally verified prerequisite.
+ADR 0403 adds the kernel-backed full-nonce/serial gate with opaque journal
+registration, scoped revocation and bounded storage without retained tombstones.
+All 849 workspace tests and strict Clippy pass. Its immutable diagnostic must
+pass cl02 before matching Kind; the live packet consumer remains unimplemented.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

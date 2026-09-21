@@ -228,6 +228,9 @@ both deployed kernels; proceed with actual authenticated/banked L3 consumption.
 ADR 0402 implements the journal's pre-persistence incarnation-retirement hook
 and single-record rollback, locally verified without a kernel-admission claim.
 Actual bank/gate integration and cl02-before-Kind qualification remain required.
+ADR 0403 implements the bounded kernel incarnation gate and disposable platform
+qualifier. Local tests pass; kernel execution on cl02 then Kind remains pending.
+No production packet admission or Phase 9 closure is claimed.
 Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical
 snapshot, candidate or isolated device gate closes full production locality.

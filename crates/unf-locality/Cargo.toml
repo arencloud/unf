@@ -1,0 +1,19 @@
+[package]
+name = "unf-locality"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+aya.workspace = true
+thiserror.workspace = true
+unf-cni-state = { path = "../unf-cni-state" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+unf-ipam = { path = "../unf-ipam" }
+
+[lints]
+workspace = true

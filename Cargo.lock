@@ -3561,6 +3561,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "unf-locality"
+version = "0.1.0"
+dependencies = [
+ "aya",
+ "tempfile",
+ "thiserror 2.0.20",
+ "unf-cni-state",
+ "unf-ipam",
+]
+
+[[package]]
 name = "unf-policy"
 version = "0.1.0"
 dependencies = [

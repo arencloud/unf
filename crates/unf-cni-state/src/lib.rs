@@ -367,7 +367,18 @@ pub struct AttachmentJournal {
     attachments: BTreeMap<AttachmentKey, AttachmentRecord>,
     instance: Option<Arc<()>>,
     revision: u64,
-    retirement: Option<Box<dyn AttachmentRetirement>>,
+    retirement: Option<RetirementHook>,
+}
+
+struct RetirementHook {
+    owner: Arc<()>,
+    callback: Box<dyn AttachmentRetirement>,
+}
+
+/// Opaque identity of one hook installation in one open journal. Not a
+/// serialized permission; it remains distinct across journal reopen.
+pub struct AttachmentRetirementRegistration {
+    owner: Arc<()>,
 }
 
 /// Synchronous, process-local invalidation of a previously published attachment
@@ -550,16 +561,30 @@ impl AttachmentJournal {
     pub fn install_retirement(
         &mut self,
         retirement: Box<dyn AttachmentRetirement>,
-    ) -> Result<(), JournalError> {
+    ) -> Result<AttachmentRetirementRegistration, JournalError> {
         if self.retirement.is_some() || self.instance.is_none() {
             return Err(JournalError::InvalidTransition(
                 "retirement installation requires a durable journal without an existing hook"
                     .into(),
             ));
         }
-        self.retirement = Some(retirement);
+        let owner = Arc::new(());
+        self.retirement = Some(RetirementHook {
+            owner: Arc::clone(&owner),
+            callback: retirement,
+        });
         self.instance = Some(Arc::new(()));
-        Ok(())
+        Ok(AttachmentRetirementRegistration { owner })
+    }
+
+    /// Checks installation identity, independently of a changing inventory cut.
+    /// A publisher must additionally check its exact current cut under this
+    /// journal's transaction lock before issuing a kernel lease.
+    #[must_use]
+    pub fn retirement_matches(&self, registration: &AttachmentRetirementRegistration) -> bool {
+        self.retirement
+            .as_ref()
+            .is_some_and(|hook| Arc::ptr_eq(&hook.owner, &registration.owner))
     }
 
     /// Applies one validated, durable transaction operation.
@@ -676,7 +701,7 @@ impl AttachmentJournal {
             && record.phase == AttachmentPhase::Ready
             && let Some(token) = &record.creation_token
             && let Some(retirement) = &self.retirement
-            && let Err(error) = retirement.retire(token)
+            && let Err(error) = retirement.callback.retire(token)
         {
             previous.restore(self);
             // The hook may have partially revoked. Never reuse a pre-failure
