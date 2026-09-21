@@ -21,6 +21,9 @@ pub(crate) struct RuntimeMaps {
     pub fence: MapData,
     pub resume: MapData,
     pub dispatch: MapData,
+    // Keep the exclusive process owner alive through every bank's retained Arc.
+    pub owner: Option<std::fs::File>,
+    pub pin_directory: Option<std::path::PathBuf>,
 }
 
 impl LocalityRuntimeMaps {
@@ -41,6 +44,8 @@ impl LocalityRuntimeMaps {
             fence: MapData::from_fd(fence)?,
             resume: MapData::from_fd(resume)?,
             dispatch: MapData::from_fd(dispatch)?,
+            owner: None,
+            pin_directory: None,
         };
         check_shape(&maps.input, MapType::PerCpuArray, 4, 80, 1, 0)?;
         check_shape(&maps.fence, MapType::Array, 4, 32, 1, 128)?;

@@ -125,6 +125,10 @@ ADR 0422 passes that complete reader-floor gate on cl02 then matching Kind,
 including the frozen old executable's rejection, all kernel/socket checks,
 unchanged production journals and log review. Actual early runtime-map fencing
 and production agent/packet wiring remain next; L3/L4/L5/Q stay open.
+ADR 0423 adds exclusive owned runtime pins, atomic fresh creation, exact loaded
+map-ID verification and reopen withdrawal of fence/bank/continuations. Missing
+pins are never silently recreated. The complete paired diagnostic and actual
+agent startup/boot decision remain pending; production is still `45d85d5`.
 
 ## Safety and efficiency boundary
 

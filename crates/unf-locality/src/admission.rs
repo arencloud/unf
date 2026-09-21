@@ -224,6 +224,23 @@ impl LocalityApplyGuard {
 }
 
 impl LocalityAdmission {
+    /// Bind the real loader while retaining exclusive startup ownership.
+    ///
+    /// # Errors
+    /// Reports missing owned pins or poisoned synchronization.
+    pub fn configure_loader(&self, loader: &mut aya::EbpfLoader<'_>) -> Result<()> {
+        lock(&self.state)?.runtime.configure_loader(loader)
+    }
+
+    /// Check the newly loaded runtime's actual shared map identities before
+    /// any TC attachment. Names or compatible shapes alone are insufficient.
+    ///
+    /// # Errors
+    /// Reports missing/substituted maps or poisoned synchronization.
+    pub fn verify_loaded(&self, object: &aya::Ebpf) -> Result<()> {
+        lock(&self.state)?.runtime.verify_loaded(object)
+    }
+
     /// Take exclusive map ownership and withdraw before any CNI-serving startup
     /// or input mutation. Both components start unknown, including on restart.
     ///

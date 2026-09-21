@@ -931,6 +931,9 @@ ADRs 0421–0422 add and qualify the durable journal reader floor on cl02 then
 matching Kind. The actual old agent rejects the private schema-5 journal before
 CNI bind; all prior kernel/socket checks pass. Production journals remain
 unchanged. Early runtime-map fencing and real agent/packet integration are next.
+ADR 0423 implements exclusive runtime-map ownership, atomic private pin creation
+and restart withdrawal, without inferring fresh startup from missing pins.
+Its complete cl02-before-Kind gate and actual agent integration remain pending.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

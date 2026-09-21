@@ -43,6 +43,9 @@ trusted policy input and native replies, not production packet composition.
 Early runtime-map fencing before route/CNI startup, actual writer/bank wiring,
 policy/Service/egress/reverse-path composition and restart continuity remain
 prerequisites to L3/Phase 9 closure.
+ADR 0423 implements owned startup pins and fail-closed reopen, including exact
+loader bindings and explicit fresh-create versus reopen decisions. Paired kernel
+qualification and actual early agent startup integration remain pending.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

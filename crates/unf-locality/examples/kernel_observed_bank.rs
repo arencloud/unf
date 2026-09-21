@@ -21,6 +21,8 @@ use unf_route::{NativeRoutePlan, NativeRoutingProvider, RoutingProvider};
 mod journal_floor;
 #[path = "support/kernel_bank.rs"]
 mod kernel_bank;
+#[path = "support/runtime_owner.rs"]
+mod runtime_owner;
 
 fn request(operation: TransactionOperation) -> TransactionRequest {
     TransactionRequest::new(CNI_TRANSACTION_SCHEMA_VERSION, operation)
@@ -195,6 +197,13 @@ async fn main() {
     let second_plan = create(&mut journal, provider, "second", &args[1]).await;
     let records = journal.records();
     let (evidence, context) = evidence(&records);
+    if std::env::var("UNF_LOCALITY_RUNTIME_OWNER_TEST").as_deref() == Ok("yes") {
+        runtime_owner::verify(
+            Path::new(&std::env::var("UNF_KERNEL_BANK_BPFFS").unwrap()),
+            &context,
+        )
+        .unwrap();
+    }
     let gate = IncarnationGate::install(&mut journal, 8).unwrap();
     if std::env::var("UNF_LOCALITY_JOURNAL_FLOOR_TEST").as_deref() == Ok("yes") {
         journal_floor::verify(

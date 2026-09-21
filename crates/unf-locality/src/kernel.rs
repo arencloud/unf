@@ -2,6 +2,7 @@
 //! delivery and cannot be restored from serialized metadata or old pins.
 
 pub(crate) mod build;
+mod pins;
 pub(crate) mod runtime;
 mod sys;
 
