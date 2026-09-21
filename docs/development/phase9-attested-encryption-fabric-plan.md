@@ -68,6 +68,9 @@ ADR 0430 makes placement acquisition independent of remote Required decisions
 and preserves it across unrelated key/transport-plan churn, without relaxing
 the full applied cut or real journal/kernel fences. Packet/recovery validation
 and measured stabilization remain pending.
+ADR 0431 qualifies mixed-MTU observation and actual selection readback with
+the complete startup/bank/socket diagnostic on cl02 then identical-image Kind.
+Production state is unchanged; full runtime and L3/L4/L5/Q remain open.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

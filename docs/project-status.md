@@ -962,6 +962,10 @@ ADR 0430 supports pure-local demand by acquiring placement for all admitted
 plans, with full-cut reuse across unrelated transport/key churn. Native
 qualification now has an explicit all-plans observation mode; fixture retirement
 is checked separately. These code changes do not promote L3/L4/L5/Q or S1.
+ADR 0431 passes the complete mixed-MTU/selection-readback diagnostic on cl02
+then identical-image Kind. Existing journals are unchanged; all current/init
+and retained logs are reviewed, with warnings retained. Real publisher/writer/
+packet composition and L3/L4/L5/Q remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

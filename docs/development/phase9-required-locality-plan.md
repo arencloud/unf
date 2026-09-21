@@ -159,6 +159,9 @@ across unrelated transport/key-plan churn. The new runtime's scoped reply gate
 must use `UNF_REQUIRED_REPLY_LOCALITY_ACQUISITION=all-plans`; Native placement
 convergence is distinct from fixture retirement. Actual packet/recovery
 qualification remains open, and this is not an S1 resource measurement.
+ADR 0431 passes the expanded mixed-MTU/selected-program diagnostic on cl02 then
+identical `5f03031` Kind, preserving journals and reviewing all retained logs.
+Actual publisher/writer/packet composition and L3/L4/L5/Q remain open.
 
 ## Safety and efficiency boundary
 
