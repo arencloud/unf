@@ -8274,12 +8274,20 @@ impl EncryptionKeySynchronizer {
                     changed = true;
                     continue;
                 }
-                if epoch < bootstrap.epoch_floor {
+                if epoch < bootstrap.epoch_floor && expired {
                     bail!(
-                        "active encryption transition epoch {epoch} is behind fleet floor {}",
+                        "expired encryption transition epoch {epoch} is behind fleet floor {}",
                         bootstrap.epoch_floor
                     );
                 }
+                // The floor is the highest issued public epoch, not a
+                // revocation of every lower viable transition. A faster peer
+                // may already have activated this exact round, retired its
+                // predecessor and prepared the next one. Do not stop before
+                // publication/reciprocal-cut consumption: that would strand a
+                // lagging member until both of its keys expire. No local
+                // mutation or activation is authorized here; the existing
+                // complete-cut, membership, lifetime and drain checks remain.
                 return Ok(changed);
             }
 
@@ -16684,7 +16692,7 @@ async fn consume_events(
                         }
                     }
                     Err(error) => {
-                        warn!(%error, "encryption key publication failed; retaining Node-local key authority");
+                        warn!(error = %format!("{error:#}"), "encryption key publication failed; retaining Node-local key authority");
                     }
                 }
             }
@@ -19960,6 +19968,8 @@ fn init_tracing() {
 
 #[cfg(test)]
 mod tests {
+    mod key_rotation;
+
     use super::*;
     use aya::programs::{TestRun, TestRunOptions};
     use std::os::unix::fs::symlink;

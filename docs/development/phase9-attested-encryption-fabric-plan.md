@@ -235,6 +235,9 @@ ADR 0404 verifies the disposable kernel/journal incarnation gate on cl02.
 Run the identical image on retained Kind before consuming the new gate.
 ADR 0405 passes matching Kind. Continue the authenticated immutable bank and
 packet-policy-first production consumer; full Phase 9 remains open.
+ADR 0409 reproduces a viable transition blocked before reciprocal-cut consumption
+by a faster member's issuance floor. The narrow repair preserves all activation
+barriers; rebuilt runtime qualification on cl02 then Kind remains required.
 ADR 0408 passes the matching observed-bank fixture on persistent Kind. Both
 kernel preparations are qualified; live packet integration and the separate
 cl02 key-lifecycle finding remain open, as do L3/L4/L5/Q.

@@ -40,6 +40,10 @@ neither Ready Pods nor the isolated bank test close encryption health or S1.
 ADR 0408 passes matching persistent Kind with unchanged journals and reviewed
 retained logs. This closes only the observed-bank prerequisite, not the cl02
 key-lifecycle finding, production packet integration or resource qualification.
+ADR 0409 adds a deterministic two-member reproduction and narrow progress
+repair for a viable transition behind an issuance floor. No key reset or
+activation bypass is introduced. Live rotation and traffic qualification remain
+required before treating that repair as verified; S1–S5 stay open.
 
 Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required

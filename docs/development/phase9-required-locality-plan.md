@@ -69,6 +69,10 @@ encryption-health finding requires repair/requalification, not a state reset.
 ADR 0408 passes matching Kind on the identical diagnostic, preserving journals
 and reviewing retained logs. Observed-bank preparation is qualified on both
 kernels; production bank/packet integration and full lifecycle closure remain.
+ADR 0409 reproduces and repairs a viable-key-transition progress stall behind
+a faster member's issuance floor, preserving complete-cut and drain barriers.
+Current-runtime cl02-before-Kind requalification remains required; other
+warning causes and actual locality packet integration are not closed by it.
 
 ## Safety and efficiency boundary
 

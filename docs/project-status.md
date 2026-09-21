@@ -886,6 +886,9 @@ five-agent policy/Service convergence is not encryption-health qualification.
 ADR 0408 passes matching Kind on the identical image, preserving journals and
 reviewing current/retained logs. The observed-bank prerequisite is verified on
 both kernels; actual packet integration and Phase 9 closure remain open.
+ADR 0409 reproduces and repairs one key-floor progress stall without a key reset
+or incomplete-cut activation. Immutable runtime qualification and investigation
+of the remaining witness warnings are still required, cl02 before Kind.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
