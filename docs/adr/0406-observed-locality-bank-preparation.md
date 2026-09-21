@@ -79,6 +79,12 @@ aliases, route-drift/cancellation retirement, stale applied context/journal
 rejection and scoped revocation. The fixture sends no workload traffic and
 touches no production CNI journal or pin. cl02 must pass before matching Kind.
 
+The first immutable-image build from `9bc8e4b` compiled both helpers but stopped
+before publication because `.containerignore` excluded the new shell suite.
+The allowlist now includes that exact script; credential/artifact exclusions
+remain unchanged. The failed build is retained in
+`.artifacts/p9-observed-bank-build.log`; no live execution occurred from it.
+
 The live agent does not yet consume this new library. Next integrate frozen
 device maps/private seeds, the immutable program publisher and policy-first
 packet path, with current-context/journal fences and restart migration. The
