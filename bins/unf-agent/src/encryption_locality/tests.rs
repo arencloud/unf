@@ -1,4 +1,5 @@
 use super::*;
+mod checkpoint;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use unf_common::IdentityId;
 use unf_encryption::{
@@ -325,7 +326,7 @@ async fn cancelled_replay_keeps_the_single_worker_slot_until_real_completion() {
     let slot = cache.work_slot.clone().try_acquire_owned().unwrap();
     let (started_tx, started_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let work = tokio::task::spawn_blocking(move || -> Result<VerifiedEncryptionLocality> {
+    let work = tokio::task::spawn_blocking(move || -> Result<Option<PlacementResult>> {
         let _slot = slot;
         started_tx.send(()).unwrap();
         release_rx
@@ -336,6 +337,7 @@ async fn cancelled_replay_keeps_the_single_worker_slot_until_real_completion() {
     cache.pending = Some(PendingPlacement {
         context,
         plan_digest: plan.admitted_digest,
+        source: PlacementSource::Controller,
         task: tokio::spawn(async move { work.await.unwrap() }),
     });
     tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
@@ -362,4 +364,41 @@ async fn cancelled_replay_keeps_the_single_worker_slot_until_real_completion() {
     .unwrap();
     drop(slot);
     assert_eq!(cache.work_slot.available_permits(), 1);
+}
+
+#[test]
+fn failed_or_cleared_candidate_never_rearms_checkpoint_recovery() {
+    let mut cache = PlacementCache {
+        recovery_attempted: true,
+        source: Some(PlacementSource::PrivateCheckpoint),
+        checkpoint_durable: true,
+        ..PlacementCache::default()
+    };
+    cache.clear().unwrap();
+    assert!(cache.recovery_attempted);
+    assert!(cache.source.is_none() && !cache.checkpoint_durable);
+    record_observation(&cache, &state(), false);
+}
+
+#[test]
+fn recovered_source_status_never_implies_kernel_or_delivery_authority() {
+    let (evidence, _) = crate::cni_inventory::tests::placement("pod-a", 17, true);
+    let state = state();
+    let mut cache = PlacementCache {
+        candidate: Some((plan().admitted_digest, evidence)),
+        source: Some(PlacementSource::PrivateCheckpoint),
+        checkpoint_durable: true,
+        ..PlacementCache::default()
+    };
+    record_observation(&cache, &state, false);
+    let wire = serde_json::to_value(status_for(&state)).unwrap();
+    assert_eq!(wire["observation"]["source"], "privateCheckpoint");
+    assert_eq!(wire["observation"]["checkpointDurable"], true);
+    assert_eq!(wire["kernelAdmitted"], false);
+    assert_eq!(wire["observedDelivery"], false);
+    cache.clear().unwrap();
+    record_observation(&cache, &state, false);
+    let wire = serde_json::to_value(status_for(&state)).unwrap();
+    assert_eq!(wire["observation"]["source"], serde_json::Value::Null);
+    assert_eq!(wire["observation"]["checkpointDurable"], false);
 }

@@ -354,6 +354,10 @@ All-Pod logs and public journals were inspected; no ERROR/restart or durable
 generation mismatch explains that sample. Preserve both failed windows and
 instrument the packet path before proceeding to Kind or claiming closure.
 
+ADR 0440 implements private placement-source replay without restoring kernel
+authority. Local checks pass; cl02-first root-filesystem/offline-worker and
+full restart packet qualification remain pending. Phase 9 stays open.
+
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
 commit/push and evidence record for every step. Four of the six initially

@@ -60,6 +60,100 @@ fn response(request: &EncryptionLocalityRequest) -> EncryptionLocalityResponse {
 }
 
 #[test]
+fn private_checkpoint_replays_source_and_requires_the_entire_current_cut() {
+    let request = EncryptionLocalityRequest::issue(context()).unwrap();
+    let wire = serde_json::to_vec(&response(&request)).unwrap();
+    let (captured, original) =
+        EncryptionLocalityResponse::capture_authenticated(&wire, &request, &context()).unwrap();
+    let checkpoint = serde_json::to_vec(&captured).unwrap();
+    assert_eq!(
+        CapturedEncryptionLocality::replay_private_checkpoint(&checkpoint, &context()).unwrap(),
+        original
+    );
+    for field in 0..7 {
+        let mut changed = context();
+        match field {
+            0 => changed.cluster_id.push('x'),
+            1 => changed.recipient.node_name.push('x'),
+            2 => changed.recipient.node_uid.push('x'),
+            3 => changed.membership_revision = Revision::new(99),
+            4 => changed.identity_epoch += 1,
+            5 => changed.identity_revision = Revision::new(99),
+            _ => changed.routing_revision = Revision::new(99),
+        }
+        assert!(
+            CapturedEncryptionLocality::replay_private_checkpoint(&checkpoint, &changed).is_err()
+        );
+    }
+    let valid = serde_json::to_value(captured).unwrap();
+    for (pointer, value) in [
+        ("/schemaVersion", serde_json::json!(2)),
+        ("/request/schemaVersion", serde_json::json!(2)),
+        (
+            "/request/nonce/0",
+            serde_json::json!(request.nonce[0].wrapping_add(1)),
+        ),
+        (
+            "/response/workloads/0/workloadUid",
+            serde_json::json!("substitution"),
+        ),
+        (
+            "/response/workloads/0/addresses/0",
+            serde_json::json!("10.42.0.99"),
+        ),
+        (
+            "/response/nodes/0/uid",
+            serde_json::json!("replacement-node"),
+        ),
+        (
+            "/response/certificate/context/identityEpoch",
+            serde_json::json!(99),
+        ),
+    ] {
+        let mut changed = valid.clone();
+        *changed.pointer_mut(pointer).unwrap() = value;
+        assert!(
+            CapturedEncryptionLocality::replay_private_checkpoint(
+                &serde_json::to_vec(&changed).unwrap(),
+                &context()
+            )
+            .is_err(),
+            "{pointer}"
+        );
+    }
+    for pointer in ["", "/request", "/response", "/response/workloads/0"] {
+        let mut changed = valid.clone();
+        changed
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("unrecognized".into(), serde_json::json!(true));
+        assert!(
+            CapturedEncryptionLocality::replay_private_checkpoint(
+                &serde_json::to_vec(&changed).unwrap(),
+                &context()
+            )
+            .is_err(),
+            "{pointer}"
+        );
+    }
+    assert!(matches!(
+        CapturedEncryptionLocality::replay_private_checkpoint(
+            &vec![0; MAX_ENCRYPTION_LOCALITY_CHECKPOINT_BYTES + 1],
+            &context()
+        ),
+        Err(EncryptionLocalityDistributionError::Capacity)
+    ));
+    // An archive is not an HTTP response, including when its original nonce
+    // is known. It must use the distinct trusted-file replay boundary.
+    assert!(
+        EncryptionLocalityResponse::decode_authenticated(&checkpoint, &request, &context())
+            .is_err()
+    );
+}
+
+#[test]
 fn nonce_bound_replay_yields_only_exact_dual_stack_placement() {
     let request = EncryptionLocalityRequest::issue(context()).unwrap();
     let wire = serde_json::to_vec(&response(&request)).unwrap();

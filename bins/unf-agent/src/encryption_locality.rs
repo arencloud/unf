@@ -10,6 +10,8 @@ use unf_encryption::{
     VerifiedEncryptionLocality,
 };
 
+mod checkpoint;
+
 use super::{
     AgentState, EncryptionKeySynchronizer, EncryptionPlanSynchronizer, Ordering, read_agent_token,
 };
@@ -20,12 +22,29 @@ pub(super) struct PlacementCache {
     work_slot: std::sync::Arc<tokio::sync::Semaphore>,
     attachments: Option<super::cni_inventory::InventorySelection>,
     publisher: super::locality_publisher::BankPublisher,
+    recovery_attempted: bool,
+    source: Option<PlacementSource>,
+    checkpoint_durable: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum PlacementSource {
+    Controller,
+    PrivateCheckpoint,
+}
+
+struct PlacementResult {
+    evidence: VerifiedEncryptionLocality,
+    source: PlacementSource,
+    durable: bool,
 }
 
 struct PendingPlacement {
     context: EncryptionLocalityContext,
     plan_digest: AdmittedNodeLocalPlanDigest,
-    task: tokio::task::JoinHandle<Result<VerifiedEncryptionLocality>>,
+    source: PlacementSource,
+    task: tokio::task::JoinHandle<Result<Option<PlacementResult>>>,
 }
 
 impl Drop for PendingPlacement {
@@ -42,6 +61,9 @@ impl Default for PlacementCache {
             work_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             attachments: None,
             publisher: super::locality_publisher::BankPublisher::default(),
+            recovery_attempted: false,
+            source: None,
+            checkpoint_durable: false,
         }
     }
 }
@@ -52,6 +74,10 @@ impl PlacementCache {
         self.candidate = None;
         self.pending = None;
         self.attachments = None;
+        self.source = None;
+        self.checkpoint_durable = false;
+        // Recovery is a once-per-process bootstrap attempt. Clearing a failed
+        // candidate must not resurrect the archive on the next polling tick.
         Ok(())
     }
 
@@ -68,6 +94,7 @@ enum PlacementPhase {
     #[default]
     Absent,
     Fetching,
+    Restoring,
     Replayed,
     Failed,
 }
@@ -84,6 +111,8 @@ pub(super) struct PlacementObservation {
     journal_selected_attachments: usize,
     journal_selected_addresses: usize,
     journal_selected_payload_bytes: usize,
+    source: Option<PlacementSource>,
+    checkpoint_durable: bool,
 }
 
 pub(super) fn record_observation(cache: &PlacementCache, state: &AgentState, failed: bool) {
@@ -98,6 +127,8 @@ pub(super) fn record_observation(cache: &PlacementCache, state: &AgentState, fai
         observation.context = Some(evidence.certificate().context().clone());
         observation.plan_digest = Some(*digest);
         observation.local_addresses = evidence.certificate().addresses().len();
+        observation.source = cache.source;
+        observation.checkpoint_durable = cache.checkpoint_durable;
         if let Some(selected) = &cache.attachments {
             (
                 observation.journal_selected_attachments,
@@ -106,7 +137,10 @@ pub(super) fn record_observation(cache: &PlacementCache, state: &AgentState, fai
             ) = selected.counts();
         }
     } else if let Some(pending) = &cache.pending {
-        observation.phase = PlacementPhase::Fetching;
+        observation.phase = match pending.source {
+            PlacementSource::Controller => PlacementPhase::Fetching,
+            PlacementSource::PrivateCheckpoint => PlacementPhase::Restoring,
+        };
         observation.context = Some(pending.context.clone());
         observation.plan_digest = Some(pending.plan_digest);
     }
@@ -276,9 +310,14 @@ async fn synchronize_inner(
                 .pending
                 .take()
                 .context("finished locality task disappeared")?;
-            let evidence = (&mut pending.task)
+            let Some(result) = (&mut pending.task)
                 .await
-                .context("locality worker failed")??;
+                .context("locality worker failed")??
+            else {
+                // No saved source: the next tick fetches with a fresh nonce.
+                return Ok(());
+            };
+            let evidence = result.evidence;
             if applied_context(plan, authority.cluster_id(), state).as_ref() != Some(&context)
                 || evidence.certificate().context() != &context
             {
@@ -290,6 +329,8 @@ async fn synchronize_inner(
                 "replayed locality placement candidate; kernel admission remains separate"
             );
             plans.locality.candidate = Some((plan.admitted_digest, evidence));
+            plans.locality.source = Some(result.source);
+            plans.locality.checkpoint_durable = result.durable;
             refresh_attachments(&mut plans.locality, state, plan, &context).await?;
             return Ok(());
         }
@@ -303,7 +344,45 @@ async fn synchronize_inner(
         return Ok(());
     };
     let digest = plan.admitted_digest;
+    if !plans.locality.recovery_attempted {
+        plans.locality.recovery_attempted = true;
+        start_recovery(plans, context, digest, work_slot);
+        return Ok(());
+    }
     start_fetch(plans, context, digest, work_slot)
+}
+
+fn start_recovery(
+    plans: &mut EncryptionPlanSynchronizer,
+    context: EncryptionLocalityContext,
+    plan_digest: AdmittedNodeLocalPlanDigest,
+    work_slot: tokio::sync::OwnedSemaphorePermit,
+) {
+    let path = checkpoint::path(&plans.state_path);
+    let expected = context.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let _work_slot = work_slot;
+        let Some(bytes) = checkpoint::load(&path)? else {
+            return Ok(None);
+        };
+        let evidence = unf_encryption::CapturedEncryptionLocality::replay_private_checkpoint(
+            &bytes, &expected,
+        )?;
+        Ok(Some(PlacementResult {
+            evidence,
+            source: PlacementSource::PrivateCheckpoint,
+            durable: true,
+        }))
+    });
+    plans.locality.pending = Some(PendingPlacement {
+        context,
+        plan_digest,
+        source: PlacementSource::PrivateCheckpoint,
+        task: tokio::spawn(async move {
+            task.await
+                .context("locality checkpoint replay worker failed")?
+        }),
+    });
 }
 
 fn start_fetch(
@@ -327,6 +406,7 @@ fn start_fetch(
         .post(endpoint.clone())
         .bearer_auth(read_agent_token(&plans.agent_token_path)?)
         .json(&request);
+    let path = checkpoint::path(&plans.state_path);
     let task = tokio::spawn(async move {
         let response = builder
             .send()
@@ -340,8 +420,19 @@ fn start_fetch(
             let _work_slot = work_slot;
             // Replay against the requested cut here; the event-loop handoff
             // separately checks that this is still the actual applied cut.
-            EncryptionLocalityResponse::decode_authenticated(&bytes, &request, &request.context)
-                .map_err(anyhow::Error::from)
+            let (captured, evidence) = EncryptionLocalityResponse::capture_authenticated(&bytes, &request, &request.context)?;
+            // The same bounded worker slot covers replay and durable I/O. A
+            // cancelled write cannot race a new writer after releasing a slot.
+            // A stale saved cut grants nothing: handoff and restart each require
+            // the independently current full cut and fresh kernel observations.
+            let durable = match checkpoint::save(&path, &captured, &request.context) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(%error, "locality source checkpoint not durable; online candidate remains independently authenticated");
+                    false
+                }
+            };
+            Ok(Some(PlacementResult { evidence, source: PlacementSource::Controller, durable }))
         })
         .await
         .context("locality replay worker failed")?
@@ -349,6 +440,7 @@ fn start_fetch(
     plans.locality.pending = Some(PendingPlacement {
         context,
         plan_digest,
+        source: PlacementSource::Controller,
         task,
     });
     Ok(())

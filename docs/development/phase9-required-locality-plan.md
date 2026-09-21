@@ -453,5 +453,10 @@ retained rotated logs rather than claiming the truncated tail was complete.
 Track warnings and request timeouts as well as crashes/OOM/verifier errors.
 Never reset maps, authority journals, history or frontiers to manufacture a pass.
 
+ADR 0440 implements bounded private placement-source recovery, full-cut replay,
+one-shot offline acquisition and explicit source/durability status. Local tests
+pass; root-filesystem/worker qualification follows cl02 first, then identical
+Kind. Full process-restart packet recovery and persistence retry remain open.
+
 Commit and push each verified slice before the next. S1–S5 stabilization remains
 separate, with measured equal-workload comparisons and supported load envelopes.

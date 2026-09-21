@@ -998,6 +998,11 @@ ADR 0439 passes the actual publisher/main-hook socket gate on cl02 then identica
 including translated Services, policy, writer withdrawal and journal retirement.
 Exact cleanup, preserved journals and complete log review pass. Restart and
 full authenticated fleet/mixed-replica qualification remain open, as does Phase 9.
+ADR 0440 adds bounded root-owned placement-source recovery in the existing
+background worker, with full-source/current-cut replay and truthful provenance
+and durability status. All 912 workspace tests and strict Clippy pass; the
+expanded privileged gate remains pending on cl02 then identical Kind. Saved
+input restores no bank authority; complete restart traffic remains open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

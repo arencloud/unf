@@ -43,7 +43,7 @@ ip netns exec "$fabric" bash -ec '
     printf "1\n" > /proc/sys/net/ipv6/conf/all/forwarding
     [[ $(< /proc/sys/net/ipv4/ip_forward) == 1 && $(< /proc/sys/net/ipv6/conf/all/forwarding) == 1 ]]
 '
-for test in tests::diagnostic_build_revision_matches_source tests::locality_delivery::privileged_publisher_main_hook_delivers_and_revokes_dual_stack; do
+for test in tests::diagnostic_build_revision_matches_source encryption_locality::tests::checkpoint::privileged_private_checkpoint_replay_is_bounded_and_offline tests::locality_delivery::privileged_publisher_main_hook_delivers_and_revokes_dual_stack; do
     ip netns exec "$fabric" /usr/local/bin/unf-main-tests --ignored --exact "$test" --nocapture --test-threads=1 | tee "$directory/test.log"
     grep -Eq '^test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log"
 done
@@ -54,4 +54,4 @@ LC_ALL=C find "$directory/bpffs" -mindepth 1 -printf '%y %D:%i %P\n' | LC_ALL=C 
 diff -u "$directory/before" "$directory/after"
 umount "$directory/bpffs"
 mounted=false
-printf 'main-composition-suite: PASS tests=2 allowed=16 denied=20 exact-cleanup=true controller-admission=false\n'
+printf 'main-composition-suite: PASS tests=3 allowed=16 denied=20 checkpoint-replay=true exact-cleanup=true controller-admission=false\n'
