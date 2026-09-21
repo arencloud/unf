@@ -1,7 +1,7 @@
 # Phase 9 Required locality and replica closure
 
 This completes the open boundary from ADRs 0293–0294 and 0324. cl02 now runs
-`8db97bb` with an unchanged Native baseline; its complete scoped Required reply
+`6d71a30` with an unchanged Native baseline; its complete scoped Required reply
 and journal-inventory gate passes in ADR 0390 after the retained ADR 0387 failure.
 ADR 0391 passes the matching persistent Kind gate on identical images. The
 historical `f984db9` Kind runtime is unavailable
@@ -24,7 +24,8 @@ required. Missing SIGTERM handling observed during image checks remains a
 separate recovery defect, not hidden by the traffic pass. ADRs 0392–0394 repair
 signal handling and qualify isolated PID-1 shutdown on cl02 then Kind; configured
 fabric rollout/recovery passes on cl02 in ADR 0395 with the complete scoped
-traffic gate; matching live Kind is next. These slices do not close L3.
+traffic gate; ADR 0396 passes matching configured recovery and expanded traffic
+on persistent Kind. Both fleets now run `6d71a30`. These slices do not close L3.
 
 ## Safety and efficiency boundary
 

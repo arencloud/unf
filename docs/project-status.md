@@ -826,8 +826,13 @@ ADR 0395 then qualifies `6d71a30` on cl02: configured controller/one-agent
 Native shutdown/recovery with proven zero exits, unchanged 116 CNI records,
 24 traffic allows/eight denials and 131 WireGuard frames with zero Required
 plaintext/capture loss. The failed direct-deletion workflow, NodePorts rejection
-Pods and slow admission/retry warnings remain recorded. Matching live Kind
-still runs `8db97bb`; full Phase 9 remains open.
+Pods and slow admission/retry warnings remain recorded. ADR 0396 passes matching
+live Kind on identical `6d71a30` images: configured Native recovery, 24 allows,
+eight denials, 73 WireGuard frames, zero Required plaintext/capture loss and
+exact existing CNI preservation. All fresh reports converge; current Pods are
+Ready with zero restarts. Log review retains 72 warnings, no ERROR and a failed
+retrospective observer covered by its already-open retiring stream. Production
+locality consumption, L4/L5/Q and full Phase 9 remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

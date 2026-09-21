@@ -43,6 +43,9 @@ reboot. ADR 0388 verifies an explicitly approved separate persistent Kind bootst
 on the last cl02-passing `f984db9` Native runtime. This is new infrastructure,
 not retained-state continuity. ADR 0391 subsequently qualifies the scoped
 current-runtime reply/inventory gate, not the full Phase 9 lifecycle.
+ADRs 0392–0396 then repair SIGTERM handling and qualify isolated signal exits,
+configured Native recovery and expanded traffic on identical `6d71a30` images,
+cl02 before Kind. These scoped gates do not close L3/L4/L5/Q.
 
 Historical repair checkpoint (ADRs 0316–0318): Native expiry/empty-Namespace
 continuity passes cl02 then matching-image retained Kind on runtime `5ea1bd2`.
@@ -210,7 +213,7 @@ observed missing SIGTERM shutdown handling: ADR 0392 implements and locally
 regression-tests the service drain path. ADRs 0393–0394 repair the terminal-phase
 observer and qualify isolated PID-1 shutdown on cl02 then matching Kind.
 ADR 0395 qualifies guarded cl02 rollout, Native configured shutdown/recovery
-and the expanded reply/inventory gate. Matching live Kind is next. The failed
+and the expanded reply/inventory gate. ADR 0396 passes matching live Kind. The failed
 direct-Pod-deletion qualifier and slow Required admission remain recorded.
 Continue L3 production integration.
 Complete authenticated

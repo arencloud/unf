@@ -8,7 +8,8 @@ retention and qualify the expanded reply/inventory gate on identical `8db97bb`
 images, cl02 before the separately approved persistent Kind. ADRs 0392–0394
 repair SIGTERM handling and pass isolated PID-1 SIGTERM/SIGINT gates on both
 platforms. ADR 0395 qualifies configured Native controller/one-agent recovery
-and the full scoped reply/inventory gate on cl02; matching live Kind is next.
+and the full scoped reply/inventory gate on cl02; ADR 0396 passes matching live
+Kind with 72 retained warnings, no ERROR and exact existing CNI preservation.
 It retains a failed direct-deletion qualifier, 35-observation Required admission
 and controller-replacement retry bursts, not a seamless-recovery claim. The workstation
 installer mock still fails on its host-socket SELinux permission boundary;

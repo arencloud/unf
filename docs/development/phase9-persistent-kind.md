@@ -6,6 +6,9 @@ replacement for historical retained-state evidence. Qualification order remains
 the cl02-passing `f984db9` Native runtime. ADR 0391 subsequently qualifies the
 scoped reply/inventory gate on `8db97bb`; neither result closes the full lifecycle.
 ADR 0394 tests isolated `6d71a30` signal probes without upgrading the live fleet.
+ADR 0396 subsequently upgrades the live fleet to those same images after cl02,
+qualifying Native configured controller/agent recovery and the expanded
+reply/inventory gate. Full locality and lifecycle qualification remain open.
 
 Run commands from the repository root. The kubeconfig and TLS keys are local,
 ignored credentials; never include them in commits or evidence bundles.
