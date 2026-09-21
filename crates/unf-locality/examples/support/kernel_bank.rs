@@ -188,12 +188,20 @@ pub async fn verify(
     let wire6 = packet(v6);
     probe(&mut object, "unpublished-bank", v4, &wire4, 2)?;
     let worker = LocalityObservationWorker::default();
+    let pin_root = std::env::var("UNF_KERNEL_BANK_BPFFS")?;
+    ensure!(
+        pin_root.starts_with("/tmp/unf-observed-bank.")
+            && Path::new(&pin_root)
+                .file_name()
+                .is_some_and(|name| name == "bpffs"),
+        "unexpected disposable bpffs root"
+    );
     let bank = worker
         .try_prepare(
             leased,
             &runtime,
             std::fs::read("/usr/local/lib/unf/locality-bank")?,
-            Path::new("/sys/fs/bpf/unf-isolated-bank").into(),
+            Path::new(&pin_root).into(),
         )?
         .context("worker busy")?
         .finish()

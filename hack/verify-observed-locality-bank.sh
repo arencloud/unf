@@ -45,8 +45,9 @@ for namespace in "$fabric" "$peer_a" "$peer_b"; do
 done
 if [[ ${UNF_KERNEL_BANK_ISOLATED_CONTAINER:-} == yes ]]; then
     # Dedicated mount inside this disposable Pod; no host bpffs bind mount.
-    mkdir -p /sys/fs/bpf/unf-isolated-bank
-    mount -t bpf bpf /sys/fs/bpf/unf-isolated-bank
+    export UNF_KERNEL_BANK_BPFFS=$directory/bpffs
+    mkdir "$UNF_KERNEL_BANK_BPFFS"
+    mount -t bpf bpf "$UNF_KERNEL_BANK_BPFFS"
     # Only the private fabric namespace changes forwarding, never host sysctls.
     ip netns exec "$fabric" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
 fi
@@ -58,8 +59,8 @@ for namespace in "${namespaces[@]}"; do
     ip -n "$namespace" -j link show | jq -e 'length==1 and .[0].ifname=="lo"' >/dev/null
 done
 if [[ ${UNF_KERNEL_BANK_ISOLATED_CONTAINER:-} == yes ]]; then
-    [[ -z $(find /sys/fs/bpf/unf-isolated-bank -mindepth 1 -print -quit) ]]
-    umount /sys/fs/bpf/unf-isolated-bank
-    rmdir /sys/fs/bpf/unf-isolated-bank
+    [[ -z $(find "$UNF_KERNEL_BANK_BPFFS" -mindepth 1 -print -quit) ]]
+    umount "$UNF_KERNEL_BANK_BPFFS"
+    rmdir "$UNF_KERNEL_BANK_BPFFS"
     printf 'kernel-locality-suite: PASS bank-checks=true namespace-cleanup=true packet-delivery-tested=false\n'
 fi

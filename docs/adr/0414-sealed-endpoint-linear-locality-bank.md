@@ -98,3 +98,13 @@ bounded topology-history retention. These are retained observations, not a
 clean-log or uninterrupted-key-progress claim. Evidence is under
 `.artifacts/p9-locality-bank-resume-cl02-{logs,state}`; existing CNI journals
 were captured separately before the diagnostic.
+
+The first immutable cl02 attempt (`c9c75dc`, image `sha256:08bd414ae28aac6c704cedec45657d7fa9a5733a47b0e42c3e4ad8e03c779091`)
+passed all 28 native-observation checks, then failed before bank loading because
+its mountpoint could not be created under the Pod's `/sys/fs/bpf`. The fixture
+now mounts bpffs on its already owned private `/tmp` directory, as the earlier
+device fixtures do. No host bpffs mount is introduced. The failed Pod and its
+exact-UID Namespace were deleted and absence checked; the old harness's
+`cleanup:false` is its combined failure flag, not a claim that the Namespace
+survived. Complete corrected-image cl02 qualification remains mandatory before
+Kind. Evidence: `.artifacts/p9-kernel-bank-c9c75dc-cl02`.
