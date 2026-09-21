@@ -169,6 +169,11 @@ Reverse-Service composition and complete live delivery remain open; no rollout.
 ADR 0433 retains the main diagnostic's pre-deployment COPY/allowlist failure and
 adds an exact compiled-revision assertion. Rebuild and cl02-first validation
 remain required; intermediate layer metadata is not binary provenance.
+ADR 0434 passes all five actual-main verifier/TestRun checks on cl02 then
+identical-image Kind, including compiled revision equality. Journals remain
+unchanged and current/retained regular/init logs are reviewed with warnings
+preserved. Reverse-Service and actual selected-bank delivery remain next;
+the isolated gate does not close L3/L4/L5/Q.
 
 ## Safety and efficiency boundary
 

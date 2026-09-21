@@ -77,6 +77,9 @@ publisher/writer delivery and restart continuity remain pending; no live rollout
 ADR 0433 repairs the diagnostic script allowlist after a pre-deployment build
 failure and requires exact compiled source evidence. The main-program gate and
 full Phase 9 closure remain pending.
+ADR 0434 passes that five-test actual-main gate on cl02 then identical-image
+Kind with exact compiled provenance, unchanged production journals and complete
+log review. Reverse-Service, selected-bank delivery and recovery remain open.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

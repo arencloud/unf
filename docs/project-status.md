@@ -973,6 +973,10 @@ composition and full runtime delivery/recovery remain open. No rollout occurs.
 ADR 0433 retains the failed diagnostic packaging attempt, repairs its allowlist
 and adds a compiled-revision assertion. No incorrect resulting binary revision
 was demonstrated; rebuilt main-program cl02-before-Kind validation remains next.
+ADR 0434 passes the five actual-main verifier/TestRun checks on cl02 then
+identical-image Kind, preserving journals and reviewing current and retained
+regular/init logs. WARN findings are retained. Reverse-Service, selected-bank
+delivery, runtime recovery and L3/L4/L5/Q remain open; no production rollout.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
