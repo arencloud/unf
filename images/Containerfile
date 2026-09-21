@@ -4,7 +4,6 @@ FROM ${RUST_IMAGE} AS builder
 # Keep the input distinct from the compiler environment: a reused builder's
 # ENV takes precedence over an ARG with the same name.
 ARG UNF_SOURCE_REVISION=unknown
-ENV UNF_BUILD_REVISION=${UNF_SOURCE_REVISION}
 
 WORKDIR /src
 
@@ -13,7 +12,8 @@ COPY crates ./crates
 COPY bins ./bins
 COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
 
-RUN cargo build --locked --release --package unf-controller --package unf-agent --package unf-cni
+RUN export UNF_BUILD_REVISION="${UNF_SOURCE_REVISION}" \
+    && cargo build --locked --release --package unf-controller --package unf-agent --package unf-cni
 
 FROM docker.io/library/debian:bookworm-slim
 

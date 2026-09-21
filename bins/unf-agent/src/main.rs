@@ -20158,6 +20158,18 @@ mod tests {
             .expect("construct test controller client")
     }
 
+    #[test]
+    #[ignore = "requires exact expected source revision from immutable diagnostic gate"]
+    fn diagnostic_build_revision_matches_source() {
+        let expected =
+            std::env::var("UNF_EXPECT_BUILD_REVISION").expect("explicit expected source revision");
+        assert!(expected.len() == 40 && expected.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            BUILD_REVISION, expected,
+            "compiled source revision differs from immutable diagnostic provenance"
+        );
+    }
+
     #[tokio::test]
     async fn unexpected_task_panic_is_a_supervised_failure() {
         let mut tasks = JoinSet::new();

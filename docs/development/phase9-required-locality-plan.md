@@ -166,6 +166,9 @@ ADR 0432 adds the actual policy-first forward bridge and four dedicated
 continuations, including local DSR NAT revalidation and ordinary missing-bank
 fallback. Its real-main verifier/TestRun gate must pass cl02 before Kind.
 Reverse-Service composition and complete live delivery remain open; no rollout.
+ADR 0433 retains the main diagnostic's pre-deployment COPY/allowlist failure and
+adds an exact compiled-revision assertion. Rebuild and cl02-first validation
+remain required; intermediate layer metadata is not binary provenance.
 
 ## Safety and efficiency boundary
 

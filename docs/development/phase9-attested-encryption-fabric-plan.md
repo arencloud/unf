@@ -74,6 +74,9 @@ Production state is unchanged; full runtime and L3/L4/L5/Q remain open.
 ADR 0432 implements the policy-first forward bridge and dedicated continuation
 loading. Actual-main kernel qualification, reverse-Service composition, full
 publisher/writer delivery and restart continuity remain pending; no live rollout.
+ADR 0433 repairs the diagnostic script allowlist after a pre-deployment build
+failure and requires exact compiled source evidence. The main-program gate and
+full Phase 9 closure remain pending.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

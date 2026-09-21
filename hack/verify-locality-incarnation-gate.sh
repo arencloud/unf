@@ -18,8 +18,10 @@ deadline_seconds=180
 poll_attempts=100
 case $suite in
     kernel-main-bridge)
+        : "${UNF_LOCALITY_GATE_SOURCE_REVISION:?exact expected compiled source revision}"
+        [[ $UNF_LOCALITY_GATE_SOURCE_REVISION =~ ^[0-9a-f]{40}$ ]]
         test_command='["env","UNF_MAIN_LOCALITY_ISOLATED_CONTAINER=yes","bash","/usr/local/bin/verify-main-locality-bridge"]'
-        marker='main-locality-suite: PASS tests=4 actual-main=true missing-bank-fallback=true live-attachment=false bank-delivery=false$'
+        marker='main-locality-suite: PASS tests=5 compiled-source=true actual-main=true missing-bank-fallback=true live-attachment=false bank-delivery=false$'
         memory_limit=2Gi
         cpu_limit=2
         deadline_seconds=300
@@ -95,8 +97,8 @@ cleanup() {
         rg -q "$marker" "$directory/test.log" || result=1
     fi
     if [[ $suite == kernel-main-bridge ]]; then
-        [[ $(rg -c 'main-locality-check: name=.* passed=true$' "$directory/test.log") == 4 ]] || result=1
-        [[ $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 4 ]] || result=1
+        [[ $(rg -c 'main-locality-check: name=.* passed=true$' "$directory/test.log") == 5 ]] || result=1
+        [[ $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 5 ]] || result=1
     fi
     if [[ $suite == kernel-delivery || $suite == kernel-admission || $suite == kernel-journal-floor || $suite == kernel-runtime-owner || $suite == kernel-agent-startup ]]; then
         if rg -q 'kernel-locality-delivery: PASS allowed=8 denied=16 protocols=tcp,udp families=4,6 request-bank=true reply-native=true production-policy=false$' "$directory/test.log" &&
@@ -119,8 +121,9 @@ cleanup() {
         rg -q 'observed-locality-mixed-mtu: PASS source=1400 target=1450 uniform-mismatch-rejected=true$' "$directory/test.log" || result=1
         rg -q 'kernel-locality-agent-startup: PASS actual-agent=true early-owner=true real-journal-floor=5 armed-reopen-withdrawn=true partial-rejected=true missing-same-boot-rejected=true client-error-supervised=true bytes-preserved=true packet-attachment=false cleanup=true$' "$directory/test.log" || result=1
     fi
-    jq -n --argjson code "$result" --argjson removed "$removed" --argjson delivery "$delivery" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" \
-        '{schemaVersion:2,result:(if $code==0 then "passed" else "failed" end),platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:$removed,packetDeliveryTested:$delivery}' > "$directory/evidence.json"
+    jq -n --argjson code "$result" --argjson removed "$removed" --argjson delivery "$delivery" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" --arg source "${UNF_LOCALITY_GATE_SOURCE_REVISION:-}" \
+        '{schemaVersion:2,result:(if $code==0 then "passed" else "failed" end),platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:$removed,packetDeliveryTested:$delivery}
+          + (if $suite=="kernel-main-bridge" then {expectedCompiledSourceRevision:$source} else {} end)' > "$directory/evidence.json"
     printf 'Incarnation gate result=%s evidence=%s\n' "$result" "$directory"
     exit "$result"
 }
@@ -132,6 +135,10 @@ if [[ $UNF_LOCALITY_GATE_PLATFORM == cl02 ]]; then
     "${kc[@]}" -n "$namespace" create rolebinding gate-privileged --clusterrole=system:openshift:scc:privileged --serviceaccount="$namespace:default" >/dev/null
 fi
 jq -n --arg ns "$namespace" --arg node "$UNF_LOCALITY_GATE_NODE" --arg image "$image" --argjson command "$test_command" --arg memory "$memory_limit" --arg cpu "$cpu_limit" --argjson deadline "$deadline_seconds" '{apiVersion:"v1",kind:"Pod",metadata:{name:"gate",namespace:$ns},spec:{nodeName:$node,hostNetwork:true,automountServiceAccountToken:false,restartPolicy:"Never",activeDeadlineSeconds:$deadline,containers:[{name:"gate",image:$image,imagePullPolicy:"IfNotPresent",securityContext:{privileged:true,runAsUser:0},resources:{requests:{cpu:"100m",memory:"64Mi"},limits:{cpu:$cpu,memory:$memory}},env:[{name:"UNF_LOCALITY_GATE_ISOLATED_CONTAINER",value:"yes"},{name:"UNF_OBSERVED_BANK_ISOLATED_CONTAINER",value:"yes"}],command:$command}]}}' > "$directory/pod.json"
+if [[ $suite == kernel-main-bridge ]]; then
+    jq --arg source "$UNF_LOCALITY_GATE_SOURCE_REVISION" '.spec.containers[0].env += [{name:"UNF_EXPECT_BUILD_REVISION",value:$source}]' "$directory/pod.json" > "$directory/pod-source.json"
+    mv "$directory/pod-source.json" "$directory/pod.json"
+fi
 "${kc[@]}" create -f "$directory/pod.json" >/dev/null
 finished=false
 for _ in $(seq 1 "$poll_attempts"); do
