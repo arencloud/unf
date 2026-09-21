@@ -20143,6 +20143,7 @@ fn init_tracing() {
 #[cfg(test)]
 mod tests {
     mod key_rotation;
+    mod service_reply;
 
     use super::*;
     use aya::programs::{TestRun, TestRunOptions};

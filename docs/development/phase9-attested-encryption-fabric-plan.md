@@ -80,6 +80,9 @@ full Phase 9 closure remain pending.
 ADR 0434 passes that five-test actual-main gate on cl02 then identical-image
 Kind with exact compiled provenance, unchanged production journals and complete
 log review. Reverse-Service, selected-bank delivery and recovery remain open.
+ADR 0435 implements the policy-tracked reverse-Service bridge and expands the
+actual-main diagnostic to seven tests. Local checks pass; immutable cl02-first
+qualification and live selected-bank delivery/recovery remain pending.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

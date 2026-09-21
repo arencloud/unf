@@ -136,6 +136,7 @@ const ENCRYPTION_DSR_DISPATCH: i32 = -1_004;
 const ENCRYPTION_SECURE_NAT_DISPATCH: i32 = -1_005;
 const SERVICE_POST_LOOKUP_TRANSLATED: u8 = 1 << 0;
 const SERVICE_POST_LOOKUP_REROUTE_HOST: u8 = 1 << 1;
+const SERVICE_POST_LOOKUP_REVERSE: u8 = 1 << 2;
 // A DSR redirect preserves the frontend tuple. Reserve one skb mark bit so a
 // subsequent local hook does not select the same VIP again. Both classifier
 // directions consume it because the exact next hook depends on the route
@@ -835,7 +836,10 @@ fn encryption_finalizer<const IPV6: bool>(ctx: &TcContext) -> i32 {
     let Some(post_lookup) = SERVICE_POST_LOOKUP_SCRATCH.get(0).copied() else {
         return TC_ACT_SHOT;
     };
-    if post_lookup & SERVICE_POST_LOOKUP_TRANSLATED != 0 {
+    if post_lookup & SERVICE_POST_LOOKUP_REVERSE != 0 {
+        // An exact, policy-tracked Service reply already owns its reversible
+        // translation. Do not seed a new frontend or borrow source egress NAT.
+    } else if post_lookup & SERVICE_POST_LOOKUP_TRANSLATED != 0 {
         seed_service_frontend_policy_connection(observation.tcp_flags);
         if !observation.enforce && post_lookup & SERVICE_POST_LOOKUP_REROUTE_HOST != 0 {
             return if IPV6 {
@@ -1401,7 +1405,7 @@ fn observe_ipv4(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                     SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
                     now_ns,
                 );
-                return TC_ACT_PIPE;
+                return locality_runtime::prepare_service_reply::<false>(direction, tcp_flags);
             }
             forward_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
             prepare_load_balancer_cluster_source_v4(ctx, source_ipv4);
@@ -1685,7 +1689,7 @@ fn observe_ipv6(ctx: &TcContext, direction: Direction, enforce: bool) -> i32 {
                     SERVICE_EVENT_REASON_REVERSE_TRANSLATED,
                     now_ns,
                 );
-                return TC_ACT_PIPE;
+                return locality_runtime::prepare_service_reply::<true>(direction, observation.tcp_flags);
             }
             forward_key.role = SERVICE_CONNECTION_ROLE_FORWARD;
             prepare_load_balancer_cluster_source_v6(ctx, observation.source_address);
@@ -4730,6 +4734,11 @@ fn active_policy_revision() -> u64 {
 /// the isolated stage can fail closed instead of leaking native traffic.
 #[inline(always)]
 fn gateway_egress_maybe_owned(observation: &FlowObservation) -> bool {
+    if SERVICE_POST_LOOKUP_SCRATCH.get(0).copied().unwrap_or(0) & SERVICE_POST_LOOKUP_REVERSE != 0 {
+        // The reverse Service transaction, not an independently initiated
+        // gateway flow, owns this reply's already-restored translation.
+        return false;
+    }
     if !matches!(observation.protocol, PROTOCOL_TCP | PROTOCOL_UDP) {
         return false;
     }

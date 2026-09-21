@@ -21,7 +21,7 @@ case $suite in
         : "${UNF_LOCALITY_GATE_SOURCE_REVISION:?exact expected compiled source revision}"
         [[ $UNF_LOCALITY_GATE_SOURCE_REVISION =~ ^[0-9a-f]{40}$ ]]
         test_command='["env","UNF_MAIN_LOCALITY_ISOLATED_CONTAINER=yes","bash","/usr/local/bin/verify-main-locality-bridge"]'
-        marker='main-locality-suite: PASS tests=5 compiled-source=true actual-main=true missing-bank-fallback=true live-attachment=false bank-delivery=false$'
+        marker='main-locality-suite: PASS tests=7 compiled-source=true actual-main=true missing-bank-fallback=true reverse-service-policy=true live-attachment=false bank-delivery=false$'
         memory_limit=2Gi
         cpu_limit=2
         deadline_seconds=300

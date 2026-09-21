@@ -174,6 +174,10 @@ identical-image Kind, including compiled revision equality. Journals remain
 unchanged and current/retained regular/init logs are reviewed with warnings
 preserved. Reverse-Service and actual selected-bank delivery remain next;
 the isolated gate does not close L3/L4/L5/Q.
+ADR 0435 routes enforcing reverse-Service replies through current forward-policy
+witness checks and normal policy/locality/transport finalization, preserving
+backend ownership separately from rewritten VIP bytes. The expanded seven-test
+main-program diagnostic must pass cl02 before Kind; live composition is pending.
 
 ## Safety and efficiency boundary
 

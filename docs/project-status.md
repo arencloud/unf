@@ -977,6 +977,10 @@ ADR 0434 passes the five actual-main verifier/TestRun checks on cl02 then
 identical-image Kind, preserving journals and reviewing current and retained
 regular/init logs. WARN findings are retained. Reverse-Service, selected-bank
 delivery, runtime recovery and L3/L4/L5/Q remain open; no production rollout.
+ADR 0435 adds current forward-policy witnesses to enforcing reverse-Service
+replies before normal policy/locality/transport handling. Backend ownership is
+preserved across VIP rewriting. Local checks pass; the expanded seven-test
+immutable gate must pass cl02 then Kind. Full runtime delivery remains open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -6,6 +6,88 @@ use unf_ebpf_common::locality::{ABI_VERSION, PACKET_DSR_PENDING};
 pub(super) const DISPATCH: i32 = -1_006;
 pub(super) const TRANSPORT: i32 = -1_007;
 
+/// Called only after exact reverse-Service lookup and successful wire rewrite
+/// on the enforcing ingress path. Preserve actual backend/client ownership:
+/// the rewritten VIP is not a workload and must never be used as that proof.
+#[inline(never)]
+pub(super) fn prepare_service_reply<const IPV6: bool>(direction: Direction, tcp_flags: u8) -> i32 {
+    let (Some(value), Some(observation), Some(post)) = (
+        SERVICE_CONNECTION_SCRATCH.get(0),
+        FLOW_OBSERVATION_SCRATCH.get_ptr_mut(0),
+        SERVICE_POST_LOOKUP_SCRATCH.get_ptr_mut(0),
+    ) else {
+        return TC_ACT_SHOT;
+    };
+    // SAFETY: each scratch slot belongs to this CPU's invocation. Exact reverse
+    // lookup copied and validated the Service connection before the rewrite.
+    #[allow(unsafe_code)]
+    let observation = unsafe { &mut *observation };
+    observation.source_address = value.backend_address;
+    observation.destination_address = value.client_address;
+    observation.source_port = value.backend_port;
+    observation.destination_port = value.client_port;
+    observation.direction = direction;
+    observation.address_family = if IPV6 {
+        AddressFamily::Ipv6
+    } else {
+        AddressFamily::Ipv4
+    };
+    observation.protocol = value.protocol;
+    observation.tcp_flags = tcp_flags;
+    observation.enforce = true;
+    let identity = active_identity_config();
+    if IPV6 {
+        observation.source_identity = lookup_identity_v6(value.backend_address, identity);
+        observation.destination_identity = lookup_identity_v6(value.client_address, identity);
+    } else {
+        observation.source_identity = lookup_identity_v4(
+            [
+                value.backend_address[0],
+                value.backend_address[1],
+                value.backend_address[2],
+                value.backend_address[3],
+            ],
+            identity,
+        );
+        observation.destination_identity = lookup_identity_v4(
+            [
+                value.client_address[0],
+                value.client_address[1],
+                value.client_address[2],
+                value.client_address[3],
+            ],
+            identity,
+        );
+    }
+    if observation.source_identity.get() != 0 && observation.destination_identity.get() != 0 {
+        let (Some(key), Some(reverse)) = (
+            POLICY_CONNECTION_SCRATCH.get_ptr_mut(0),
+            POLICY_CONNECTION_SCRATCH.get_ptr_mut(1),
+        ) else {
+            return TC_ACT_SHOT;
+        };
+        // SAFETY: distinct per-CPU slots; later policy evaluation repopulates
+        // them, but cannot grant reply provenance from Service state alone.
+        #[allow(unsafe_code)]
+        let (key, reverse) = unsafe { (&mut *key, &mut *reverse) };
+        populate_connection_keys(observation, key, reverse);
+        #[allow(unsafe_code)]
+        let now = unsafe { bpf_ktime_get_ns() };
+        if !refresh_connection(reverse, active_policy_revision(), now) {
+            return TC_ACT_SHOT;
+        }
+    }
+    #[allow(unsafe_code)]
+    unsafe {
+        *post = SERVICE_POST_LOOKUP_REVERSE;
+    }
+    if IPV6 {
+        SERVICE_POLICY_DISPATCH_V6
+    } else {
+        SERVICE_POLICY_DISPATCH_V4
+    }
+}
+
 #[inline(never)]
 pub(super) fn prepare<const IPV6: bool>(ctx: &TcContext, observation: &FlowObservation) -> bool {
     if !observation.enforce
