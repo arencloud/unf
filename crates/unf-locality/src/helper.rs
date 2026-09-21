@@ -39,7 +39,7 @@ pub struct PrivateMountChannel {
     peer: UCred,
 }
 
-/// Owns a private bpffs mount reference, not a mount-namespace descriptor.
+/// Owns a private bpffs adapter-directory reference, not a namespace descriptor.
 /// The mount is reclaimed after the final directory reference closes, including
 /// process death. BPF object FDs may survive independently; no persistent shared
 /// preparation pins are created. Do not duplicate or export the directory FD.

@@ -1050,6 +1050,10 @@ The first helper image (`f4c257e`) passes cl02 but fails identical-image Kind.
 The fixture masked the helper's underlying error with a client EOF; diagnostic
 ordering/context are corrected before another cl02-first attempt. Journals and
 live permissions remain unchanged; the paired helper boundary is not Verified.
+The improved observer identifies Kind's prepopulated bpffs `progs.debug` entry.
+The helper now creates an exclusive private adapter directory inside the
+detached filesystem, preserving kernel entries and refusing existing adapter
+residue. Local regression covers preservation; paired requalification is pending.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

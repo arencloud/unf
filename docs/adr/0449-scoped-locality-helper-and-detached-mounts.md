@@ -25,11 +25,11 @@ data. Rejected descriptors close on every path. No client descriptor is accepted
 by the mount operation. There is no public listener or implicit fallback.
 
 The helper creates a **detached bpffs** through `fsopen`, `fsconfig` and `fsmount`.
-It returns only the root directory FD, never a namespace/configuration FD. No
+It returns only a private adapter-directory FD, never a namespace/configuration FD. No
 mount tree is cloned or modified, no shared pin pathname exists, and no temporary
 mount directory needs cleanup. The agent uses its own BPF capability through
 `/proc/self/fd/<held-directory>`; final directory-reference closure releases the
-filesystem while independently held map/program FDs can survive. The root is
+filesystem while independently held map/program FDs can survive. The directory is
 checked as root-owned, private, empty bpffs. No policy/packet permission follows.
 
 The underlying primitives already exist in Linux; see the primary Linux 5.14
@@ -83,3 +83,12 @@ The fixture now always joins/reports helper failure before unwrapping the client
 and filesystem syscalls retain operation context. Preserve the original evidence
 under `.artifacts/p9-helper-mount-f4c257e-{cl02,kind}-gate`; do not attribute the
 Kind cause before the improved observation has run cl02 first and then Kind.
+
+Source `de05a3c` again passes cl02 and identifies Kind's concrete rejection:
+`helper mount is not empty: "progs.debug"`. Its fresh bpffs contains kernel
+preload entries. The helper now creates one exclusive mode-0700 adapter
+subdirectory in its detached filesystem and passes that FD; it does not delete
+or ignore entries in the adapter directory, reuse EEXIST, or modify kernel
+preloads. A regression preserves both preload-like entries and existing adapter
+residue. Requalify this source on cl02 before identical Kind; earlier failures
+remain retained and are not relabeled as passes.

@@ -211,6 +211,35 @@ fn restrict_thread(capabilities: rustix::thread::CapabilitySet) {
 }
 
 #[test]
+fn adapter_directory_preserves_existing_entries_and_refuses_reuse() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("progs.debug"), b"preserve kernel entries").unwrap();
+    let descriptor = File::open(root.path()).unwrap();
+    let adapter = mount::adapter_directory(&descriptor).unwrap();
+    assert!(
+        std::fs::read_dir(root.path().join("unf-locality"))
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert_eq!(fstat(&adapter).unwrap().st_mode & 0o777, 0o700);
+    std::fs::write(
+        root.path().join("unf-locality/residue"),
+        b"preserve foreign residue",
+    )
+    .unwrap();
+    assert!(mount::adapter_directory(&descriptor).is_err());
+    assert_eq!(
+        std::fs::read(root.path().join("unf-locality/residue")).unwrap(),
+        b"preserve foreign residue"
+    );
+    assert_eq!(
+        std::fs::read(root.path().join("progs.debug")).unwrap(),
+        b"preserve kernel entries"
+    );
+}
+
+#[test]
 #[ignore = "requires isolated cl02-first CAP_SYS_ADMIN/BPF kernel qualification"]
 fn privileged_private_mount_descriptor_survives_helper_exit_and_reclaims_pins() {
     let expected = std::env::var("UNF_EXPECT_BUILD_REVISION").unwrap();

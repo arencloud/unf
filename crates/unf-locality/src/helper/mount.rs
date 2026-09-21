@@ -1,9 +1,11 @@
 use super::PrivateMount;
 use anyhow::{Context as _, Result};
+use rustix::fs::{Mode, OFlags, mkdirat, openat};
 use rustix::mount::{
     FsMountFlags, FsOpenFlags, MountAttrFlags, fsconfig_create, fsconfig_set_string, fsmount,
     fsopen,
 };
+use std::os::fd::{AsFd, OwnedFd};
 
 pub(super) fn allocate() -> Result<PrivateMount> {
     // Create a detached filesystem using Linux's FD-based mount API. Never
@@ -20,7 +22,18 @@ pub(super) fn allocate() -> Result<PrivateMount> {
             | MountAttrFlags::MOUNT_ATTR_NOEXEC,
     )
     .context("helper detached fsmount")?;
-    // Only this root FD leaves the helper. It is not a mount namespace FD or
-    // filesystem configuration FD. No fallback to shared/attached pins exists.
-    PrivateMount::validate(directory)
+    // Newer kernels may populate progs.debug/maps.debug in a new filesystem.
+    // Preserve those entries: create one exclusive private adapter directory,
+    // never accept EEXIST, and return only that held directory reference.
+    PrivateMount::validate(adapter_directory(&directory)?)
+}
+
+pub(super) fn adapter_directory(root: &impl AsFd) -> Result<OwnedFd> {
+    mkdirat(root, "unf-locality", Mode::RWXU).context("helper exclusive adapter directory")?;
+    Ok(openat(
+        root,
+        "unf-locality",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?)
 }
