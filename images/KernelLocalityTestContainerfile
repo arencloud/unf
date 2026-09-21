@@ -20,6 +20,7 @@ LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
 COPY --from=builder /src/target/release/examples/kernel_observed_bank /usr/local/bin/kernel-observed-bank
 COPY --from=builder /src/target/release/unf-agent /usr/local/bin/unf-startup-agent
 COPY --from=legacy-agent /usr/local/bin/unf-component /usr/local/bin/unf-legacy-agent
+COPY --from=legacy-agent /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY .artifacts/unf-locality-bank /usr/local/lib/unf/locality-bank
 COPY .artifacts/unf-locality-fixture /usr/local/lib/unf/locality-fixture
 COPY hack/verify-observed-locality-bank.sh /usr/local/bin/verify-observed-locality-bank

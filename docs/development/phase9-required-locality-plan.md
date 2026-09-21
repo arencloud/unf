@@ -137,6 +137,10 @@ ADR 0425 wires the real agent's early owned startup, durable kernel-boot/path
 checkpoint, actual CNI retirement hook before bind/readiness, and exact main
 loader bindings. Paired disposable real-agent qualification is pending; packet
 dispatch and real applied writers remain unwired and production unchanged.
+ADR 0426 retains the first real-agent cl02 failure: absent diagnostic system
+trust caused client-construction panic and exposed missing task-exit supervision.
+The client is now fallible and main supervises unexpected task exits; the fixture
+adds explicit missing-trust coverage. Rebuilt cl02 must pass before Kind.
 
 ## Safety and efficiency boundary
 

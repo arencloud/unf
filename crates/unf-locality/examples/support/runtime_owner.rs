@@ -179,7 +179,17 @@ pub fn verify(bpffs: &Path, context: &EncryptionLocalityContext) -> Result<()> {
 /// ELF. It must establish early ownership/CNI retirement, then fail before any
 /// attachment. No controller, credentials, uplink or production path is passed.
 fn startup_agent(bpffs: &Path, state: &Path, expected: &str) -> Result<String> {
-    let output = Command::new("/usr/bin/timeout")
+    startup_agent_with_trust(bpffs, state, expected, false)
+}
+
+fn startup_agent_with_trust(
+    bpffs: &Path,
+    state: &Path,
+    expected: &str,
+    missing_trust: bool,
+) -> Result<String> {
+    let mut command = Command::new("/usr/bin/timeout");
+    command
         .args(["15s", "/usr/local/bin/unf-startup-agent"])
         .args(["--listen", "127.0.0.1:0", "--node-name", "fixture-startup"])
         .arg("--ebpf-object")
@@ -208,8 +218,15 @@ fn startup_agent(bpffs: &Path, state: &Path, expected: &str) -> Result<String> {
         .env_clear()
         .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .env("RUST_LOG", "info")
-        .env("TOKIO_WORKER_THREADS", "2")
-        .output()?;
+        .env("TOKIO_WORKER_THREADS", "2");
+    if missing_trust {
+        // Native certificate loading honors these explicit paths instead of
+        // the system bundle. Missing trust must be a normal supervised error.
+        command
+            .env("SSL_CERT_FILE", state.join("absent-certs.pem"))
+            .env("SSL_CERT_DIR", state.join("absent-certs"));
+    }
+    let output = command.output()?;
     ensure!(
         output.stdout.len() + output.stderr.len() <= 128 * 1024,
         "startup output budget"
@@ -220,7 +237,9 @@ fn startup_agent(bpffs: &Path, state: &Path, expected: &str) -> Result<String> {
         String::from_utf8(output.stderr)?
     );
     ensure!(
-        output.status.code() == Some(1) && combined.contains(expected),
+        output.status.code() == Some(1)
+            && combined.contains(expected)
+            && !combined.contains("panicked"),
         "unexpected isolated agent startup: {combined}"
     );
     // Retain full real-process output, including the deliberate terminal error.
@@ -228,6 +247,7 @@ fn startup_agent(bpffs: &Path, state: &Path, expected: &str) -> Result<String> {
     Ok(combined)
 }
 
+#[allow(clippy::too_many_lines)] // One linear, owned startup/reopen/cleanup scenario.
 pub fn verify_agent_startup(bpffs: &Path, context: &EncryptionLocalityContext) -> Result<()> {
     ensure!(
         bpffs.starts_with("/tmp") && bpffs.file_name().is_some_and(|name| name == "bpffs"),
@@ -263,6 +283,12 @@ pub fn verify_agent_startup(bpffs: &Path, context: &EncryptionLocalityContext) -
         "real CNI gate did not persist empty reader floor"
     );
     drop(reopened_journal);
+    startup_agent_with_trust(
+        root.path(),
+        state.path(),
+        "construct system-trust controller client",
+        true,
+    )?;
     let mut runtime = LocalityRuntimeMaps::open_owned(&pins, &owner)?;
     let object = load(&runtime)?;
     assert_withdrawn(&object)?;
@@ -323,7 +349,7 @@ pub fn verify_agent_startup(bpffs: &Path, context: &EncryptionLocalityContext) -
     root.close()?;
     state.close()?;
     println!(
-        "kernel-locality-agent-startup: PASS actual-agent=true early-owner=true real-journal-floor=5 armed-reopen-withdrawn=true partial-rejected=true missing-same-boot-rejected=true bytes-preserved=true packet-attachment=false cleanup=true"
+        "kernel-locality-agent-startup: PASS actual-agent=true early-owner=true real-journal-floor=5 armed-reopen-withdrawn=true partial-rejected=true missing-same-boot-rejected=true client-error-supervised=true bytes-preserved=true packet-attachment=false cleanup=true"
     );
     Ok(())
 }

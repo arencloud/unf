@@ -52,6 +52,8 @@ writer and packet integration remain open; no Phase 9 row is promoted.
 ADR 0425 implements actual early startup and CNI journal binding, with an
 explicit boot/path checkpoint and exact main-ELF map IDs. Paired real-process
 qualification is pending; no local packet dispatch or fleet rollout occurs.
+ADR 0426 retains the cl02 startup trust/panic failure, corrects fallible client
+construction and task-exit supervision, and requires rebuilt cl02 before Kind.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

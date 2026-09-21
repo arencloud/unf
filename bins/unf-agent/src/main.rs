@@ -1996,6 +1996,7 @@ struct AgentStatus {
 enum SupervisedFailure {
     Dataplane(anyhow::Error),
     CniTransaction(anyhow::Error),
+    Task(anyhow::Error),
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2165,6 +2166,10 @@ async fn main() -> Result<()> {
             None
         }
         failure = service_failure_rx.recv(), if supervised_service_configured => failure,
+        completed = tasks.join_next(), if !tasks.is_empty() => {
+            state.ready.store(false, Ordering::Release);
+            Some(unexpected_task_exit(completed, &mut service_failure_rx))
+        }
     };
     let result = finish_agent_tasks(cancellation, tasks, service_failure, &state).await;
     if result.is_ok() {
@@ -2188,6 +2193,22 @@ async fn bind_agent_api(address: SocketAddr) -> Result<Vec<tokio::net::TcpListen
         }
     }
     Ok(listeners)
+}
+
+fn unexpected_task_exit(
+    completed: Option<std::result::Result<(), tokio::task::JoinError>>,
+    failure_rx: &mut mpsc::Receiver<SupervisedFailure>,
+) -> SupervisedFailure {
+    // A task may finish immediately after sending its more precise service
+    // failure. Preserve that cause when join and channel are both ready.
+    if let Ok(failure) = failure_rx.try_recv() {
+        return failure;
+    }
+    SupervisedFailure::Task(match completed {
+        Some(Err(error)) => anyhow!(error).context("supervised agent task aborted"),
+        Some(Ok(())) => anyhow!("supervised agent task exited before shutdown"),
+        None => anyhow!("supervised agent task set disappeared before shutdown"),
+    })
 }
 
 fn bind_ipv6_agent_listener(address: SocketAddr, only_v6: bool) -> Result<tokio::net::TcpListener> {
@@ -2254,6 +2275,7 @@ async fn finish_agent_tasks(
         Some(SupervisedFailure::CniTransaction(error)) => {
             Err(error).context("CNI transaction API failed")
         }
+        Some(SupervisedFailure::Task(error)) => Err(error).context("agent task supervision failed"),
         None => Ok(()),
     }
 }
@@ -7947,10 +7969,7 @@ fn dataplane_controller_client(
         Some(url) => {
             ReloadingControllerClient::new(url, ca_path.to_path_buf(), reloads, reload_errors)
         }
-        None => Ok(ReloadingControllerClient::without_custom_trust(
-            reloads,
-            reload_errors,
-        )),
+        None => ReloadingControllerClient::without_custom_trust(reloads, reload_errors),
     }
 }
 
@@ -8000,17 +8019,20 @@ impl ReloadingControllerClient {
         })
     }
 
-    fn without_custom_trust(reloads: Counter, reload_errors: Counter) -> Self {
-        Self {
+    fn without_custom_trust(reloads: Counter, reload_errors: Counter) -> Result<Self> {
+        let client = reqwest::Client::builder()
+            .build()
+            .context("construct system-trust controller client")?;
+        Ok(Self {
             ca_path: PathBuf::new(),
             controller_resolution: None,
             state: Arc::new(Mutex::new(ControllerClientState {
                 observed_ca_pem: Vec::new(),
-                client: reqwest::Client::new(),
+                client,
             })),
             reloads,
             reload_errors,
-        }
+        })
     }
 
     fn current(&self) -> reqwest::Client {
@@ -19998,6 +20020,38 @@ mod tests {
 
     fn test_controller_client() -> ReloadingControllerClient {
         ReloadingControllerClient::without_custom_trust(Counter::default(), Counter::default())
+            .expect("construct test controller client")
+    }
+
+    #[tokio::test]
+    async fn unexpected_task_panic_is_a_supervised_failure() {
+        let mut tasks = JoinSet::new();
+        tasks.spawn(async { panic!("injected agent task panic") });
+        let (_sender, mut receiver) = mpsc::channel(1);
+        let failure = unexpected_task_exit(tasks.join_next().await, &mut receiver);
+        let SupervisedFailure::Task(error) = failure else {
+            panic!("lost task panic")
+        };
+        assert!(format!("{error:#}").contains("injected agent task panic"));
+    }
+
+    #[test]
+    fn task_exit_preserves_an_already_reported_service_failure() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        assert!(
+            sender
+                .try_send(SupervisedFailure::Dataplane(anyhow!("precise cause")))
+                .is_ok()
+        );
+        let failure = unexpected_task_exit(Some(Ok(())), &mut receiver);
+        let SupervisedFailure::Dataplane(error) = failure else {
+            panic!("lost precise cause")
+        };
+        assert_eq!(error.to_string(), "precise cause");
+        assert!(matches!(
+            unexpected_task_exit(Some(Ok(())), &mut receiver),
+            SupervisedFailure::Task(_)
+        ));
     }
 
     #[test]
@@ -22756,10 +22810,7 @@ mod tests {
             active_selection_bank: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
-            client: ReloadingControllerClient::without_custom_trust(
-                Counter::default(),
-                Counter::default(),
-            ),
+            client: test_controller_client(),
             agent_token_path: PathBuf::new(),
             state_path,
             load_balancer_state_path,
@@ -23939,10 +23990,7 @@ mod tests {
             bgp: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
-            client: ReloadingControllerClient::without_custom_trust(
-                Counter::default(),
-                Counter::default(),
-            ),
+            client: test_controller_client(),
             agent_token_path: PathBuf::new(),
             interval: Duration::from_secs(1),
         };
@@ -24182,10 +24230,7 @@ mod tests {
             bgp: None,
             node_name: "worker-a".to_owned(),
             controller_url: None,
-            client: ReloadingControllerClient::without_custom_trust(
-                Counter::default(),
-                Counter::default(),
-            ),
+            client: test_controller_client(),
             agent_token_path: PathBuf::new(),
             interval: Duration::from_secs(1),
         };
@@ -24990,10 +25035,7 @@ mod tests {
             active_selection_bank: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
-            client: ReloadingControllerClient::without_custom_trust(
-                Counter::default(),
-                Counter::default(),
-            ),
+            client: test_controller_client(),
             agent_token_path: PathBuf::new(),
             state_path: directory.path().join("service.json"),
             load_balancer_state_path: directory.path().join("load-balancer.json"),
@@ -26419,10 +26461,7 @@ mod tests {
             active_selection_bank: 0,
             node_name: "worker-a".to_owned(),
             controller_url: None,
-            client: ReloadingControllerClient::without_custom_trust(
-                Counter::default(),
-                Counter::default(),
-            ),
+            client: test_controller_client(),
             agent_token_path: PathBuf::new(),
             state_path: directory.path().join("service.json"),
             load_balancer_state_path: directory.path().join("load-balancer.json"),

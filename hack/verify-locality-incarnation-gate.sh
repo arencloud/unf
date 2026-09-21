@@ -100,7 +100,7 @@ cleanup() {
         rg -q 'kernel-locality-runtime-owner: PASS atomic-create=true exclusive-owner=true reopen-withdrawn=true exact-bindings=true partial-rejected=true foreign-preserved=true cleanup=true$' "$directory/test.log" || result=1
     fi
     if [[ $suite == kernel-agent-startup ]]; then
-        rg -q 'kernel-locality-agent-startup: PASS actual-agent=true early-owner=true real-journal-floor=5 armed-reopen-withdrawn=true partial-rejected=true missing-same-boot-rejected=true bytes-preserved=true packet-attachment=false cleanup=true$' "$directory/test.log" || result=1
+        rg -q 'kernel-locality-agent-startup: PASS actual-agent=true early-owner=true real-journal-floor=5 armed-reopen-withdrawn=true partial-rejected=true missing-same-boot-rejected=true client-error-supervised=true bytes-preserved=true packet-attachment=false cleanup=true$' "$directory/test.log" || result=1
     fi
     jq -n --argjson code "$result" --argjson removed "$removed" --argjson delivery "$delivery" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" \
         '{schemaVersion:2,result:(if $code==0 then "passed" else "failed" end),platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:$removed,packetDeliveryTested:$delivery}' > "$directory/evidence.json"

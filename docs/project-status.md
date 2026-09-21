@@ -942,6 +942,9 @@ ADR 0425 integrates actual early agent ownership/boot fencing and real CNI
 retirement before bind/readiness, plus exact main loader map IDs. The disposable
 real-process cl02-before-Kind gate remains pending; production packet dispatch,
 writer/bank integration and L3/L4/L5/Q remain open. No release pin is changed.
+ADR 0426 retains the failed cl02 actual-startup attempt and corrects missing-trust
+panic handling and unexpected task-exit supervision. The expanded rebuilt gate
+must pass cl02 before Kind; production state is unchanged and Phase 9 stays open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
