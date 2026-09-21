@@ -57,6 +57,9 @@ construction and task-exit supervision, and requires rebuilt cl02 before Kind.
 ADR 0427 implements actual identity/route writer fencing and unchanged-cut work
 avoidance. Local validation does not close production bank/packet integration
 or any L3/L4/L5/Q platform gate.
+ADR 0428 qualifies repaired actual startup on cl02 then matching `4a027ea` Kind,
+preserving journals and reviewing logs. The newer applied writers and subsequent
+bank/packet composition still require real runtime qualification.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

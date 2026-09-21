@@ -949,6 +949,10 @@ ADR 0427 implements the real applied-writer guards, exact readback recovery,
 unchanged route/checkpoint work avoidance and fatal fence supervision. Actual
 bank production and policy-first packet/reply integration remain next; live
 fleets stay `45d85d5`, and L3/L4/L5/Q are not promoted by local tests.
+ADR 0428 passes the repaired complete real-startup gate on cl02 then matching
+`4a027ea` Kind. Expected startup failures, all prior packet checks, exact cleanup
+and full log/state review pass. Newer writer code is not in that diagnostic;
+actual bank/packet integration and L3/L4/L5/Q remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

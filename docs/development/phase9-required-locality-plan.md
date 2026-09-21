@@ -145,6 +145,10 @@ ADR 0427 wires actual identity/remote-route guards, including recovery, rollback
 readback and durable completion. Unchanged healthy polls avoid redundant fence
 and checkpoint writes; uncertain fences trigger supervision. This is locally
 verified code, not production packet qualification. Bank/packet wiring remains next.
+ADR 0428 passes the repaired actual-agent startup gate on cl02 then identical
+`4a027ea` Kind, including supervised missing-trust failure and every prior kernel/
+socket gate. Production state is preserved and logs reviewed. It does not qualify
+newer writer code `c7aece1`; actual bank production and packet wiring are next.
 
 ## Safety and efficiency boundary
 
