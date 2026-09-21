@@ -51,6 +51,13 @@ expired authority or resetting keys; Kind stays on its prior runtime.
 ADR 0411 adds a regression-backed drain deadline cap with unchanged complete-cut
 activation and positive retirement checks. It still requires rebuilt cl02-first
 rotation/recovery/traffic qualification; no stability status is promoted yet.
+ADR 0412 then passes scoped cl02 qualification on `45d85d5`, with activations
+6480–6483, successful traffic/ciphertext and exact existing-journal preservation.
+Its 1,292 current warnings retain restart retry amplification, proof retries,
+one rendezvous timeout, bounded-history churn and existing admission findings.
+No activation drain-window recurrence is seen; eventual 16/18-observation
+Required/Native convergence is not a latency or sustained-load qualification.
+Matching Kind, production locality and full lifecycle remain required.
 
 Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required

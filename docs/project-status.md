@@ -896,6 +896,11 @@ Repair and repeat cl02 before advancing the runtime. No Phase 9 status is promot
 ADR 0411 implements expiry-bounded predecessor drain: a valid attested successor
 can activate without extending an expired key, and removal still requires
 positive zero-flow/zero-route proof. Immutable runtime qualification is pending.
+ADR 0412 passes scoped `45d85d5` cl02 rotation, configured recovery and the full
+reply/inventory gate: common activations 6480–6483, 24 allows/eight denials,
+247 WireGuard/zero Required plaintext frames and unchanged 116 CNI records.
+Current/retained logs are reviewed; retry amplification remains an S1 finding.
+Matching Kind is next. Locality packet consumption and Phase 9 remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
