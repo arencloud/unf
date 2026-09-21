@@ -54,6 +54,9 @@ explicit boot/path checkpoint and exact main-ELF map IDs. Paired real-process
 qualification is pending; no local packet dispatch or fleet rollout occurs.
 ADR 0426 retains the cl02 startup trust/panic failure, corrects fallible client
 construction and task-exit supervision, and requires rebuilt cl02 before Kind.
+ADR 0427 implements actual identity/route writer fencing and unchanged-cut work
+avoidance. Local validation does not close production bank/packet integration
+or any L3/L4/L5/Q platform gate.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

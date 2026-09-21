@@ -118,6 +118,7 @@ use unf_loadbalancer::{
     NodeReachabilitySnapshot, compile_load_balancer_dataplane,
     compile_load_balancer_selection_dataplane,
 };
+use unf_locality::LocalityApplyComponent;
 use unf_route::{
     NativeIpv4NextHop, NativeIpv6NextHop, NativeRemoteNode, NativeRemoteRoutePlan,
     NativeRemoteRoutingProvider, REMOTE_ROUTE_SNAPSHOT_SCHEMA_VERSION, RemoteRouteSnapshot,
@@ -2018,6 +2019,7 @@ async fn main() -> Result<()> {
     locality_runtime::initialize(&args, &state, service_dataplane)?;
     spawn_control_plane_tasks(&args, &state, &cancellation, &mut tasks, service_dataplane)?;
     let (service_failure_tx, mut service_failure_rx) = mpsc::channel(1);
+    locality_runtime::supervise(&state, &cancellation, &mut tasks, &service_failure_tx);
     let mut supervised_service_configured = false;
 
     let cni_provider = resolve_cni_provider(&args, &state).await?;
@@ -2626,13 +2628,10 @@ async fn restore_remote_routes(
     let current = restored.as_ref().is_some_and(|(_, current)| *current);
     let applied = match restored {
         Some((restored, true)) => {
-            restored
-                .plan
-                .apply()
+            publish_desired_remote_routes(state, &restored.snapshot);
+            repair_owned_routes(&restored, state)
                 .await
                 .context("repair last-known-good remote routes")?;
-            publish_desired_remote_routes(state, &restored.snapshot);
-            publish_applied_remote_routes(state, &restored.snapshot, &restored.plan);
             info!(
                 epoch = restored.snapshot.source_epoch,
                 revision = restored.snapshot.revision,
@@ -2770,8 +2769,8 @@ fn adopt_node_block_refresh(
 }
 
 async fn repair_last_known_good_routes(applied: &AppliedRemoteRoutes, state: &AgentState) {
-    match applied.plan.apply().await {
-        Ok(_) => publish_applied_remote_routes(state, &applied.snapshot, &applied.plan),
+    match repair_owned_routes(applied, state).await {
+        Ok(()) => {}
         Err(error) => {
             state.applied_remote_route_epoch.store(0, Ordering::Release);
             state
@@ -2784,6 +2783,31 @@ async fn repair_last_known_good_routes(applied: &AppliedRemoteRoutes, state: &Ag
             error!(%error, "last-known-good remote routes could not be repaired");
         }
     }
+}
+
+async fn repair_owned_routes(applied: &AppliedRemoteRoutes, state: &AgentState) -> Result<()> {
+    let mut guard = if locality_runtime::is_applied(
+        state,
+        LocalityApplyComponent::Routing,
+        applied.snapshot.source_epoch,
+        applied.snapshot.revision,
+    )? {
+        None
+    } else {
+        locality_runtime::begin(state, LocalityApplyComponent::Routing)?
+    };
+    if applied.plan.readback().await.is_err() {
+        if guard.is_none() {
+            guard = locality_runtime::begin(state, LocalityApplyComponent::Routing)?;
+        }
+        applied.plan.apply().await?;
+    }
+    publish_applied_remote_routes(state, &applied.snapshot, &applied.plan);
+    locality_runtime::complete(
+        guard,
+        applied.snapshot.source_epoch,
+        applied.snapshot.revision,
+    )
 }
 
 async fn fetch_remote_route_snapshot(
@@ -2899,6 +2923,27 @@ async fn apply_remote_route_snapshot(
         context.ipv4_onlink,
         context.ipv6_onlink,
     )?;
+    let mut guard = None;
+    if can_reuse_remote_route_checkpoint(&snapshot, &plan, previous) {
+        if !locality_runtime::is_applied(
+            state,
+            LocalityApplyComponent::Routing,
+            snapshot.source_epoch,
+            snapshot.revision,
+        )? {
+            guard = locality_runtime::begin(state, LocalityApplyComponent::Routing)?;
+        }
+        if plan.readback().await.is_ok() {
+            publish_applied_remote_routes(state, &snapshot, &plan);
+            locality_runtime::complete(guard, snapshot.source_epoch, snapshot.revision)?;
+            // Identical durable desired state and actual readback: no route
+            // replacement, checkpoint fsync or repeated admission withdrawal.
+            return Ok(AppliedRemoteRoutes { snapshot, plan });
+        }
+    }
+    if guard.is_none() {
+        guard = locality_runtime::begin(state, LocalityApplyComponent::Routing)?;
+    }
     match previous {
         Some(previous) => plan.reconcile_from(&previous.plan).await?,
         None => plan.apply().await?,
@@ -2916,7 +2961,16 @@ async fn apply_remote_route_snapshot(
         };
     }
     publish_applied_remote_routes(state, &snapshot, &plan);
+    locality_runtime::complete(guard, snapshot.source_epoch, snapshot.revision)?;
     Ok(AppliedRemoteRoutes { snapshot, plan })
+}
+
+fn can_reuse_remote_route_checkpoint(
+    snapshot: &RemoteRouteSnapshot,
+    plan: &NativeRemoteRoutePlan,
+    previous: Option<&AppliedRemoteRoutes>,
+) -> bool {
+    previous.is_some_and(|previous| previous.snapshot == *snapshot && previous.plan == *plan)
 }
 
 fn validate_remote_route_snapshot(
@@ -7428,6 +7482,7 @@ async fn run_dataplane(
         config.egress_path_provider.clone(),
         egress_bgp,
     );
+    let identity_guard = locality_runtime::begin(&state, LocalityApplyComponent::Identity)?;
     let recovered = recover_persistent_dataplane(
         &mut identities,
         &mut policies,
@@ -7436,6 +7491,12 @@ async fn run_dataplane(
         pins_existed,
     )?;
     apply_recovered_state(&state, &identities, &policies, &services, &recovered);
+    match (recovered.identity_epoch, recovered.identity_revision) {
+        (Some(epoch), Some(revision)) => {
+            locality_runtime::complete(identity_guard, epoch, revision)?;
+        }
+        _ => drop(identity_guard),
+    }
     let recovered_ready = recovered_dataplane_is_ready(&recovered);
     if !recovered_ready {
         populate_dataplane_before_attachment(&mut identities, &mut policies, &mut services, &state)
@@ -17983,6 +18044,12 @@ async fn synchronize_identities(
     let applied_revision = state.applied_identity_revision.load(Ordering::Acquire);
     if snapshot.source_epoch == synchronizer.applied_epoch {
         if desired_revision == applied_revision {
+            revalidate_locality_identities(
+                synchronizer,
+                state,
+                snapshot.source_epoch,
+                desired_revision,
+            )?;
             return Ok(());
         }
         if desired_revision < applied_revision {
@@ -17996,6 +18063,7 @@ async fn synchronize_identities(
     let desired_ipv4 = desired_ipv4_identity_entries(&snapshot.ipv4_entries, desired_revision)?;
     let desired_ipv6 = desired_ipv6_identity_entries(&snapshot.ipv6_entries, desired_revision)?;
     let staging_bank = (synchronizer.active_bank + 1) % IDENTITY_BANK_COUNT;
+    let identity_guard = locality_runtime::begin(state, LocalityApplyComponent::Identity)?;
     apply_identity_entries(
         synchronizer,
         desired_ipv4,
@@ -18005,6 +18073,8 @@ async fn synchronize_identities(
         staging_bank,
     )?;
     synchronizer.applied_epoch = snapshot.source_epoch;
+    validate_applied_identity_config(synchronizer, snapshot.source_epoch, desired_revision)?;
+    locality_runtime::complete(identity_guard, snapshot.source_epoch, desired_revision)?;
     state
         .applied_identity_epoch
         .store(snapshot.source_epoch, Ordering::Release);
@@ -18045,6 +18115,47 @@ async fn synchronize_identities(
         "identity snapshot applied"
     );
     Ok(())
+}
+
+fn validate_applied_identity_config(
+    synchronizer: &IdentitySynchronizer,
+    epoch: u64,
+    revision: u64,
+) -> Result<()> {
+    let expected = encode_identity_config(
+        epoch,
+        revision,
+        usize::try_from(identity_entry_count(synchronizer))?,
+        synchronizer.active_bank,
+    )?;
+    if synchronizer.config.get(&0, 0)? != expected {
+        bail!("applied identity configuration readback mismatch");
+    }
+    Ok(())
+}
+
+fn revalidate_locality_identities(
+    synchronizer: &IdentitySynchronizer,
+    state: &AgentState,
+    epoch: u64,
+    revision: u64,
+) -> Result<()> {
+    if locality_runtime::is_applied(state, LocalityApplyComponent::Identity, epoch, revision)? {
+        return Ok(());
+    }
+    let guard = locality_runtime::begin(state, LocalityApplyComponent::Identity)?;
+    validate_applied_identity_config(synchronizer, epoch, revision)?;
+    let bank = usize::from(synchronizer.active_bank);
+    let ipv4 = synchronizer.ipv4_maps[bank]
+        .iter()
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let ipv6 = synchronizer.ipv6_maps[bank]
+        .iter()
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if ipv4 != synchronizer.ipv4_banks[bank] || ipv6 != synchronizer.ipv6_banks[bank] {
+        bail!("applied identity bank readback mismatch");
+    }
+    locality_runtime::complete(guard, epoch, revision)
 }
 
 async fn request_identity_snapshot(
@@ -27962,6 +28073,38 @@ mod tests {
         assert!(
             load_remote_route_snapshot_for_startup(&path, &rotated, 3, 4, true, false).is_err()
         );
+    }
+
+    #[test]
+    fn route_checkpoint_reuse_requires_exact_snapshot_and_lowered_plan() {
+        let (local, snapshot) = route_test_snapshots();
+        let plan = lower_remote_route_snapshot(&snapshot, &local, 3, 4, true, false).unwrap();
+        let previous = AppliedRemoteRoutes {
+            snapshot: snapshot.clone(),
+            plan: plan.clone(),
+        };
+        assert!(can_reuse_remote_route_checkpoint(
+            &snapshot,
+            &plan,
+            Some(&previous)
+        ));
+        assert!(!can_reuse_remote_route_checkpoint(&snapshot, &plan, None));
+        let mut changed = snapshot.clone();
+        changed.revision += 1;
+        assert!(!can_reuse_remote_route_checkpoint(
+            &changed,
+            &plan,
+            Some(&previous)
+        ));
+        for (ipv4, ipv6, onlink) in [(5, 4, true), (3, 5, true), (3, 4, false)] {
+            let moved =
+                lower_remote_route_snapshot(&snapshot, &local, ipv4, ipv6, onlink, false).unwrap();
+            assert!(!can_reuse_remote_route_checkpoint(
+                &snapshot,
+                &moved,
+                Some(&previous)
+            ));
+        }
     }
 
     #[test]

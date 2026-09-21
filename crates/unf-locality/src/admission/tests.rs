@@ -66,6 +66,68 @@ fn startup_unknown_cannot_publish_or_arm() {
 }
 
 #[test]
+fn completed_writer_observation_is_read_only_and_exact() {
+    let state = state();
+    assert!(
+        !lock(&state)
+            .unwrap()
+            .is_applied(LocalityApplyComponent::Identity, 7, Revision::new(11))
+            .unwrap()
+    );
+    settle(&state);
+    let events = lock(&state).unwrap().runtime.events.clone();
+    for _ in 0..100 {
+        let observed = lock(&state).unwrap();
+        observed.health().unwrap();
+        assert!(
+            observed
+                .is_applied(LocalityApplyComponent::Identity, 7, Revision::new(11))
+                .unwrap()
+        );
+        assert!(
+            !observed
+                .is_applied(LocalityApplyComponent::Identity, 8, Revision::new(11))
+                .unwrap()
+        );
+        assert!(
+            !observed
+                .is_applied(LocalityApplyComponent::Routing, 7, Revision::new(11))
+                .unwrap()
+        );
+        assert!(
+            !observed
+                .is_applied(LocalityApplyComponent::Identity, 0, Revision::new(0))
+                .unwrap()
+        );
+    }
+    assert_eq!(lock(&state).unwrap().runtime.events, events);
+    let update = Update::begin(&state, LocalityApplyComponent::Identity).unwrap();
+    assert!(
+        !lock(&state)
+            .unwrap()
+            .is_applied(LocalityApplyComponent::Identity, 7, Revision::new(11))
+            .unwrap()
+    );
+    drop(update);
+    lock(&state).unwrap().health().unwrap();
+    assert!(
+        !lock(&state)
+            .unwrap()
+            .is_applied(LocalityApplyComponent::Identity, 7, Revision::new(11))
+            .unwrap()
+    );
+    lock(&state).unwrap().runtime.fail_withdraw = true;
+    assert!(Update::begin(&state, LocalityApplyComponent::Routing).is_err());
+    assert!(lock(&state).unwrap().health().is_err());
+    assert!(
+        lock(&state)
+            .unwrap()
+            .is_applied(LocalityApplyComponent::Routing, 7, Revision::new(13))
+            .is_err()
+    );
+}
+
+#[test]
 fn concurrent_components_cannot_rearm_each_other() {
     for reverse in [false, true] {
         let state = state();

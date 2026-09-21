@@ -59,6 +59,30 @@ struct State<R: FenceRuntime> {
 }
 
 impl<R: FenceRuntime> State<R> {
+    fn health(&self) -> Result<()> {
+        ensure!(
+            !self.poisoned,
+            "locality admission has an uncertain kernel fence; stop runtime"
+        );
+        Ok(())
+    }
+
+    fn is_applied(
+        &self,
+        component: LocalityApplyComponent,
+        epoch: u64,
+        revision: Revision,
+    ) -> Result<bool> {
+        self.health()?;
+        Ok(epoch != 0
+            && revision.get() != 0
+            && self.applied[component.index()]
+                == Applied::Current {
+                    epoch,
+                    revision: revision.get(),
+                })
+    }
+
     fn new(mut runtime: R) -> Result<Self> {
         runtime.withdraw()?;
         Ok(Self {
@@ -224,6 +248,30 @@ impl LocalityApplyGuard {
 }
 
 impl LocalityAdmission {
+    /// Read-only fatal health check for runtime supervision. Unknown, failed or
+    /// pending inputs with a successfully withdrawn fence are not fatal.
+    ///
+    /// # Errors
+    /// Reports poisoned synchronization or an uncertain kernel fence.
+    pub fn health(&self) -> Result<()> {
+        lock(&self.state)?.health()
+    }
+
+    /// O(1) observation of this coordinator's completed writer, not a fresh
+    /// kernel observation and never packet permission. An unchanged writer may
+    /// avoid withdrawal; false requires guarded readback/apply before completion.
+    ///
+    /// # Errors
+    /// Reports poisoned synchronization or an uncertain kernel fence.
+    pub fn is_applied(
+        &self,
+        component: LocalityApplyComponent,
+        epoch: u64,
+        revision: Revision,
+    ) -> Result<bool> {
+        lock(&self.state)?.is_applied(component, epoch, revision)
+    }
+
     /// Bind the real loader while retaining exclusive startup ownership.
     ///
     /// # Errors

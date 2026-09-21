@@ -141,6 +141,10 @@ ADR 0426 retains the first real-agent cl02 failure: absent diagnostic system
 trust caused client-construction panic and exposed missing task-exit supervision.
 The client is now fallible and main supervises unexpected task exits; the fixture
 adds explicit missing-trust coverage. Rebuilt cl02 must pass before Kind.
+ADR 0427 wires actual identity/remote-route guards, including recovery, rollback,
+readback and durable completion. Unchanged healthy polls avoid redundant fence
+and checkpoint writes; uncertain fences trigger supervision. This is locally
+verified code, not production packet qualification. Bank/packet wiring remains next.
 
 ## Safety and efficiency boundary
 

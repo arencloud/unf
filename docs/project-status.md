@@ -945,6 +945,10 @@ writer/bank integration and L3/L4/L5/Q remain open. No release pin is changed.
 ADR 0426 retains the failed cl02 actual-startup attempt and corrects missing-trust
 panic handling and unexpected task-exit supervision. The expanded rebuilt gate
 must pass cl02 before Kind; production state is unchanged and Phase 9 stays open.
+ADR 0427 implements the real applied-writer guards, exact readback recovery,
+unchanged route/checkpoint work avoidance and fatal fence supervision. Actual
+bank production and policy-first packet/reply integration remain next; live
+fleets stay `45d85d5`, and L3/L4/L5/Q are not promoted by local tests.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

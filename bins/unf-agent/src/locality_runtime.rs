@@ -8,7 +8,11 @@ use std::sync::OnceLock;
 use anyhow::{Context as _, Result, ensure};
 use serde::{Deserialize, Serialize};
 use unf_cni_state::AttachmentJournal;
-use unf_locality::{IncarnationGate, LocalityAdmission, LocalityRuntimeMaps};
+use unf_common::Revision;
+use unf_locality::{
+    IncarnationGate, LocalityAdmission, LocalityApplyComponent, LocalityApplyGuard,
+    LocalityRuntimeMaps,
+};
 
 use super::{AgentState, Args, load_secure_json, persist_secure_json};
 
@@ -232,6 +236,68 @@ impl LocalityRuntime {
             .map_err(|_| anyhow::anyhow!("locality journal gate replaced"))?;
         Ok(())
     }
+}
+
+pub(super) fn begin(
+    state: &AgentState,
+    component: LocalityApplyComponent,
+) -> Result<Option<LocalityApplyGuard>> {
+    state
+        .locality_runtime
+        .get()
+        .map(|runtime| runtime.admission.begin(component))
+        .transpose()
+}
+
+pub(super) fn is_applied(
+    state: &AgentState,
+    component: LocalityApplyComponent,
+    epoch: u64,
+    revision: u64,
+) -> Result<bool> {
+    state.locality_runtime.get().map_or(Ok(true), |runtime| {
+        runtime
+            .admission
+            .is_applied(component, epoch, Revision::new(revision))
+    })
+}
+
+pub(super) fn complete(guard: Option<LocalityApplyGuard>, epoch: u64, revision: u64) -> Result<()> {
+    if let Some(guard) = guard {
+        guard.complete(epoch, Revision::new(revision))?;
+    }
+    Ok(())
+}
+
+pub(super) fn supervise(
+    state: &std::sync::Arc<AgentState>,
+    cancellation: &tokio_util::sync::CancellationToken,
+    tasks: &mut tokio::task::JoinSet<()>,
+    failure_tx: &tokio::sync::mpsc::Sender<super::SupervisedFailure>,
+) {
+    let Some(runtime) = state.locality_runtime.get() else {
+        return;
+    };
+    let admission = runtime.admission.clone();
+    let state = std::sync::Arc::clone(state);
+    let cancellation = cancellation.clone();
+    let failure_tx = failure_tx.clone();
+    tasks.spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                () = cancellation.cancelled() => break,
+                _ = interval.tick() => {
+                    if let Err(error) = admission.health() {
+                        state.ready.store(false, super::Ordering::Release);
+                        let _ = failure_tx.send(super::SupervisedFailure::Dataplane(error.context("fatal locality fence"))).await;
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[cfg(test)]
