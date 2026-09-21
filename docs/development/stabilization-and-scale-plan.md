@@ -3,7 +3,16 @@
 Requested 2026-09-12. Phase 9's closure (ADR 0292) was reopened by S1's
 transport coverage findings (ADR 0293). Phase 9 and S1–S5 remain open.
 
-2026-09-21 resume: ADRs 0384–0387 add bounded real-journal candidate selection,
+Current checkpoint (2026-09-21): ADRs 0389–0391 repair tombstone-aware catalog
+retention and qualify the expanded reply/inventory gate on identical `8db97bb`
+images, cl02 before the separately approved persistent Kind. ADRs 0392–0394
+repair SIGTERM handling and pass isolated PID-1 SIGTERM/SIGINT gates on both
+platforms. Configured fabric rollout/recovery remains pending. The workstation
+installer mock still fails on its host-socket SELinux permission boundary;
+static package rendering passes, but no full mock pass is claimed. No resource
+savings, sustained-load envelope, L3 consumption or S1–S5 closure is claimed.
+
+Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required
 admission gate (missing key epoch 6117 and drain/catch-up deferrals). Retiring
 container streams contain 7,779 warnings during the controller replacement;
@@ -12,7 +21,7 @@ These are reliability/efficiency findings, not measured resource improvements.
 The retained Kind environment is unavailable; no fresh-cluster result may be
 substituted for its retained-state continuity evidence.
 
-Current checkpoint: ADRs 0353–0354 qualify runtime `f984db9` on cl02, then
+Historical checkpoint: ADRs 0353–0354 qualify runtime `f984db9` on cl02, then
 retained Kind with identical images. The complete expanded cross-worker
 Required reply gate verifies runtime CNI ownership and placement-candidate
 distribution/retirement, with preserved state and reviewed current/rotated

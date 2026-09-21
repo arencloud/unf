@@ -207,8 +207,10 @@ ADRs 0389–0391 close the regression-backed catalog-retention repair and scoped
 reply/inventory qualification on cl02 then matching persistent Kind. Preserve
 the historical failure, retry warnings and all authority state. Address the
 observed missing SIGTERM shutdown handling: ADR 0392 implements and locally
-regression-tests the service drain path; cl02 PID-1 qualification is next,
-then matching Kind and live fabric recovery. Continue L3 production integration.
+regression-tests the service drain path. ADRs 0393–0394 repair the terminal-phase
+observer and qualify isolated PID-1 shutdown on cl02 then matching Kind.
+Guarded configured-fabric rollout/recovery is next, cl02 before Kind.
+Continue L3 production integration.
 Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical
 snapshot, candidate or isolated device gate closes full production locality.

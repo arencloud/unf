@@ -21,7 +21,9 @@ ADR 0390 verifies that complete cl02 runtime gate, including traffic/ciphertext,
 actual inventory counts, retirement and byte-identical existing journals. The
 matching Kind gate passes in ADR 0391; production locality consumption remains
 required. Missing SIGTERM handling observed during image checks remains a
-separate recovery defect, not hidden by the traffic pass.
+separate recovery defect, not hidden by the traffic pass. ADRs 0392–0394 repair
+signal handling and qualify isolated PID-1 shutdown on cl02 then Kind; configured
+fabric rollout/recovery remains next. These slices do not close L3.
 
 ## Safety and efficiency boundary
 

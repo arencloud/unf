@@ -2,9 +2,10 @@
 
 This is the independent environment approved on 2026-09-21 (ADR 0388), not a
 replacement for historical retained-state evidence. Qualification order remains
-**cl02 first, then Kind with matching immutable images**. Bootstrap currently
-uses the previously cl02-passing `f984db9` Native runtime, not cl02's failed
-`d007071` Required-admission candidate.
+**cl02 first, then Kind with matching immutable images**. Initial bootstrap used
+the cl02-passing `f984db9` Native runtime. ADR 0391 subsequently qualifies the
+scoped reply/inventory gate on `8db97bb`; neither result closes the full lifecycle.
+ADR 0394 tests isolated `6d71a30` signal probes without upgrading the live fleet.
 
 Run commands from the repository root. The kubeconfig and TLS keys are local,
 ignored credentials; never include them in commits or evidence bundles.
