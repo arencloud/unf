@@ -115,3 +115,15 @@ The fixture now uses its existing Bash inside the exact private fabric netns
 to write/read back the two forwarding controls. No package or host sysctl is
 changed. Its complete failed log and Namespace cleanup are retained under
 `.artifacts/p9-kernel-bank-29afce0-cl02`; this is not a consumer pass.
+
+The `9f90681` attempt reaches the real loader: all 28 native checks and the
+empty-dispatch denial pass, then the seed is rejected by the cl02 verifier for
+a variable stack address whose byte-offset alignment is no longer visible.
+The repair passes a separately bounded word index into a non-inlined context
+reader and uses an in-place helper buffer instead of multiple aggregate copies.
+It also separates endpoint verification frames, dispatches continuation tails
+only after returning to the top-level classifier, and uses fixed IPv6 word
+reads to bound subprogram stack usage. No layout/ownership check is removed.
+Compilation and disassembly are not verifier acceptance; repeat the complete
+cl02 gate before Kind. The full rejection/cleanup evidence is retained under
+`.artifacts/p9-kernel-bank-9f90681-cl02`.

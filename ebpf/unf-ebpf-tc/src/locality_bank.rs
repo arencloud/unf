@@ -9,7 +9,8 @@ use aya_ebpf::{
     EbpfContext,
     bindings::{TC_ACT_SHOT, bpf_fib_lookup as FibLookup},
     helpers::{
-        bpf_fib_lookup, bpf_probe_read_kernel, bpf_probe_read_kernel_str_bytes, bpf_redirect_peer,
+        bpf_fib_lookup, bpf_probe_read_kernel, bpf_probe_read_kernel_buf,
+        bpf_probe_read_kernel_str_bytes, bpf_redirect_peer,
     },
     macros::{classifier, map},
     maps::{Array, DevMap, HashMap, PerCpuArray, ProgramArray},
@@ -89,7 +90,7 @@ pub fn unf_locality_seed(ctx: TcContext) -> i32 {
     {
         return TC_ACT_SHOT;
     }
-    if let Ok(device) = context_device(&ctx, &config.geometry) {
+    if let Ok(device) = context_device(&ctx, config.geometry.skb_device / 8) {
         if live_endpoint(device, &config.geometry, endpoint).is_ok() {
             // The kernel TestRun context resolves/holds this actual host device.
             // Never expose the resulting pointer through userspace readback.
@@ -106,7 +107,7 @@ pub fn unf_locality_seed(ctx: TcContext) -> i32 {
 pub fn unf_locality_bank(ctx: TcContext) -> i32 {
     count(0);
     match consume(&ctx) {
-        Ok(action) => action,
+        Ok(action) => dispatch_continuation(&ctx, action),
         Err(()) => {
             count(2);
             TC_ACT_SHOT
@@ -163,7 +164,7 @@ fn consume(ctx: &TcContext) -> Result<i32, ()> {
     {
         return Err(());
     }
-    let source_device = context_device(ctx, &config.geometry)?;
+    let source_device = context_device(ctx, config.geometry.skb_device / 8)?;
     if UL_POINTER_V1.get(source.endpoint).copied() != Some(source_device) {
         return Err(());
     }
@@ -185,19 +186,35 @@ fn consume(ctx: &TcContext) -> Result<i32, ()> {
 
 #[inline(always)]
 fn resume(ctx: &TcContext, family: u8, nat: bool) -> i32 {
+    let _ = ctx;
     let index = match family {
         4 => 0,
         6 => 1,
         _ => return TC_ACT_SHOT,
     };
-    if nat {
+    // Return to the top-level classifier before any tail call. Keeping the
+    // ownership/FIB subprogram stack out of tail dispatch avoids mixed-call
+    // verifier stack restrictions; no authority is carried across a tail here.
+    -100 - index - if nat { 2 } else { 0 }
+}
+
+#[inline(always)]
+fn dispatch_continuation(ctx: &TcContext, action: i32) -> i32 {
+    let index = match action {
+        -100 => 0,
+        -101 => 1,
+        -102 => 2,
+        -103 => 3,
+        _ => return action,
+    };
+    if index >= 2 {
         count(4);
     } else {
         count(1);
     }
     // Missing, incompatible or exhausted continuation is a drop, never PIPE.
     unsafe {
-        UL_RESUME_V1.tail_call(ctx, index + if nat { 2 } else { 0 });
+        UL_RESUME_V1.tail_call(ctx, index);
     }
     TC_ACT_SHOT
 }
@@ -223,7 +240,7 @@ fn live_devices(index: u32, endpoint: &Endpoint) -> Result<(), ()> {
     Ok(())
 }
 
-#[inline(always)]
+#[inline(never)]
 fn live_endpoint(device: u64, geometry: &DeviceGeometry, endpoint: &Endpoint) -> Result<(), ()> {
     if read::<u32>(device, geometry.device_index)? != endpoint.host_index
         || read::<u32>(device, geometry.device_flags)? & 1 == 0
@@ -285,14 +302,19 @@ fn ownership(
     Ok(())
 }
 
-#[inline(always)]
-fn context_device(ctx: &TcContext, geometry: &DeviceGeometry) -> Result<u64, ()> {
-    if geometry.skb_device > 56 || geometry.skb_device % 8 != 0 {
+// A distinct bounded WORD index keeps the verifier-visible stack address
+// aligned. Folding byte_offset / 8 * 8 back to a checked byte offset loses its
+// alignment fact on the qualified 5.14 verifier. Do not bypass alignment checks
+// in BankConfig or guess an skb member offset.
+#[inline(never)]
+fn context_device(ctx: &TcContext, word: u32) -> Result<u64, ()> {
+    if word > 7 {
         return Err(());
     }
-    let prefix =
-        unsafe { bpf_probe_read_kernel::<[u64; 8]>(ctx.as_ptr().cast()) }.map_err(|_| ())?;
-    Ok(prefix[(geometry.skb_device / 8) as usize])
+    let mut prefix = [0_u64; 8];
+    let bytes = unsafe { core::slice::from_raw_parts_mut(prefix.as_mut_ptr().cast::<u8>(), 64) };
+    unsafe { bpf_probe_read_kernel_buf(ctx.as_ptr().cast(), bytes) }.map_err(|_| ())?;
+    Ok(prefix[word as usize])
 }
 
 #[inline(always)]
@@ -418,7 +440,7 @@ fn prepare_v6(
 ) -> Result<(usize, u8), ()> {
     if ctx.load::<u16>(12).map(u16::from_be) != Ok(0x86dd)
         || ctx.load::<u8>(14).map(|value| value >> 4) != Ok(6)
-        || ctx.load::<[u8; 16]>(38) != Ok(input.destination_address)
+        || !v6_destination_matches(ctx, input)?
     {
         return Err(());
     }
@@ -431,9 +453,28 @@ fn prepare_v6(
     fib.family = 10;
     fib.__bindgen_anon_1.tot_len = total;
     fib.__bindgen_anon_2.flowinfo = ctx.load::<u32>(14).map_err(|_| ())? & 0x0fff_ffff_u32.to_be();
-    fib.__bindgen_anon_3.ipv6_src = words(ctx.load::<[u8; 16]>(22).map_err(|_| ())?);
+    // Fixed word reads avoid aggregate Result<[u8;16]> copies on the small BPF
+    // call stack. They preserve the exact original wire byte order.
+    fib.__bindgen_anon_3.ipv6_src = [
+        ctx.load::<u32>(22).map_err(|_| ())?,
+        ctx.load::<u32>(26).map_err(|_| ())?,
+        ctx.load::<u32>(30).map_err(|_| ())?,
+        ctx.load::<u32>(34).map_err(|_| ())?,
+    ];
     fib.__bindgen_anon_4.ipv6_dst = words(input.destination_address);
     Ok((offset, ctx.load::<u8>(21).map_err(|_| ())?))
+}
+
+#[inline(never)]
+fn v6_destination_matches(ctx: &TcContext, input: &PacketInput) -> Result<bool, ()> {
+    // ABI v1's destination is at offset 40 in an eight-byte-aligned map value.
+    // Read aligned wire-order words without hoisting sixteen byte temporaries
+    // across skb helper calls. No pointer is exported or used for kernel reads.
+    let expected = unsafe { &*input.destination_address.as_ptr().cast::<[u32; 4]>() };
+    Ok(ctx.load::<u32>(38).map_err(|_| ())? == expected[0]
+        && ctx.load::<u32>(42).map_err(|_| ())? == expected[1]
+        && ctx.load::<u32>(46).map_err(|_| ())? == expected[2]
+        && ctx.load::<u32>(50).map_err(|_| ())? == expected[3])
 }
 
 #[inline(always)]
