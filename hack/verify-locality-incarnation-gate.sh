@@ -97,8 +97,8 @@ cleanup() {
         rg -q "$marker" "$directory/test.log" || result=1
     fi
     if [[ $suite == kernel-main-bridge ]]; then
-        [[ $(rg -c 'main-locality-check: name=.* passed=true$' "$directory/test.log") == 5 ]] || result=1
-        [[ $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 5 ]] || result=1
+        [[ $(rg -c 'main-locality-check: name=.* passed=true$' "$directory/test.log") == 7 ]] || result=1
+        [[ $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 7 ]] || result=1
     fi
     if [[ $suite == kernel-delivery || $suite == kernel-admission || $suite == kernel-journal-floor || $suite == kernel-runtime-owner || $suite == kernel-agent-startup ]]; then
         if rg -q 'kernel-locality-delivery: PASS allowed=8 denied=16 protocols=tcp,udp families=4,6 request-bank=true reply-native=true production-policy=false$' "$directory/test.log" &&

@@ -37,6 +37,9 @@ agent test compilation, strict all-target agent Clippy, main BPF release
 compilation, formatting and shell syntax pass. Ignored tests have **not** been
 claimed as kernel passes. Rebuild this source and qualify cl02 before matching
 Kind. No production image, map, journal or release pin changes in this slice.
+Pre-deployment harness review also corrected its two retained exact-count
+assertions from five to seven; the seven-test image must be paired with that
+corrected observer. No platform failure is hidden by this preflight repair.
 
 Actual main-hook selected-bank sockets, full publisher/writer composition,
 mixed local/remote replicas, crash cleanup and restart continuity remain open.
