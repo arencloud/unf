@@ -8,6 +8,12 @@ Kind bootstrap on the prior cl02-passing `f984db9` Native runtime; current-runti
 qualification must still pass cl02 first. Neither fresh bootstrap nor a successful
 scoped reply gate is full Phase 9 closure.
 
+The latest read-only cl02 checkpoint (ADR 0388) finds all five Native recovery
+journals settled at generation `1789972093114`, without a state reset. This
+eventual recovery does not repair or requalify ADR 0387's Required failure.
+The WARN-only agent logs lack the successful key-lifecycle timeline; the next
+repair must reproduce the plan-retention/key-retirement boundary explicitly.
+
 ## Safety and efficiency boundary
 
 A security identity may name Pods on several Nodes. Same-Node placement must

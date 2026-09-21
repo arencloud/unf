@@ -58,3 +58,32 @@ No host reboot, automatic-start or post-reboot recovery test is claimed. See the
 `d007071`; ADR 0387's failed Required gate remains unqualified. Repair and pass
 cl02 before advancing the new Kind runtime. L3/L4/L5/Q, Phase 9.8/9.9 and S1–S5
 remain open. No release pins change.
+
+## Parallel read-only cl02 recovery checkpoint
+
+The morning observation finds all five agents at Native active generation
+`1789972093114`, with no pending recovery plan and empty active/pending/retiring
+transport lists. Ordinary policy/Service reports are fresh and converged at
+443 / 202. Thus ADR 0387's pending Native cleanup eventually clears without our
+resetting any authority; the time to recovery was not continuously observed.
+This is not a rerun or repair of the failed Required gate.
+
+All eleven current controller/agent/installer streams were reviewed over the
+bounded 20-minute window. There are no ERROR entries, but 419 bounded-flow-history
+warnings, sixteen active path-proof retries, eight topology-history warnings,
+and one each key-publication, Service-sync and clsact warning. Agent configuration
+is `RUST_LOG=unf_agent=warn`, so successful INFO-level key lifecycle events are
+absent from both this window and the failed run. No exact epoch-retirement
+timeline can be inferred from their absence.
+
+Source review identifies a further lead: the controller's unactivated-catalog
+reuse barrier checks contract wall-clock validity, not current local key
+availability. It must be examined alongside transport-free retirement and
+pending-generation ownership. This is not a demonstrated sole cause and no
+guard has been removed. Next implementation needs a deterministic regression
+and exact key/plan/generation evidence without exposing private keys, followed
+by complete cl02 qualification before new Kind qualification.
+
+Evidence: `.artifacts/p9-cl02-resume-20260921` and
+`.artifacts/p9-cl02-resume-20260921-logs`. Recovery summary SHA-256:
+`2143482b8b96ee89dde32605b091bdb443dac374d27e81add6646bd2e7df723e`.
