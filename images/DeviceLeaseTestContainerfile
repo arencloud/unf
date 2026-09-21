@@ -7,6 +7,7 @@ COPY crates ./crates
 COPY bins ./bins
 COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
 RUN cargo build --locked --release --package unf-link --example kernel_netns_cookie
+RUN cargo build --locked --release --package unf-link --example kernel_device_layout
 RUN cargo build --locked --release --package unf-agent --example device_observation_loader
 RUN cargo build --locked --release --package unf-agent --example device_owner_aliases
 RUN cargo build --locked --release --package unf-agent --example device_context_seed
@@ -16,6 +17,7 @@ FROM ${TEST_TOOLS_IMAGE}
 ARG UNF_SOURCE_REVISION
 LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
 COPY --from=builder /src/target/release/examples/kernel_netns_cookie /usr/local/bin/kernel-netns-cookie
+COPY --from=builder /src/target/release/examples/kernel_device_layout /usr/local/bin/kernel-device-layout
 COPY --from=builder /src/target/release/examples/device_observation_loader /usr/local/bin/device-observation-loader
 COPY --from=builder /src/target/release/examples/device_owner_aliases /usr/local/bin/device-owner-aliases
 COPY --from=builder /src/target/release/examples/device_context_seed /usr/local/bin/device-context-seed

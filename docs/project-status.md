@@ -833,6 +833,10 @@ exact existing CNI preservation. All fresh reports converge; current Pods are
 Ready with zero restarts. Log review retains 72 warnings, no ERROR and a failed
 retrospective observer covered by its already-open retiring stream. Production
 locality consumption, L4/L5/Q and full Phase 9 remain open.
+ADR 0397 adds bounded native device-layout discovery with borrowed BTF payloads,
+all-definition agreement and negative/mutation tests. The isolated device
+fixture now consumes native offsets and independently checks bpftool/jq parity.
+Its cl02-before-Kind gate remains pending; no live packet path is changed.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

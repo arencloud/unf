@@ -16,6 +16,7 @@ tokio.workspace = true
 unf-cni-state = { path = "../unf-cni-state" }
 
 [dev-dependencies]
+serde_json.workspace = true
 unf-ipam = { path = "../unf-ipam" }
 
 [lints]

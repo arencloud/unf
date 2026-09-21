@@ -1,9 +1,10 @@
 # Phase 9 Required locality and replica closure
 
-This completes the open boundary from ADRs 0293–0294 and 0324. cl02 now runs
-`6d71a30` with an unchanged Native baseline; its complete scoped Required reply
-and journal-inventory gate passes in ADR 0390 after the retained ADR 0387 failure.
-ADR 0391 passes the matching persistent Kind gate on identical images. The
+This completes the open boundary from ADRs 0293–0294 and 0324. cl02 and persistent
+Kind now run `6d71a30` with an unchanged Native baseline; configured recovery
+and the complete scoped reply/inventory gate pass in ADRs 0395–0396, cl02 first.
+The preceding `8db97bb` gate passes in ADRs 0390–0391 after the retained ADR 0387
+failure. The
 historical `f984db9` Kind runtime is unavailable
 after the workstation reboot. ADR 0388 verifies a separately approved persistent
 Kind bootstrap on the prior cl02-passing `f984db9` Native runtime; current-runtime
@@ -26,6 +27,10 @@ signal handling and qualify isolated PID-1 shutdown on cl02 then Kind; configure
 fabric rollout/recovery passes on cl02 in ADR 0395 with the complete scoped
 traffic gate; ADR 0396 passes matching configured recovery and expanded traffic
 on persistent Kind. Both fleets now run `6d71a30`. These slices do not close L3.
+ADR 0397 implements bounded native base/split BTF layout discovery, removing
+the future consumer's dependence on diagnostic bpftool/jq subprocesses. Its
+local mutation tests pass; the complete native-offset device fixture must pass
+cl02 before Kind. Layout metadata alone grants no packet authority.
 
 ## Safety and efficiency boundary
 

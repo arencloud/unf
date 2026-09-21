@@ -29,6 +29,7 @@ const EGRESS_OWNER_PREFIX: &str = "unf:egress-address:v1:";
 pub const EGRESS_GATEWAY_INTERFACE: &str = "unf-egress0";
 const MAX_GATEWAY_ADDRESSES: usize = 4_096;
 
+pub mod kernel_layout;
 mod observation;
 mod peer_identity;
 

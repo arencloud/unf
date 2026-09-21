@@ -1,0 +1,17 @@
+# Reuse the previously qualified immutable device fixture; rebuild only the
+# native metadata reader and qualification script. Never a production image.
+ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
+ARG DEVICE_LEASE_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:67fc08aa4825e0002bc5b23d602282e571cd627d50de0a99d3a334ce684879fc
+FROM ${RUST_IMAGE} AS builder
+WORKDIR /src
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY bins ./bins
+COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
+RUN cargo build --locked --release --package unf-link --example kernel_device_layout
+
+FROM ${DEVICE_LEASE_IMAGE}
+ARG UNF_SOURCE_REVISION
+LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
+COPY --from=builder /src/target/release/examples/kernel_device_layout /usr/local/bin/kernel-device-layout
+COPY hack/verify-device-lease.sh /usr/local/bin/verify-device-observation

@@ -216,6 +216,8 @@ ADR 0395 qualifies guarded cl02 rollout, Native configured shutdown/recovery
 and the expanded reply/inventory gate. ADR 0396 passes matching live Kind. The failed
 direct-Pod-deletion qualifier and slow Required admission remain recorded.
 Continue L3 production integration.
+ADR 0397 supplies locally verified native kernel-layout discovery; qualify its
+complete isolated device fixture on cl02 then matching Kind before consuming it.
 Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical
 snapshot, candidate or isolated device gate closes full production locality.

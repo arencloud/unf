@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 [[ ${UNF_DEVICE_OBSERVATION_ISOLATED_CONTAINER:-} == yes && $EUID == 0 && $(uname -m) == x86_64 ]]
-for command in ip tc bpftool jq socat ss timeout mount umount od grep kernel-netns-cookie device-observation-loader device-owner-aliases device-context-seed device-lease-traffic; do command -v "$command" >/dev/null; done
+for command in ip tc bpftool jq socat ss timeout mount umount od grep kernel-netns-cookie kernel-device-layout device-observation-loader device-owner-aliases device-context-seed device-lease-traffic; do command -v "$command" >/dev/null; done
 directory=$(mktemp -d /tmp/unf-device-observation.XXXXXX)
 suffix=${directory##*.}
 fabric=unf-dl-f-$suffix
@@ -116,7 +116,17 @@ if [[ -e /sys/kernel/btf/veth ]]; then
     bpftool -j -B /sys/kernel/btf/vmlinux btf dump file /sys/kernel/btf/veth format raw > "$directory/veth.json"
 else jq -n '{types:[]}' > "$directory/veth.json"; fi
 jq -n -L /usr/local/share/unf-qualification --slurpfile vm "$directory/vmlinux.json" --slurpfile veth_types "$directory/veth.json" \
-    'include "device-observation-layout"; [$vm[0],$veth_types[0]]|device_lease_layout' > "$directory/layout.json"
+    'include "device-observation-layout"; [$vm[0],$veth_types[0]]|device_lease_layout' > "$directory/reference-layout.json"
+# The native reader supplies offsets used by the actual BPF fixture. The older
+# independent bpftool/jq path is an oracle, not a production runtime dependency.
+kernel-device-layout > "$directory/native-layout.json"
+jq -e '.schemaVersion==1 and .scope=="kernel-device-layout-metadata" and
+  .wordBytes==8 and .kernelAdmitted==false and
+  (.btfDigest|length)==32 and all(.btfDigest[];type=="number" and .>=0 and .<=255 and .==floor)' "$directory/native-layout.json" >/dev/null
+jq '.schemaVersion=2 | .scope="isolated-device-lease-layout" | del(.btfDigest)' "$directory/native-layout.json" > "$directory/layout.json"
+jq -e -s 'length==2 and .[0]==.[1]' "$directory/reference-layout.json" "$directory/layout.json" >/dev/null
+kernel-device-layout > "$directory/native-layout-repeat.json"
+cmp "$directory/native-layout.json" "$directory/native-layout-repeat.json"
 stage=verifier-load
 install -d -m 0700 "$directory/bpffs"
 mount -t bpf bpf "$directory/bpffs"
