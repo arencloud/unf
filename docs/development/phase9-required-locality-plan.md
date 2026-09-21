@@ -31,6 +31,9 @@ ADR 0397 implements bounded native base/split BTF layout discovery, removing
 the future consumer's dependence on diagnostic bpftool/jq subprocesses. Its
 local mutation tests pass; the complete native-offset device fixture must pass
 cl02 before Kind. Layout metadata alone grants no packet authority.
+ADR 0398 passes the complete native-offset fixture on cl02, including independent
+layout parity, lifetime/publication checks and unchanged CNI journals. Matching
+persistent Kind remains required; live runtime stays `6d71a30`.
 
 ## Safety and efficiency boundary
 

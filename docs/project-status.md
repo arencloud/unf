@@ -837,6 +837,11 @@ ADR 0397 adds bounded native device-layout discovery with borrowed BTF payloads,
 all-definition agreement and negative/mutation tests. The isolated device
 fixture now consumes native offsets and independently checks bpftool/jq parity.
 Its cl02-before-Kind gate remains pending; no live packet path is changed.
+ADR 0398 passes cl02's native-offset fixture: all seventy serial checks and both
+40,000-packet movement/publication matrices, zero foreign delivery/socket loss,
+independent layout parity and exact old-map retirement. All 116 CNI records are
+unchanged; five fresh reports converge and current Pods have zero restarts.
+Reviewed logs retain 450 warnings, no ERROR. Matching Kind is next.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
