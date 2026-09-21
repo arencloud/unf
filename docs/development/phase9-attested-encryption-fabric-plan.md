@@ -361,6 +361,9 @@ ADR 0442 subsequently passes the identical-image private filesystem/offline
 worker gate on cl02 then Kind, including the existing publisher/socket matrix,
 preserved production journals and full log review. Full restart/fleet closure
 remains pending; this paired slice grants no additional runtime permission.
+ADR 0444 also passes the identical-image local DSR publisher/socket gate on
+cl02 then Kind, with 24 positive exchanges/24 denials and actual reversible
+reply state. Full authenticated fleet, mixed replicas, restart and Q remain open.
 
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
