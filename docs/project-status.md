@@ -870,6 +870,10 @@ pass cl02 before matching Kind; the live packet consumer remains unimplemented.
 ADR 0404 passes that real kernel/journal gate on cl02, with all 116 existing
 CNI records byte-identical, fresh five-agent convergence, 441 reviewed warnings
 and no ERROR. Matching-image Kind is next; L3 packet integration remains open.
+ADR 0405 passes matching Kind's kernel/journal gate with preserved journals,
+three fresh converged reports, one current / 75 retained warnings and no ERROR.
+This prerequisite is qualified on both kernels; authenticated bank/packet
+integration, migration and L4/L5/Q remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

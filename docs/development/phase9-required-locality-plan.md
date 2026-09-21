@@ -54,6 +54,9 @@ The live authenticated bank consumer and restart fencing are still pending.
 ADR 0404 passes the real kernel/journal gate on cl02 with immutable `bbb5a65`
 diagnostics, exact existing-journal preservation and reviewed logs. Matching
 Kind is next; this is not yet production packet consumption.
+ADR 0405 passes matching Kind on the identical immutable image, preserving
+existing journals and reviewing retained logs. The kernel/journal gate is now
+qualified on both kernels; authenticated bank/packet integration remains next.
 
 ## Safety and efficiency boundary
 
