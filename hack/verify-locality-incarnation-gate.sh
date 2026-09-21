@@ -21,7 +21,7 @@ case $suite in
         test_command='["bash","/usr/local/bin/verify-observed-locality-bank"]'
         marker='observed-locality-suite: PASS native-checks=28 bank-checks=true namespace-cleanup=true packet-delivery-tested=false$'
         ;;
-    kernel-delivery)
+    kernel-delivery|kernel-admission)
         test_command='["env","UNF_KERNEL_BANK_ISOLATED_CONTAINER=yes","UNF_KERNEL_BANK_PACKET_DELIVERY=yes","bash","/usr/local/bin/verify-observed-locality-bank"]'
         marker='kernel-locality-suite: PASS bank-checks=true namespace-cleanup=true packet-delivery-tested=true$'
         ;;
@@ -70,12 +70,16 @@ cleanup() {
     if [[ $result == 0 ]]; then
         rg -q "$marker" "$directory/test.log" || result=1
     fi
-    if [[ $suite == kernel-delivery ]]; then
+    if [[ $suite == kernel-delivery || $suite == kernel-admission ]]; then
         if rg -q 'kernel-locality-delivery: PASS allowed=8 denied=16 protocols=tcp,udp families=4,6 request-bank=true reply-native=true production-policy=false$' "$directory/test.log" &&
             [[ $(rg -c 'kernel-locality-delivery: name=.* delivered=true ' "$directory/test.log") == 8 &&
                $(rg -c 'kernel-locality-delivery: name=.* delivered=false ' "$directory/test.log") == 16 ]]; then
             delivery=true
         else result=1; fi
+    fi
+    if [[ $suite == kernel-admission ]]; then
+        rg -q 'kernel-locality-admission: PASS decisions=8 pending-writer-denied=true cancelled-writer-denied=true rollback-not-rearmed=true production-integration=false$' "$directory/test.log" || result=1
+        [[ $(rg -c 'kernel-locality-check: name=coordinator-' "$directory/test.log") == 8 ]] || result=1
     fi
     jq -n --argjson code "$result" --argjson removed "$removed" --argjson delivery "$delivery" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" \
         '{schemaVersion:2,result:(if $code==0 then "passed" else "failed" end),platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:$removed,packetDeliveryTested:$delivery}' > "$directory/evidence.json"

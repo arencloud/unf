@@ -109,6 +109,10 @@ ADR 0418 passes that complete `35f9e1b` gate on cl02 then identical-image Kind:
 eight actual successful exchanges and sixteen denials on each platform,
 complete cleanup, unchanged journals and reviewed logs. Production admission
 coordination and packet composition remain required; L3/L4/L5/Q stay open.
+ADR 0419 implements the shared applied-writer admission coordinator with
+cancel/failure-safe guards and O(1) publication locking. Its expanded kernel
+and socket fixture requires cl02 then identical-image Kind. Actual production
+writer hooks and packet wiring remain open, not inferred from library tests.
 
 ## Safety and efficiency boundary
 

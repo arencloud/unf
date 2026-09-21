@@ -15,7 +15,8 @@ use unf_cni_state::{
 use unf_ebpf_common::locality::{ABI_VERSION, PACKET_DSR_PENDING, PacketInput};
 use unf_encryption::EncryptionLocalityContext;
 use unf_locality::{
-    IncarnationGate, LeasedLocalityBank, LocalityObservationWorker, LocalityRuntimeMaps,
+    IncarnationGate, KernelLocalityBank, LeasedLocalityBank, LocalityAdmission,
+    LocalityApplyComponent, LocalityObservationWorker, LocalityRuntimeMaps,
 };
 use unf_route::NativeRoutePlan;
 
@@ -377,6 +378,17 @@ pub async fn verify(
     // remain live. Revoking the nonce below cannot be repaired by route state.
     probe(&mut object, "target-route-restored-v4", v4, &wire4, 7)?;
     probe(&mut object, "target-route-restored-v6", v6, &wire6, 7)?;
+    let admission = verify_admission(
+        runtime,
+        &mut object,
+        &bank,
+        journal,
+        gate,
+        current,
+        target_route,
+        [v4, v6],
+    )
+    .await?;
     pair(
         &mut delivery,
         &mut object,
@@ -400,10 +412,10 @@ pub async fn verify(
         false,
     )?;
     ensure!(
-        bank.publish(&mut runtime, journal, gate, current).is_err(),
+        admission.publish(&bank, journal, gate, current).is_err(),
         "stale original journal cut accepted"
     );
-    runtime.withdraw()?;
+    admission.withdraw()?;
     if let Some(delivery) = &delivery {
         delivery.finish()?;
     }
@@ -415,4 +427,66 @@ pub async fn verify(
 
 fn runtime_from(object: &Ebpf) -> Result<LocalityRuntimeMaps> {
     runtime(object)
+}
+
+#[allow(clippy::too_many_arguments)] // Exact live fixture authorities, never reopened pins.
+async fn verify_admission(
+    runtime: LocalityRuntimeMaps,
+    object: &mut Ebpf,
+    bank: &KernelLocalityBank,
+    journal: &AttachmentJournal,
+    gate: &IncarnationGate,
+    context: &EncryptionLocalityContext,
+    route: &NativeRoutePlan,
+    inputs: [PacketInput; 2],
+) -> Result<LocalityAdmission> {
+    use LocalityApplyComponent::{Identity, Routing};
+    let admission = LocalityAdmission::new(runtime)?;
+    let [v4, v6] = inputs;
+    let wire4 = packet(v4);
+    let wire6 = packet(v6);
+    probe(object, "coordinator-startup-withdrawn", v4, &wire4, 2)?;
+    let identity = admission.begin(Identity)?;
+    let routing = admission.begin(Routing)?;
+    identity.complete(context.identity_epoch, context.identity_revision)?;
+    ensure!(
+        admission.publish(bank, journal, gate, context).is_err(),
+        "pending route writer admitted"
+    );
+    probe(object, "coordinator-route-pending", v4, &wire4, 2)?;
+    // Simulate a real route update interrupted before commit, not merely a
+    // fabricated status flag. Drop leaves it failed even after route rollback.
+    route.delete().await?;
+    drop(routing);
+    route.apply().await?;
+    ensure!(
+        admission.publish(bank, journal, gate, context).is_err(),
+        "cancelled route writer admitted"
+    );
+    probe(object, "coordinator-route-cancelled", v4, &wire4, 2)?;
+    let routing = admission.begin(Routing)?;
+    route.readback().await?;
+    routing.complete(context.identity_epoch, context.routing_revision)?;
+    admission.publish(bank, journal, gate, context)?;
+    probe(object, "coordinator-recovered-v4", v4, &wire4, 7)?;
+    probe(object, "coordinator-recovered-v6", v6, &wire6, 7)?;
+    let identity = admission.begin(Identity)?;
+    let routing = admission.begin(Routing)?;
+    drop(identity);
+    routing.complete(context.identity_epoch, context.routing_revision)?;
+    ensure!(
+        admission.publish(bank, journal, gate, context).is_err(),
+        "route completion masked failed identity writer"
+    );
+    probe(object, "coordinator-identity-cancelled", v4, &wire4, 2)?;
+    admission
+        .begin(Identity)?
+        .complete(context.identity_epoch, context.identity_revision)?;
+    admission.publish(bank, journal, gate, context)?;
+    probe(object, "coordinator-settled-v4", v4, &wire4, 7)?;
+    probe(object, "coordinator-settled-v6", v6, &wire6, 7)?;
+    println!(
+        "kernel-locality-admission: PASS decisions=8 pending-writer-denied=true cancelled-writer-denied=true rollback-not-rearmed=true production-integration=false"
+    );
+    Ok(admission)
 }
