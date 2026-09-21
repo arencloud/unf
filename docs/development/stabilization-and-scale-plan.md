@@ -20,6 +20,9 @@ isolated fixture on cl02; matching Kind remains pending. Reviewed cl02 logs
 also expose one operations-persistence retry whose outer-only log message
 omits the underlying cause. Later durable generation/revision progress is proved;
 failure-detail logging and recurring bounded-history warnings remain findings.
+ADR 0401 then passes matching Kind with independent packet accounting and
+unchanged live state. Native layout discovery is qualified on both kernels,
+not a measured CPU/RSS improvement or production L3/S1–S5 closure.
 
 Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required

@@ -40,6 +40,9 @@ not live qualification; the rebuilt fixture must pass cl02 again before Kind.
 ADR 0400 passes the complete repaired `90cb651` fixture on cl02, with exact
 layout parity, traffic accounting, cleanup and journal preservation. The
 same immutable image must now pass persistent Kind.
+ADR 0401 passes that complete matching Kind gate. Native bounded kernel-layout
+discovery is qualified on both deployed kernels; actual authenticated packet
+consumption, migration and L4/L5/Q remain open.
 
 ## Safety and efficiency boundary
 

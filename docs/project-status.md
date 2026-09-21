@@ -851,6 +851,13 @@ movement/publication, layout-parity and cleanup checks pass with unchanged
 116 CNI records. Fresh reports converge; logs retain 447 warnings, no ERROR,
 including one operations-persistence retry with later durable progress proved.
 The identical immutable image's Kind rerun remains next.
+ADR 0401 passes matching Kind's complete native-offset fixture: seventy serial
+checks, both 40,000-packet matrices, independent offset parity, exact old-map
+retirement and zero foreign delivery/socket loss. Preexisting journals are
+unchanged, reports converge, and runtime Pods remain Ready with zero restarts.
+Current/retained log windows have one/74 overlapping warnings and no ERROR.
+Native layout discovery is qualified on both kernels; actual L3 consumption,
+migration, L4/L5/Q and stabilization remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

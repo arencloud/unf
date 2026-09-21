@@ -9,6 +9,9 @@ ADR 0394 tests isolated `6d71a30` signal probes without upgrading the live fleet
 ADR 0396 subsequently upgrades the live fleet to those same images after cl02,
 qualifying Native configured controller/agent recovery and the expanded
 reply/inventory gate. Full locality and lifecycle qualification remain open.
+ADR 0401 additionally qualifies the native-offset isolated device fixture after
+cl02, retaining ADR 0399's earlier compiler-attribute parsing failure and repair.
+This does not upgrade the live fleet or activate production locality permission.
 
 Run commands from the repository root. The kubeconfig and TLS keys are local,
 ignored credentials; never include them in commits or evidence bundles.
