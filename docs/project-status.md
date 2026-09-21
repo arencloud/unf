@@ -1054,6 +1054,13 @@ The improved observer identifies Kind's prepopulated bpffs `progs.debug` entry.
 The helper now creates an exclusive private adapter directory inside the
 detached filesystem, preserving kernel entries and refusing existing adapter
 residue. Local regression covers preservation; paired requalification is pending.
+ADR 0450 verifies the corrected detached-mount helper boundary (`c929d55`) on
+cl02 then identical Kind: helper SYS_ADMIN-only, client three-capability BPF
+pinning with namespace creation denied, descriptor lifetime/reclamation and
+preserved journals. Workspace passes 921 tests; complete current/retained logs
+retain known warnings with no ERROR. Separate-process supervisor, observation,
+seeding and final restricted-runtime integration remain next; no live privilege
+or image changes occur and Phase 9/S1–S5 remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

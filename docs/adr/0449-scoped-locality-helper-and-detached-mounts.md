@@ -53,7 +53,7 @@ yet separate production containers or full process-crash qualification.
 
 | Slice | State / closure requirement |
 | --- | --- |
-| Detached-mount protocol and ownership | Implemented; local tests, then immutable cl02-first/Kind kernel gate |
+| Detached-mount protocol and ownership | **Verified isolated boundary**: source `c929d55` passes cl02 then identical Kind; 921 workspace tests pass. ADR 0450 records limits and complete evidence; this is not production-process integration |
 | Production supervisor and endpoint authentication | Pending: private socket delivery, process/Pod identity, single persistent worker slot, bounded cancellation and child reaping; no UID-only public service |
 | Descriptor-bound namespace observations | Pending: link/route/cookie readbacks and fresh recheck, no caller pathname lookup or policy authority |
 | Restricted device seeding | Pending: exact program/map provenance, fixed non-transmitting operation, no general BPF execution API |

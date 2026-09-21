@@ -381,6 +381,12 @@ The first boundary uses authenticated single-use detached-bpffs FD transfer;
 production supervision, namespace observations, device seeding and restricted
 runtime integration remain explicit sub-milestones. Do not apply ADR 0448's
 historical patches or mark the fleet/Phase 9 complete from this isolated slice.
+ADR 0450 verifies the detached-mount boundary on cl02 then identical Kind with
+capability-restricted test threads, actual descriptor/pin lifetime checks and
+unchanged production journals. Full workspace tests pass (921); log warnings
+remain visible. Next is trusted separate-process supervision, then namespace
+observations/device seeding and final restricted-runtime integration. This does
+not deploy the helper, promote L3/L4/L5/Q or complete Phase 9/stabilization.
 
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
