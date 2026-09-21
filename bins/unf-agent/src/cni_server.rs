@@ -233,7 +233,9 @@ fn journal_error_response(error: &JournalError) -> TransactionResponse {
         JournalError::NotFound => TransactionErrorCode::NotFound,
         JournalError::InvalidTransition(_) => TransactionErrorCode::InvalidTransition,
         JournalError::IncompatibleSchema { .. } => TransactionErrorCode::IncompatibleSchema,
-        JournalError::Io(_) => TransactionErrorCode::PersistenceFailure,
+        JournalError::Io(_) | JournalError::Retirement(_) => {
+            TransactionErrorCode::PersistenceFailure
+        }
         JournalError::Ipam(IpamError::Exhausted { .. }) => TransactionErrorCode::Exhausted,
         JournalError::Conflict(_) | JournalError::Ipam(_) => TransactionErrorCode::Conflict,
     };
@@ -486,6 +488,64 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn retirement_failure_returns_retryable_error_without_authorizing_teardown() {
+        struct FailingRetirement;
+        impl unf_cni_state::AttachmentRetirement for FailingRetirement {
+            fn retire(&self, _: &[u8; 32]) -> io::Result<()> {
+                Err(io::Error::other("injected locality revocation failure"))
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attachments.json");
+        let journal = Mutex::new(AttachmentJournal::open(&path, provider()).unwrap());
+        let mut bound = spec();
+        bound.workload_uid = Some("pod-uid-a".into());
+        for operation in [
+            TransactionOperation::Prepare {
+                attachment: bound.clone(),
+            },
+            TransactionOperation::Commit {
+                key: bound.key.clone(),
+            },
+        ] {
+            assert!(matches!(
+                handle_request(&request(operation), &journal).await.outcome,
+                TransactionOutcome::Ok { .. }
+            ));
+        }
+        journal
+            .lock()
+            .await
+            .install_retirement(Box::new(FailingRetirement))
+            .unwrap();
+        let durable = fs::read(&path).unwrap();
+        let response = handle_request(
+            &request(TransactionOperation::BeginDelete {
+                key: bound.key.clone(),
+            }),
+            &journal,
+        )
+        .await;
+        assert_eq!(response.schema_version, CNI_TRANSACTION_SCHEMA_VERSION);
+        assert!(matches!(
+            response.outcome,
+            TransactionOutcome::Error {
+                code: TransactionErrorCode::PersistenceFailure,
+                ..
+            }
+        ));
+        let encoded = serde_json::to_string(&response).unwrap();
+        assert!(!encoded.contains("creationToken"));
+        assert_eq!(fs::read(&path).unwrap(), durable);
+        let journal = journal.lock().await;
+        assert_eq!(
+            journal.get(&bound.key).unwrap().phase,
+            AttachmentPhase::Ready
+        );
+        assert!(journal.cut().is_none());
     }
 
     #[tokio::test]

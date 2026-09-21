@@ -43,6 +43,10 @@ same immutable image must now pass persistent Kind.
 ADR 0401 passes that complete matching Kind gate. Native bounded kernel-layout
 discovery is qualified on both deployed kernels; actual authenticated packet
 consumption, migration and L4/L5/Q remain open.
+ADR 0402 adds locally verified per-incarnation journal retirement before durable
+teardown, with failure/retry fences and single-record rollback. The kernel gate
+and actual bank publisher must install and consume this boundary; no live
+locality permission is enabled by the journal API alone.
 
 ## Safety and efficiency boundary
 

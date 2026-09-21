@@ -23,6 +23,10 @@ failure-detail logging and recurring bounded-history warnings remain findings.
 ADR 0401 then passes matching Kind with independent packet accounting and
 unchanged live state. Native layout discovery is qualified on both kernels,
 not a measured CPU/RSS improvement or production L3/S1–S5 closure.
+ADR 0402 replaces whole-inventory CNI rollback copies with one-record snapshots
+while adding pre-persistence incarnation retirement. Failure/retry regressions
+pass locally. Full-document persistence and allocation scans remain; there is
+no measured heavy-load improvement or live kernel-retirement claim yet.
 
 Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required

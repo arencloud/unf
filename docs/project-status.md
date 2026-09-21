@@ -858,6 +858,11 @@ unchanged, reports converge, and runtime Pods remain Ready with zero restarts.
 Current/retained log windows have one/74 overlapping warnings and no ERROR.
 Native layout discovery is qualified on both kernels; actual L3 consumption,
 migration, L4/L5/Q and stabilization remain open.
+ADR 0402 adds the synchronous per-incarnation CNI retirement boundary, blocking
+durable deletion on revocation failure and eliminating whole-inventory rollback
+copies. All 843 workspace tests and strict Clippy pass; the kernel-backed hook
+and immutable publisher remain pending. No live locality or performance claim
+is promoted by this locally verified prerequisite.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

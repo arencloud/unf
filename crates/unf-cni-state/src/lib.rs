@@ -330,6 +330,8 @@ pub enum JournalError {
     IncompatibleSchema { actual: u16, expected: u16 },
     #[error("attachment journal I/O failed: {0}")]
     Io(#[from] io::Error),
+    #[error("attachment locality retirement failed before journal persistence: {0}")]
+    Retirement(io::Error),
     #[error("attachment journal JSON is invalid: {0}")]
     Json(#[from] serde_json::Error),
     #[error("attachment IPAM failed: {0}")]
@@ -365,6 +367,61 @@ pub struct AttachmentJournal {
     attachments: BTreeMap<AttachmentKey, AttachmentRecord>,
     instance: Option<Arc<()>>,
     revision: u64,
+    retirement: Option<Box<dyn AttachmentRetirement>>,
+}
+
+/// Synchronous, process-local invalidation of a previously published attachment
+/// incarnation. Implementations must be idempotent and treat an already absent
+/// nonce as success. Returning an error prevents the durable CNI transition and
+/// its successful reply; it must never authorize subsequent link teardown.
+///
+/// Called under the journal owner's transaction lock, before persistence. Do
+/// not call back into that lock, perform async work, or restore permission on
+/// failure. This is a revocation hook, not placement or packet authority.
+pub trait AttachmentRetirement: Send + Sync {
+    /// Revoke this exact full creation nonce in every published locality bank.
+    ///
+    /// # Errors
+    /// Return an error if revocation cannot be established. Partial revocation
+    /// is allowed on error; automatic rearm is not.
+    fn retire(&self, creation_token: &[u8; 32]) -> io::Result<()>;
+}
+
+// A transaction changes at most one record. Keep its rollback copy rather than
+// cloning every attachment on each ADD/DEL or idempotent Commit. Persistence
+// still serializes the complete durable document; this is not O(1) total I/O.
+struct MutationSnapshot {
+    key: AttachmentKey,
+    record: Option<AttachmentRecord>,
+}
+
+impl MutationSnapshot {
+    fn capture(journal: &AttachmentJournal, operation: &TransactionOperation) -> Option<Self> {
+        let key = match operation {
+            TransactionOperation::Prepare { attachment } => &attachment.key,
+            TransactionOperation::Commit { key }
+            | TransactionOperation::BeginAbort { key }
+            | TransactionOperation::CompleteAbort { key }
+            | TransactionOperation::BeginDelete { key }
+            | TransactionOperation::CompleteDelete { key } => key,
+            TransactionOperation::Status
+            | TransactionOperation::List { .. }
+            | TransactionOperation::Inspect { .. }
+            | TransactionOperation::Check { .. } => return None,
+        };
+        Some(Self {
+            key: key.clone(),
+            record: journal.get(key).cloned(),
+        })
+    }
+
+    fn restore(self, journal: &mut AttachmentJournal) {
+        if let Some(record) = self.record {
+            journal.attachments.insert(self.key, record);
+        } else {
+            journal.attachments.remove(&self.key);
+        }
+    }
 }
 
 /// Opaque process-local snapshot fence. A token from another open journal,
@@ -418,6 +475,7 @@ impl AttachmentJournal {
             attachments,
             instance: Some(Arc::new(())),
             revision: 0,
+            retirement: None,
         };
         if migrated {
             journal.persist()?;
@@ -477,6 +535,33 @@ impl AttachmentJournal {
             && self.revision == cut.revision
     }
 
+    /// Installs the one lifetime invalidator shared by all locality banks for
+    /// this open journal. Install before publishing any bank, under the same
+    /// lock used for transactions and publication. Existing cuts are invalidated
+    /// so work started without this boundary cannot be published afterward.
+    ///
+    /// Reopen never restores this process-local hook or packet permission. The
+    /// publisher must first fence any previous runtime bank before serving CNI.
+    /// No hook is necessary for callers that never publish locality permission.
+    ///
+    /// # Errors
+    /// Rejects replacement or uncertain journal durability. A hook cannot be
+    /// removed or swapped while this journal remains open.
+    pub fn install_retirement(
+        &mut self,
+        retirement: Box<dyn AttachmentRetirement>,
+    ) -> Result<(), JournalError> {
+        if self.retirement.is_some() || self.instance.is_none() {
+            return Err(JournalError::InvalidTransition(
+                "retirement installation requires a durable journal without an existing hook"
+                    .into(),
+            ));
+        }
+        self.retirement = Some(retirement);
+        self.instance = Some(Arc::new(()));
+        Ok(())
+    }
+
     /// Applies one validated, durable transaction operation.
     ///
     /// # Errors
@@ -505,16 +590,37 @@ impl AttachmentJournal {
             self.validate_legacy_operation(schema_version, &operation)?;
         }
 
-        // Read operations cannot mutate the inventory. Do not allocate a
-        // rollback copy or compare the entire journal for Status/List/CHECK.
-        let previous = (!matches!(
-            &operation,
-            TransactionOperation::Status
-                | TransactionOperation::List { .. }
-                | TransactionOperation::Inspect { .. }
-                | TransactionOperation::Check { .. }
-        ))
-        .then(|| self.attachments.clone());
+        let previous = MutationSnapshot::capture(self, &operation);
+        let result = self.apply_operation(operation, schema_version);
+        let (attachment, attachments) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(previous) = previous {
+                    previous.restore(self);
+                }
+                return Err(error);
+            }
+        };
+        if let Some(previous) = previous
+            && self.get(&previous.key) != previous.record.as_ref()
+        {
+            self.persist_mutation(previous)?;
+        }
+        Ok(TransactionResponse {
+            schema_version,
+            outcome: TransactionOutcome::Ok {
+                attachment: attachment.map(Box::new),
+                attachments,
+                attachment_count: self.attachments.len(),
+            },
+        })
+    }
+
+    fn apply_operation(
+        &mut self,
+        operation: TransactionOperation,
+        schema_version: u16,
+    ) -> Result<(Option<AttachmentRecord>, Vec<AttachmentRecord>), JournalError> {
         let (attachment, attachments) = match operation {
             TransactionOperation::Status => (None, Vec::new()),
             TransactionOperation::List {
@@ -556,35 +662,38 @@ impl AttachmentJournal {
             }
         };
 
-        if let Some(previous) = previous
-            && self.attachments != previous
+        Ok((attachment, attachments))
+    }
+
+    fn persist_mutation(&mut self, previous: MutationSnapshot) -> Result<(), JournalError> {
+        let Some(revision) = self.revision.checked_add(1) else {
+            previous.restore(self);
+            return Err(JournalError::InvalidTransition(
+                "process-local attachment revision exhausted".into(),
+            ));
+        };
+        if let Some(record) = &previous.record
+            && record.phase == AttachmentPhase::Ready
+            && let Some(token) = &record.creation_token
+            && let Some(retirement) = &self.retirement
+            && let Err(error) = retirement.retire(token)
         {
-            let Some(revision) = self.revision.checked_add(1) else {
-                self.attachments = previous;
-                return Err(JournalError::InvalidTransition(
-                    "process-local attachment revision exhausted".into(),
-                ));
-            };
-            if let Err(error) = self.persist() {
-                self.attachments = previous;
-                // A failure can occur after rename. Preserve the existing
-                // transaction rollback behavior, but never authorize locality
-                // from a potentially ambiguous durable snapshot. Reads and
-                // no-op replays cannot make this instance trustworthy again.
-                self.instance = None;
-                return Err(error);
-            }
-            self.revision = revision;
-            self.instance.get_or_insert_with(|| Arc::new(()));
+            previous.restore(self);
+            // The hook may have partially revoked. Never reuse a pre-failure
+            // publication cut even though the durable journal did not change.
+            self.instance = None;
+            return Err(JournalError::Retirement(error));
         }
-        Ok(TransactionResponse {
-            schema_version,
-            outcome: TransactionOutcome::Ok {
-                attachment: attachment.map(Box::new),
-                attachments,
-                attachment_count: self.attachments.len(),
-            },
-        })
+        if let Err(error) = self.persist() {
+            previous.restore(self);
+            // A failure can occur after rename. Reads and no-op replays cannot
+            // make this instance trustworthy again, and retirement stays final.
+            self.instance = None;
+            return Err(error);
+        }
+        self.revision = revision;
+        self.instance.get_or_insert_with(|| Arc::new(()));
+        Ok(())
     }
 
     fn list_records(
@@ -1155,6 +1264,7 @@ fn remove_stale_temporary(path: &Path) -> Result<(), JournalError> {
 mod tests {
     mod cut;
     mod ownership;
+    mod retirement;
     use std::os::unix::fs::symlink;
 
     use super::*;
