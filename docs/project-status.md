@@ -911,6 +911,10 @@ preparation and exact-runtime/original-cut publisher. Its isolated consumer
 requires cl02-before-Kind qualification. Live agent integration, compatibility,
 restart continuity and application-delivery coverage remain open; Phase 9 is
 not promoted by this implementation slice.
+ADR 0415 verifies the repaired `b432bec` isolated bank on cl02, with nineteen
+kernel decisions, 28 native checks, unchanged production journals and current/
+retained log review. Matching Kind is next. No live agent or release pin changes;
+production application delivery and full L3/L4/L5/Q remain unverified.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

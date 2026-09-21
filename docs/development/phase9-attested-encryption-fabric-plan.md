@@ -36,6 +36,9 @@ ADR 0414 adds the sealed endpoint-linear bank implementation and an isolated
 consumer qualifier. cl02-first kernel validation is pending. The production
 agent remains unchanged; policy/Service wiring, restart migration and actual
 delivery evidence remain prerequisites to any L3/Phase 9 closure.
+ADR 0415 passes the complete repaired bank diagnostic on cl02, including
+nineteen non-transmitting kernel decisions and all 28 native checks. Matching
+Kind on the identical `b432bec` image is next; production integration stays open.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

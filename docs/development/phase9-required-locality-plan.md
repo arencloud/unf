@@ -93,6 +93,10 @@ binding, private device seeds, the bounded preparation worker and original-cut
 publication fence. Isolated kernel qualification is pending on cl02 before
 matching Kind. The actual agent packet path, compatibility/restart boundaries
 and L4/L5/Q remain open; a redirect request is not observed delivery.
+ADR 0415 passes the complete repaired `b432bec` bank diagnostic on cl02: 28
+native checks, nineteen kernel decisions, exact sealing/publication and nonce
+retirement, with unchanged production journals and full log review. Matching
+Kind follows on the identical image. This does not qualify production delivery.
 
 ## Safety and efficiency boundary
 
