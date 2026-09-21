@@ -93,6 +93,10 @@ cl02-first execution and full live controller/recovery integration remain open.
 ADR 0438 passes the corrected seven-test main/reverse-Service gate on cl02 then
 identical-image Kind, with journal preservation and full log review. Actual
 publisher/main-hook sockets, live integration and recovery remain next.
+ADR 0439 passes actual publisher/main-hook sockets on cl02 then identical
+`807a130` Kind (sixteen positive exchanges, twenty denials, exact cleanup).
+Full authenticated fleet composition and restart continuity remain next;
+L3/L4/L5/Q and measured stabilization are not promoted by the private fixture.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

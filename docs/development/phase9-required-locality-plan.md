@@ -189,6 +189,10 @@ Local checks pass; platform execution is pending after corrected reply checks.
 ADR 0438 passes all seven corrected actual-main checks on cl02 then identical
 `b87d050` Kind, preserving live state and reviewing full logs. Actual publisher/
 main-hook sockets are next; no L3/L4/L5/Q or stabilization promotion.
+ADR 0439 passes actual publisher/main-hook socket composition on cl02 then
+identical `807a130` Kind: sixteen positive exchanges, twenty denials, exact
+cleanup, unchanged production state and complete log review. Restart continuity,
+authenticated fleet composition and L4/L5/Q remain next.
 
 ## Safety and efficiency boundary
 
@@ -217,12 +221,25 @@ Required path authoritative; it never becomes a Native fallback.
 |---|---|---|
 | L1 exact address ownership | Verified locally — ADR 0325 | Shared validated placement preserves dual-stack IP/UID/identity/Node ownership; ambiguous ownership and capacity fail before expansion; no policy-pair enumeration in the placement-only API; 758 workspace tests pass |
 | L2 replayable locality certificate | Verified locally — ADR 0326 | Versioned, canonical, Node/revision-bound certificate; independent placement replay; negative replica, move, UID reuse, stale-cut, malformed-wire and address-substitution tests; 770 workspace tests pass; no packet-path change |
-| L3 consuming integration | In progress — ownership prerequisites and isolated target-device lifetime verified on both platforms, ADRs 0339–0346; live candidate distribution/status/retirement verified cl02 then Kind, ADRs 0353–0354 | Explicit wire/map compatibility and restart migration; continuous source/peer lifetime and exact attachment/route readback; banked publication and packet-policy-first consumption; status/explanation without claiming observed delivery from placement alone |
+| L3 consuming integration | In progress — bank lifetime/startup verified in paired diagnostics; main/reverse-Service checks verified (ADR 0438); actual publisher/main-hook sockets verified in private networks (ADR 0439). Full fleet and recovery remain open | Explicit wire/map compatibility and restart migration; continuous source/peer lifetime and exact attachment/route readback; banked publication and packet-policy-first consumption; status/explanation without claiming observed delivery from placement alone |
 | L4 cl02 validation | Pending | Same-Node and mixed local/remote replicas; IPv4/IPv6 TCP/UDP; PodIP, Service and translated ports; policy isolation and replies; positive remote ciphertext and zero remote Required plaintext; move/replacement/recovery; full fixture cleanup |
 | L5 matching Kind validation | Pending | Same immutable runtime and L4 matrix after cl02; retained state preserved; observer failures and losses remain failures |
 | Q complete Phase 9 lifecycle | Pending | Full current-runtime cl02 lifecycle then independent matching Kind, including staged Required baseline, rotation, failure/recovery, composition, history and cleanup; update release pins and platform status only with complete evidence |
 
 ### L3 consuming-boundary checklist
+
+Current closure checklist (historical evidence follows):
+
+| Boundary | Current state |
+| --- | --- |
+| Owned startup, journal reader floor and retirement | Paired isolated checks verified; production migration/recovery still requires the new fleet runtime |
+| Actual publisher + main classifier + PodIP/Service sockets | Verified cl02 then identical Kind in private networks, ADR 0439 |
+| Established Service reply provenance/transport | Paired actual-main checks verified, ADRs 0436/0438; revision churn preserved, protocol expiry enforced |
+| Full authenticated controller and real reconciliation loops | Pending new-runtime fleet validation; fixture-provided placement is not that proof |
+| Offline restart, crash-stage resource cleanup and fresh re-observation | Pending; never restore serialized bank/device authority |
+| DSR sockets, workload replacement, mixed replicas and remote Required ciphertext | Pending complete L4/L5 matrix |
+| Kernel admission/status/explanation | Candidate status still explicitly separates placement from admission/delivery; finish consuming status integration |
+| Q lifecycle and S1–S5 resource/load stability | Open; retain warnings/loss and measure actual supported envelopes |
 
 ADR 0347 adds the locally verified nonce-bound controller/wire distribution
 boundary. Current-Pod/Node authentication, guarded placement coordinates,

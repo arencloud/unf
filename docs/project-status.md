@@ -993,6 +993,11 @@ ADR 0438 passes all seven actual-main/reverse-Service checks on cl02 then
 identical `b87d050` Kind. Live state is unchanged and all current/retained
 regular/init logs are reviewed. Actual publisher/main-hook sockets follow;
 Phase 9 and stabilization remain open.
+ADR 0439 passes the actual publisher/main-hook socket gate on cl02 then identical
+`807a130` Kind: sixteen positive exchanges and twenty denials per platform,
+including translated Services, policy, writer withdrawal and journal retirement.
+Exact cleanup, preserved journals and complete log review pass. Restart and
+full authenticated fleet/mixed-replica qualification remain open, as does Phase 9.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
