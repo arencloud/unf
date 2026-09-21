@@ -1,0 +1,14 @@
+[
+  {"op":"test","path":"/metadata/namespace","value":"unf-system"},
+  {"op":"test","path":"/metadata/name","value":"unf-agent"},
+  {"op":"test","path":"/spec/updateStrategy/type","value":"OnDelete"},
+  {"op":"test","path":"/spec/template/spec/containers/0/name","value":"agent"},
+  {"op":"test","path":"/spec/template/spec/containers/0/securityContext/privileged","value":false},
+  {"op":"test","path":"/spec/template/spec/containers/0/securityContext/allowPrivilegeEscalation","value":false},
+  {"op":"test","path":"/spec/template/spec/containers/0/securityContext/readOnlyRootFilesystem","value":true},
+  {"op":"test","path":"/spec/template/spec/containers/0/securityContext/seLinuxOptions/type","value":"spc_t"},
+  {"op":"test","path":"/spec/template/spec/containers/0/securityContext/seccompProfile/type","value":"RuntimeDefault"},
+  {"op":"test","path":"/spec/template/spec/containers/0/securityContext/capabilities/drop","value":["ALL"]},
+  {"op":"test","path":"/spec/template/spec/containers/0/securityContext/capabilities/add","value":["BPF","NET_ADMIN","PERFMON"]},
+  {"op":"add","path":"/spec/template/spec/containers/0/securityContext/capabilities/add/-","value":"SYS_ADMIN"}
+]

@@ -1034,6 +1034,12 @@ ADR 0447 publishes immutable `762c980` controller/agent development candidates
 with exact diagnostic-qualified main/bank ELF bytes. Public digest/label and
 binary hashes are checked; no runtime is deployed. The privilege decision,
 isolated shutdown/version gate and full fleet/recovery validation remain pending.
+ADR 0448 records the operator's explicit selection of the cl02 lab SYS_ADMIN
+option, resolving the permission decision. Guarded opt-in patches and an exact
+non-privileged diagnostic profile pass local checks and server-side patch
+dry-runs. Exact-profile kernel/socket qualification and production-SCC Pod
+admission must pass before staged rollout; no live capability/image change has
+occurred. Phase 9, full process recovery and stabilization remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

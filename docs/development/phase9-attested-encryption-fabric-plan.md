@@ -371,6 +371,11 @@ privileged diagnostic success alone cannot close this deployment boundary.
 ADR 0446 qualifies private bank-loader pin reclamation after success/error/panic/
 SIGKILL on cl02 then identical Kind, plus the full 24-positive/24-negative socket
 matrix. Restricted-runtime deployment and complete agent restart remain open.
+ADR 0448 resolves the privilege selection: the operator explicitly approves
+SYS_ADMIN for the non-privileged cl02 lab agent, preserving default seccomp,
+NoNewPrivs and enforcing SELinux. Local profile checks and patch dry-runs pass;
+exact-profile kernel/socket gates and production-SCC admission precede rollout.
+Neither live fleet has changed, and this is not Phase 9 closure.
 
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate

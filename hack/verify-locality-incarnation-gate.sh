@@ -12,6 +12,11 @@ umask 077
 image=$UNF_LOCALITY_GATE_IMAGE
 directory=$UNF_LOCALITY_GATE_DIAGNOSTICS
 suite=${UNF_LOCALITY_GATE_SUITE:-incarnation}
+security_profile=${UNF_LOCALITY_GATE_SECURITY_PROFILE:-privileged}
+[[ $security_profile == privileged || $security_profile == cl02-sys-admin-lab ]]
+if [[ $security_profile == cl02-sys-admin-lab ]]; then
+    [[ $UNF_LOCALITY_GATE_PLATFORM == cl02 && ( $suite == kernel-main-bridge || $suite == kernel-main-composition ) ]]
+fi
 memory_limit=256Mi
 cpu_limit=1
 deadline_seconds=180
@@ -109,6 +114,10 @@ cleanup() {
     if [[ $result == 0 ]]; then
         rg -q "$marker" "$directory/test.log" || result=1
     fi
+    if [[ $security_profile == cl02-sys-admin-lab ]]; then
+        jq -e -L hack 'include "locality-lab-profile"; (.items|length)==1 and all(.items[];locality_lab_pod_valid)' "$directory/pods-after.json" >/dev/null || result=1
+        rg -q 'locality-lab-profile: PASS effective=c000201000 no-new-privs=true seccomp=filter selinux=spc_t,enforcing$' "$directory/test.log" || result=1
+    fi
     if [[ $suite == kernel-main-bridge ]]; then
         [[ $(rg -c 'main-locality-check: name=.* passed=true$' "$directory/test.log") == 7 ]] || result=1
         [[ $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 7 ]] || result=1
@@ -146,8 +155,8 @@ cleanup() {
         rg -q 'observed-locality-mixed-mtu: PASS source=1400 target=1450 uniform-mismatch-rejected=true$' "$directory/test.log" || result=1
         rg -q 'kernel-locality-agent-startup: PASS actual-agent=true early-owner=true real-journal-floor=5 armed-reopen-withdrawn=true partial-rejected=true missing-same-boot-rejected=true client-error-supervised=true bytes-preserved=true packet-attachment=false cleanup=true$' "$directory/test.log" || result=1
     fi
-    jq -n --argjson code "$result" --argjson removed "$removed" --argjson delivery "$delivery" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" --arg source "${UNF_LOCALITY_GATE_SOURCE_REVISION:-}" \
-        '{schemaVersion:2,result:(if $code==0 then "passed" else "failed" end),platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:$removed,packetDeliveryTested:$delivery}
+    jq -n --arg profile "$security_profile" --argjson code "$result" --argjson removed "$removed" --argjson delivery "$delivery" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" --arg source "${UNF_LOCALITY_GATE_SOURCE_REVISION:-}" \
+        '{schemaVersion:2,result:(if $code==0 then "passed" else "failed" end),securityProfile:$profile,platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:$removed,packetDeliveryTested:$delivery}
           + (if $suite=="kernel-main-bridge" or $suite=="kernel-main-composition" then {expectedCompiledSourceRevision:$source} else {} end)' > "$directory/evidence.json"
     printf 'Incarnation gate result=%s evidence=%s\n' "$result" "$directory"
     exit "$result"
@@ -163,6 +172,11 @@ jq -n --arg ns "$namespace" --arg node "$UNF_LOCALITY_GATE_NODE" --arg image "$i
 if [[ $suite == kernel-main-bridge || $suite == kernel-main-composition ]]; then
     jq --arg source "$UNF_LOCALITY_GATE_SOURCE_REVISION" '.spec.containers[0].env += [{name:"UNF_EXPECT_BUILD_REVISION",value:$source}]' "$directory/pod.json" > "$directory/pod-source.json"
     mv "$directory/pod-source.json" "$directory/pod.json"
+fi
+if [[ $security_profile == cl02-sys-admin-lab ]]; then
+    jq -L hack --rawfile check hack/locality-lab-profile-check.sh 'include "locality-lab-profile"; locality_lab_pod($check)' "$directory/pod.json" > "$directory/pod-profile.json"
+    jq -e -L hack 'include "locality-lab-profile"; locality_lab_pod_valid' "$directory/pod-profile.json" >/dev/null
+    mv "$directory/pod-profile.json" "$directory/pod.json"
 fi
 "${kc[@]}" create -f "$directory/pod.json" >/dev/null
 finished=false

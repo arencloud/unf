@@ -1,0 +1,5 @@
+[
+  {"op":"test","path":"/metadata/name","value":"unf-primary-agent"},
+  {"op":"test","path":"/allowedCapabilities","value":["BPF","NET_ADMIN","PERFMON"]},
+  {"op":"add","path":"/allowedCapabilities/-","value":"SYS_ADMIN"}
+]
