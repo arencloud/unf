@@ -1,6 +1,6 @@
 //! Early runtime ownership. No serialized checkpoint is packet permission.
 use std::fs::{self, DirBuilder};
-use std::io;
+use std::io::{self, Read as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
@@ -19,6 +19,13 @@ use super::{AgentState, Args, load_secure_json, persist_secure_json};
 pub(super) struct LocalityRuntime {
     pub(super) admission: LocalityAdmission,
     gate: OnceLock<IncarnationGate>,
+    preparation_root: PathBuf,
+    resources: OnceLock<BankResources>,
+}
+
+pub(super) struct BankResources {
+    pub(super) elf: Vec<u8>,
+    pub(super) pin_root: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -215,6 +222,8 @@ pub(super) fn initialize(args: &Args, state: &AgentState, dataplane: bool) -> Re
         .set(LocalityRuntime {
             admission: LocalityAdmission::new(runtime)?,
             gate: OnceLock::new(),
+            preparation_root: pin_parent.join("preparations"),
+            resources: OnceLock::new(),
         })
         .map_err(|_| anyhow::anyhow!("locality startup initialized twice"))?;
     tracing::info!(
@@ -225,6 +234,50 @@ pub(super) fn initialize(args: &Args, state: &AgentState, dataplane: bool) -> Re
 }
 
 impl LocalityRuntime {
+    pub(super) fn initialize_bank(&self, main_object: &Path) -> Result<()> {
+        let path = main_object.with_file_name("unf-ebpf-locality");
+        let fd = rustix::fs::open(
+            &path,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?;
+        let file = fs::File::from(fd);
+        let metadata = file.metadata()?;
+        ensure!(
+            metadata.is_file()
+                && metadata.uid() == 0
+                && metadata.permissions().mode() & 0o022 == 0
+                && (1..=4 * 1024 * 1024).contains(&metadata.len()),
+            "unsafe or oversized packaged locality consumer"
+        );
+        let mut elf = Vec::new();
+        file.take(4 * 1024 * 1024 + 1).read_to_end(&mut elf)?;
+        ensure!(
+            elf.len() as u64 == metadata.len() && elf.len() <= 4 * 1024 * 1024,
+            "locality ELF size changed"
+        );
+        managed_directory(&self.preparation_root)?;
+        self.resources
+            .set(BankResources {
+                elf,
+                pin_root: self.preparation_root.clone(),
+            })
+            .map_err(|_| anyhow::anyhow!("locality bank resources initialized twice"))?;
+        Ok(())
+    }
+
+    pub(super) fn resources(&self) -> Result<&BankResources> {
+        self.resources
+            .get()
+            .context("packaged locality resources unavailable")
+    }
+
+    pub(super) fn gate(&self) -> Result<&IncarnationGate> {
+        self.gate
+            .get()
+            .context("real CNI incarnation gate unavailable")
+    }
+
     pub(super) fn install_journal(&self, journal: &mut AttachmentJournal) -> Result<()> {
         ensure!(
             self.gate.get().is_none(),

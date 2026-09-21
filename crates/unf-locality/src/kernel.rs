@@ -38,6 +38,18 @@ impl KernelLocalityBank {
         self.leased.leases().len()
     }
 
+    pub(crate) fn is_selected(
+        &self,
+        runtime: &LocalityRuntimeMaps,
+        context: &EncryptionLocalityContext,
+    ) -> Result<bool> {
+        ensure!(
+            Arc::ptr_eq(&self.runtime, &runtime.maps),
+            "foreign locality runtime"
+        );
+        runtime.is_selected(self.program_id()?, context)
+    }
+
     /// Atomically replace the one locality dispatch entry. The caller MUST hold
     /// its real journal transaction lock and applied-state publication lock
     /// through this call, supplying freshly read applied context. Startup must

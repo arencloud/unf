@@ -181,6 +181,30 @@ impl LocalityObservationWorker {
         evidence: VerifiedEncryptionLocality,
         expected: EncryptionLocalityContext,
     ) -> Result<Option<LocalityObservationTask>, LocalityBankError> {
+        self.try_observe_with_provider(Some(provider), records, evidence, expected)
+    }
+
+    /// Observe native journal records using each record's actual managed MTU,
+    /// sharing the same bounded worker and one streaming host-table scan.
+    ///
+    /// # Errors
+    /// Applies the same input/worker bounds as `try_observe`.
+    pub fn try_observe_journal(
+        &self,
+        records: Vec<AttachmentRecord>,
+        evidence: VerifiedEncryptionLocality,
+        expected: EncryptionLocalityContext,
+    ) -> Result<Option<LocalityObservationTask>, LocalityBankError> {
+        self.try_observe_with_provider(None, records, evidence, expected)
+    }
+
+    fn try_observe_with_provider(
+        &self,
+        provider: Option<NativeRoutingProvider>,
+        records: Vec<AttachmentRecord>,
+        evidence: VerifiedEncryptionLocality,
+        expected: EncryptionLocalityContext,
+    ) -> Result<Option<LocalityObservationTask>, LocalityBankError> {
         validate_input(&records, &evidence, &expected)?;
         let (cancellation, cancelled) = oneshot::channel();
         let task = self.try_spawn(move || {
@@ -191,7 +215,10 @@ impl LocalityObservationWorker {
                 .map_err(LocalityBankError::Runtime)?;
             let result = runtime.block_on(async {
                 let observe = tokio::time::timeout(OBSERVATION_DEADLINE, async {
-                    let observations = provider.observe_bound_attachments(&records).await?;
+                    let observations = match provider {
+                        Some(provider) => provider.observe_bound_attachments(&records).await?,
+                        None => NativeRoutingProvider::observe_journal_attachments(&records).await?,
+                    };
                     ObservedLocalityBank::join(&evidence, &expected, observations)
                 });
                 tokio::select! {

@@ -90,7 +90,7 @@ cleanup() {
         else result=1; fi
     fi
     if [[ $suite == kernel-admission || $suite == kernel-journal-floor || $suite == kernel-runtime-owner || $suite == kernel-agent-startup ]]; then
-        rg -q 'kernel-locality-admission: PASS decisions=8 pending-writer-denied=true cancelled-writer-denied=true rollback-not-rearmed=true production-integration=false$' "$directory/test.log" || result=1
+        rg -q 'kernel-locality-admission: PASS decisions=8 pending-writer-denied=true cancelled-writer-denied=true rollback-not-rearmed=true selected-readback=true production-integration=false$' "$directory/test.log" || result=1
         [[ $(rg -c 'kernel-locality-check: name=coordinator-' "$directory/test.log") == 8 ]] || result=1
     fi
     if [[ $suite == kernel-journal-floor || $suite == kernel-runtime-owner || $suite == kernel-agent-startup ]]; then
@@ -100,6 +100,7 @@ cleanup() {
         rg -q 'kernel-locality-runtime-owner: PASS atomic-create=true exclusive-owner=true reopen-withdrawn=true exact-bindings=true partial-rejected=true foreign-preserved=true cleanup=true$' "$directory/test.log" || result=1
     fi
     if [[ $suite == kernel-agent-startup ]]; then
+        rg -q 'observed-locality-mixed-mtu: PASS source=1400 target=1450 uniform-mismatch-rejected=true$' "$directory/test.log" || result=1
         rg -q 'kernel-locality-agent-startup: PASS actual-agent=true early-owner=true real-journal-floor=5 armed-reopen-withdrawn=true partial-rejected=true missing-same-boot-rejected=true client-error-supervised=true bytes-preserved=true packet-attachment=false cleanup=true$' "$directory/test.log" || result=1
     fi
     jq -n --argjson code "$result" --argjson removed "$removed" --argjson delivery "$delivery" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" \

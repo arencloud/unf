@@ -15,14 +15,14 @@ const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
 type SelectedAttachment = (AttachmentRecord, [Option<IdentityId>; 2]);
 
 pub(super) struct CniAttachmentInventory {
-    journal: Arc<Mutex<AttachmentJournal>>,
+    pub(super) journal: Arc<Mutex<AttachmentJournal>>,
 }
 
 pub(super) struct InventorySelection {
-    cut: AttachmentJournalCut,
-    context: EncryptionLocalityContext,
-    locality_digest: EncryptionLocalityDigest,
-    records: Vec<SelectedAttachment>,
+    pub(super) cut: AttachmentJournalCut,
+    pub(super) context: EncryptionLocalityContext,
+    pub(super) locality_digest: EncryptionLocalityDigest,
+    pub(super) records: Vec<SelectedAttachment>,
     addresses: usize,
     retained_bytes: usize,
 }

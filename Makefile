@@ -1057,6 +1057,7 @@ cli:
 artifacts: ebpf
 	mkdir -p .artifacts
 	cp ebpf/unf-ebpf-tc/target/bpfel-unknown-none/release/unf-ebpf-tc .artifacts/unf-ebpf-tc
+	cp ebpf/unf-ebpf-tc/target/bpfel-unknown-none/release/unf-ebpf-locality .artifacts/unf-locality-bank
 
 images: artifacts
 	podman build --build-arg UNF_SOURCE_REVISION=$(UNF_BUILD_REVISION) --build-arg UNF_PACKAGE=unf-controller --tag localhost/unf-controller:dev --file images/Containerfile .

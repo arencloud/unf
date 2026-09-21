@@ -149,6 +149,11 @@ ADR 0428 passes the repaired actual-agent startup gate on cl02 then identical
 `4a027ea` Kind, including supervised missing-trust failure and every prior kernel/
 socket gate. Production state is preserved and logs reviewed. It does not qualify
 newer writer code `c7aece1`; actual bank production and packet wiring are next.
+ADR 0429 implements the actual journal-bound bank producer with original-cut
+handoffs, retained single-worker capacity, real dispatch/fence reuse checks and
+per-attachment MTUs. Expanded cl02-before-Kind diagnostics and full runtime
+qualification remain pending. Policy-first packet wiring, pure-local demand,
+restart continuity and L3/L4/L5/Q remain open; live fleets stay `45d85d5`.
 
 ## Safety and efficiency boundary
 

@@ -248,6 +248,26 @@ impl LocalityApplyGuard {
 }
 
 impl LocalityAdmission {
+    /// Observe actual dispatch/fence identity after confirming settled inputs.
+    /// A writer can withdraw then reapply identical coordinates; cached context
+    /// equality alone does not prove this bank is still selected.
+    ///
+    /// # Errors
+    /// Reports a fatal fence, foreign bank or failed kernel readback. This does
+    /// not validate a journal cut or claim packet delivery; caller does those.
+    pub fn is_published(
+        &self,
+        bank: &KernelLocalityBank,
+        context: &EncryptionLocalityContext,
+    ) -> Result<bool> {
+        let state = lock(&self.state)?;
+        state.health()?;
+        if state.check(context).is_err() {
+            return Ok(false);
+        }
+        bank.is_selected(&state.runtime, context)
+    }
+
     /// Read-only fatal health check for runtime supervision. Unknown, failed or
     /// pending inputs with a successfully withdrawn fence are not fatal.
     ///

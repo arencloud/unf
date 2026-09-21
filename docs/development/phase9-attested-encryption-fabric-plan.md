@@ -60,6 +60,10 @@ or any L3/L4/L5/Q platform gate.
 ADR 0428 qualifies repaired actual startup on cl02 then matching `4a027ea` Kind,
 preserving journals and reviewing logs. The newer applied writers and subsequent
 bank/packet composition still require real runtime qualification.
+ADR 0429 adds the real journal-bound bank producer and packaged consumer, with
+original-cut checks, same-coordinate withdrawal detection and mixed-MTU
+observation. Local checks and isolated diagnostics are not production packet
+qualification. Packet/reply composition and L3/L4/L5/Q remain open.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

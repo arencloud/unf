@@ -37,6 +37,26 @@ impl NativeRoutingProvider {
         &self,
         attachments: &[AttachmentRecord],
     ) -> Result<Vec<NativeAttachmentObservation>, RouteError> {
+        Self::observe_batch(attachments, Some(*self)).await
+    }
+
+    /// Observe actual native CNI journal records with their individual MTUs.
+    /// The exact link MTU and complete route plan are still checked per record;
+    /// mixed MTUs do not require repeated full host-table scans.
+    ///
+    /// # Errors
+    /// Enforces the same bounds, UID/nonce, ownership and readback checks as
+    /// `observe_bound_attachments`. Call only with real managed journal records.
+    pub async fn observe_journal_attachments(
+        attachments: &[AttachmentRecord],
+    ) -> Result<Vec<NativeAttachmentObservation>, RouteError> {
+        Self::observe_batch(attachments, None).await
+    }
+
+    async fn observe_batch(
+        attachments: &[AttachmentRecord],
+        configured: Option<Self>,
+    ) -> Result<Vec<NativeAttachmentObservation>, RouteError> {
         if attachments.len() > 65_536 {
             return Err(RouteError::Readback(
                 "attachment observation count exceeds budget".into(),
@@ -70,7 +90,8 @@ impl NativeRoutingProvider {
                 ));
             }
             host_identity = Some(identity);
-            let plan = self.plan(record, links.readback())?;
+            let provider = configured.unwrap_or_else(|| Self::new(record.spec.mtu));
+            let plan = provider.plan(record, links.readback())?;
             staged.push((record.clone(), plan, links));
         }
         if let Some((_, _, links)) = staged.first() {

@@ -33,6 +33,7 @@ async fn create(
     provider: NativeRoutingProvider,
     name: &str,
     namespace: &str,
+    mtu: u32,
 ) -> NativeRoutePlan {
     let spec = AttachmentSpec {
         key: AttachmentKey {
@@ -41,7 +42,7 @@ async fn create(
             ifname: "eth0".into(),
         },
         netns: namespace.into(),
-        mtu: 1400,
+        mtu,
         workload_uid: Some(name.into()),
     };
     journal
@@ -126,18 +127,13 @@ fn cookie(hex: &str) -> u64 {
 }
 
 async fn prepare(
-    provider: NativeRoutingProvider,
+    _provider: NativeRoutingProvider,
     records: &[AttachmentRecord],
     evidence: &VerifiedEncryptionLocality,
     context: &EncryptionLocalityContext,
 ) -> ObservedLocalityBank {
     LocalityObservationWorker::default()
-        .try_observe(
-            provider,
-            records.to_vec(),
-            evidence.clone(),
-            context.clone(),
-        )
+        .try_observe_journal(records.to_vec(), evidence.clone(), context.clone())
         .unwrap()
         .unwrap()
         .finish()
@@ -193,9 +189,34 @@ async fn main() {
     )
     .unwrap();
     let provider = NativeRoutingProvider::new(1400);
-    let first_plan = create(&mut journal, provider, "first", &args[0]).await;
-    let second_plan = create(&mut journal, provider, "second", &args[1]).await;
+    let first_plan = create(&mut journal, provider, "first", &args[0], 1400).await;
+    let second_plan = create(
+        &mut journal,
+        NativeRoutingProvider::new(1450),
+        "second",
+        &args[1],
+        1450,
+    )
+    .await;
     let records = journal.records();
+    assert!(
+        provider.observe_bound_attachments(&records).await.is_err(),
+        "uniform provider accepted a different actual managed MTU"
+    );
+    let mixed = NativeRoutingProvider::observe_journal_attachments(&records)
+        .await
+        .unwrap();
+    assert_eq!(
+        mixed
+            .iter()
+            .map(|row| row.attachment().spec.mtu)
+            .collect::<Vec<_>>(),
+        vec![1400, 1450]
+    );
+    drop(mixed);
+    println!(
+        "observed-locality-mixed-mtu: PASS source=1400 target=1450 uniform-mismatch-rejected=true"
+    );
     let (evidence, context) = evidence(&records);
     if std::env::var("UNF_LOCALITY_RUNTIME_OWNER_TEST").as_deref() == Ok("yes") {
         runtime_owner::verify(

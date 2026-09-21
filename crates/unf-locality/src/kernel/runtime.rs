@@ -165,6 +165,27 @@ impl LocalityRuntimeMaps {
         }
         Ok(id)
     }
+
+    pub(super) fn is_selected(&self, id: u32, context: &EncryptionLocalityContext) -> Result<bool> {
+        let fence: Array<_, Value<PlacementFence>> =
+            Array::try_from(Map::Array(duplicate(&self.maps.fence)?))?;
+        let expected = PlacementFence {
+            identity_epoch: context.identity_epoch,
+            identity_revision: context.identity_revision.get(),
+            routing_revision: context.routing_revision.get(),
+            schema_version: ABI_VERSION,
+            reserved: [0; 6],
+        };
+        if id == 0 || fence.get(&0, 0)?.0 != expected {
+            return Ok(false);
+        }
+        let dispatch: Array<_, u32> = Array::try_from(Map::Array(duplicate(&self.maps.dispatch)?))?;
+        match dispatch.get(&0, 0) {
+            Ok(actual) => Ok(actual == id),
+            Err(aya::maps::MapError::KeyNotFound) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 pub(super) fn duplicate(map: &MapData) -> Result<MapData> {

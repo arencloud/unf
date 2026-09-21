@@ -953,6 +953,11 @@ ADR 0428 passes the repaired complete real-startup gate on cl02 then matching
 `4a027ea` Kind. Expected startup failures, all prior packet checks, exact cleanup
 and full log/state review pass. Newer writer code is not in that diagnostic;
 actual bank/packet integration and L3/L4/L5/Q remain open.
+ADR 0429 implements actual bank production from the real journal with original
+cut fencing, bounded worker lifetime and actual kernel selection checks. Mixed
+MTUs retain one host-table scan. The expanded diagnostics must pass cl02 before
+Kind; actual runtime/packet qualification, pure-local demand, restart continuity
+and L3/L4/L5/Q remain pending. No live runtime or release pin is changed.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

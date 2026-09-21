@@ -19,6 +19,7 @@ pub(super) struct PlacementCache {
     pending: Option<PendingPlacement>,
     work_slot: std::sync::Arc<tokio::sync::Semaphore>,
     attachments: Option<super::cni_inventory::InventorySelection>,
+    publisher: super::locality_publisher::BankPublisher,
 }
 
 struct PendingPlacement {
@@ -40,15 +41,18 @@ impl Default for PlacementCache {
             pending: None,
             work_slot: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
             attachments: None,
+            publisher: super::locality_publisher::BankPublisher::default(),
         }
     }
 }
 
 impl PlacementCache {
-    pub(super) fn clear(&mut self) {
+    pub(super) fn clear(&mut self) -> Result<()> {
+        self.publisher.clear()?;
         self.candidate = None;
         self.pending = None;
         self.attachments = None;
+        Ok(())
     }
 
     fn matches(&self, plan: &AdmittedNodeLocalPlan, context: &EncryptionLocalityContext) -> bool {
@@ -170,7 +174,7 @@ fn status_for(state: &AgentState) -> PlacementStatus {
     }
 }
 
-fn applied_context(
+pub(super) fn applied_context(
     plan: &AdmittedNodeLocalPlan,
     cluster_id: &str,
     state: &AgentState,
@@ -215,8 +219,23 @@ pub(super) async fn synchronize(
     keys: &EncryptionKeySynchronizer,
     state: &AgentState,
 ) -> Result<()> {
+    let result = synchronize_inner(plans, keys, state).await;
+    if let Err(error) = result {
+        plans.locality.clear().context(format!(
+            "locality failed ({error:#}); withdrawal also failed"
+        ))?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn synchronize_inner(
+    plans: &mut EncryptionPlanSynchronizer,
+    keys: &EncryptionKeySynchronizer,
+    state: &AgentState,
+) -> Result<()> {
     let Some(plan) = plans.current.as_ref() else {
-        plans.locality.clear();
+        plans.locality.clear()?;
         return Ok(());
     };
     let Some(authority) = keys
@@ -224,17 +243,17 @@ pub(super) async fn synchronize(
         .as_ref()
         .map(unf_encryption::DurableNodeKeyAuthority::authority)
     else {
-        plans.locality.clear();
+        plans.locality.clear()?;
         return Ok(());
     };
     if authority.node_uid() != plan.snapshot.recipient.node_uid
         || authority.node_name() != state.node_name
     {
-        plans.locality.clear();
+        plans.locality.clear()?;
         bail!("locality bootstrap recipient differs from current plan");
     }
     let Some(context) = applied_context(plan, authority.cluster_id(), state) else {
-        plans.locality.clear();
+        plans.locality.clear()?;
         return Ok(());
     };
     if plans.locality.matches(plan, &context) {
@@ -243,7 +262,7 @@ pub(super) async fn synchronize(
     }
     if let Some(pending) = &plans.locality.pending {
         if pending.context != context || pending.plan_digest != plan.admitted_digest {
-            plans.locality.clear();
+            plans.locality.clear()?;
         } else if !pending.task.is_finished() {
             return Ok(());
         } else {
@@ -272,7 +291,7 @@ pub(super) async fn synchronize(
     }
     // No last-known-good locality candidate survives a failed replacement. The
     // ordinary Required transport remains authoritative, entirely unchanged.
-    plans.locality.clear();
+    plans.locality.clear()?;
     // A cancelled blocking replay retains this permit until it really exits.
     // Churn cannot build an unbounded queue of detached CPU jobs.
     let Ok(work_slot) = plans.locality.work_slot.clone().try_acquire_owned() else {
@@ -327,10 +346,12 @@ async fn refresh_attachments(
     context: &EncryptionLocalityContext,
 ) -> Result<()> {
     let Some(inventory) = state.cni_inventory.get() else {
+        cache.publisher.clear()?;
         cache.attachments = None;
         return Ok(());
     };
     let Some((_, evidence)) = &cache.candidate else {
+        cache.publisher.clear()?;
         cache.attachments = None;
         return Ok(());
     };
@@ -340,6 +361,12 @@ async fn refresh_attachments(
     if applied_context(plan, &context.cluster_id, state).as_ref() != Some(context) {
         cache.attachments = None;
         bail!("applied locality cut changed during journal selection");
+    }
+    if let Some(selection) = &cache.attachments {
+        cache
+            .publisher
+            .synchronize(state, plan, evidence, selection)
+            .await?;
     }
     Ok(())
 }

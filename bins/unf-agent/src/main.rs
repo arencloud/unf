@@ -1,5 +1,6 @@
 mod cni_inventory;
 mod encryption_locality;
+mod locality_publisher;
 mod locality_runtime;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -7374,6 +7375,11 @@ async fn run_dataplane(
     // Compatibility is checked before this call because opening the persistent
     // map set may create pins or adopt existing kernel state.
     let (mut ebpf, pins_existed, encryption_pins_existed) = load_persistent_ebpf(&config, &state)?;
+    state
+        .locality_runtime
+        .get()
+        .context("early locality runtime absent")?
+        .initialize_bank(&config.object)?;
     let flow_ring = RingBuf::try_from(
         ebpf.take_map("FLOW_EVENTS")
             .context("eBPF object does not contain FLOW_EVENTS ring buffer")?,
@@ -16881,7 +16887,7 @@ async fn consume_events(
                         }
                     }
                     Err(error) => {
-                        encryption_plans.locality.clear();
+                        encryption_plans.locality.clear()?;
                         encryption_locality::record_observation(&encryption_plans.locality, state, true);
                         warn!(%error, "encryption plan synchronization failed; retaining exact durable predecessor");
                     }

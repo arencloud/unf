@@ -15,6 +15,7 @@ if ! git -C "${project_root}" diff --quiet --ignore-submodules HEAD -- \
     exit 2
 fi
 [[ -s ${project_root}/.artifacts/unf-ebpf-tc ]]
+[[ -s ${project_root}/.artifacts/unf-locality-bank ]]
 
 revision=$(git -C "${project_root}" rev-parse --verify HEAD^{commit})
 temporary_root=$(mktemp -d)
@@ -27,6 +28,7 @@ git -C "${project_root}" archive --format=tar "${revision}" \
     | tar -xf - -C "${temporary_root}"
 mkdir -p "${temporary_root}/.artifacts"
 cp "${project_root}/.artifacts/unf-ebpf-tc" "${temporary_root}/.artifacts/unf-ebpf-tc"
+cp "${project_root}/.artifacts/unf-locality-bank" "${temporary_root}/.artifacts/unf-locality-bank"
 
 state_source=${temporary_root}/crates/unf-state/src/lib.rs
 current_abi=$(sed -nE \

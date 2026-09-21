@@ -151,7 +151,7 @@ fn placement_cache_is_cut_and_plan_bound_and_explicitly_clearable() {
     let mut changed = context.clone();
     changed.routing_revision = changed.routing_revision.next();
     assert!(!cache.matches(&plan, &changed));
-    cache.clear();
+    cache.clear().unwrap();
     assert!(!cache.matches(&plan, &context));
 }
 
@@ -226,7 +226,7 @@ async fn journal_selection_counts_remain_observational_and_clear_with_candidate(
     assert!(cache.attachments.is_none());
     record_observation(&cache, &state, true);
     assert_eq!(status_for(&state).observation.journal_selected_addresses, 0);
-    cache.clear();
+    cache.clear().unwrap();
     assert!(cache.attachments.is_none());
     record_observation(&cache, &state, false);
     let report = status_for(&state);
@@ -335,7 +335,7 @@ async fn cancelled_replay_keeps_the_single_worker_slot_until_real_completion() {
         status_for(&observed_state).observation.phase,
         PlacementPhase::Fetching
     );
-    cache.clear();
+    cache.clear().unwrap();
     assert!(cache.pending.is_none());
     assert!(cache.work_slot.clone().try_acquire_owned().is_err());
     release_tx.send(()).unwrap();

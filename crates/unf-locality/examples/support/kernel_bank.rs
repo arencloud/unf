@@ -446,9 +446,17 @@ async fn verify_admission(
     let wire4 = packet(v4);
     let wire6 = packet(v6);
     probe(object, "coordinator-startup-withdrawn", v4, &wire4, 2)?;
+    ensure!(
+        !admission.is_published(bank, context)?,
+        "startup reported selected bank"
+    );
     let identity = admission.begin(Identity)?;
     let routing = admission.begin(Routing)?;
     identity.complete(context.identity_epoch, context.identity_revision)?;
+    ensure!(
+        !admission.is_published(bank, context)?,
+        "pending writer reported selected bank"
+    );
     ensure!(
         admission.publish(bank, journal, gate, context).is_err(),
         "pending route writer admitted"
@@ -467,12 +475,24 @@ async fn verify_admission(
     let routing = admission.begin(Routing)?;
     route.readback().await?;
     routing.complete(context.identity_epoch, context.routing_revision)?;
+    ensure!(
+        !admission.is_published(bank, context)?,
+        "same coordinates silently rearmed bank"
+    );
     admission.publish(bank, journal, gate, context)?;
+    ensure!(
+        admission.is_published(bank, context)?,
+        "published bank not selected"
+    );
     probe(object, "coordinator-recovered-v4", v4, &wire4, 7)?;
     probe(object, "coordinator-recovered-v6", v6, &wire6, 7)?;
     let identity = admission.begin(Identity)?;
     let routing = admission.begin(Routing)?;
     drop(identity);
+    ensure!(
+        !admission.is_published(bank, context)?,
+        "cancelled writer reported selected bank"
+    );
     routing.complete(context.identity_epoch, context.routing_revision)?;
     ensure!(
         admission.publish(bank, journal, gate, context).is_err(),
@@ -482,11 +502,19 @@ async fn verify_admission(
     admission
         .begin(Identity)?
         .complete(context.identity_epoch, context.identity_revision)?;
+    ensure!(
+        !admission.is_published(bank, context)?,
+        "identical writer completion restored selection"
+    );
     admission.publish(bank, journal, gate, context)?;
+    ensure!(
+        admission.is_published(bank, context)?,
+        "explicit republish not selected"
+    );
     probe(object, "coordinator-settled-v4", v4, &wire4, 7)?;
     probe(object, "coordinator-settled-v6", v6, &wire6, 7)?;
     println!(
-        "kernel-locality-admission: PASS decisions=8 pending-writer-denied=true cancelled-writer-denied=true rollback-not-rearmed=true production-integration=false"
+        "kernel-locality-admission: PASS decisions=8 pending-writer-denied=true cancelled-writer-denied=true rollback-not-rearmed=true selected-readback=true production-integration=false"
     );
     Ok(admission)
 }
