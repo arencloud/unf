@@ -55,3 +55,11 @@ def locality_inventory_absent_valid:
   .observation.journalSelectedAttachments == 0
   and .observation.journalSelectedAddresses == 0
   and .observation.journalSelectedPayloadBytes == 0;
+
+# New runtime retains placement independent of remote Required transport demand.
+# A Native baseline/cleanup still requires a fresh exact placement cut. It may
+# have no bound attachments, but cannot accept malformed/partial counters.
+def locality_all_plan_inventory_valid($minimum_addresses):
+  .acquisition == "allAdmittedPlans"
+  and (locality_inventory_valid($minimum_addresses)
+       or ($minimum_addresses == 0 and locality_inventory_absent_valid));

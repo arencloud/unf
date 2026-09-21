@@ -2,8 +2,8 @@ use super::*;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use unf_common::IdentityId;
 use unf_encryption::{
-    EncryptionGenerationRecipient, NodeLocalDecisionPlan, NodeLocalPlanMode, NodeLocalPlanSnapshot,
-    NodeLocalPlanSnapshotDigest,
+    EncryptionDisposition, EncryptionGenerationRecipient, NodeLocalDecisionPlan, NodeLocalPlanMode,
+    NodeLocalPlanSnapshot, NodeLocalPlanSnapshotDigest,
 };
 
 // This is a placement-coordinate fixture, not a valid cryptographic plan.
@@ -62,7 +62,7 @@ fn state() -> AgentState {
 }
 
 #[test]
-fn locality_fetch_requires_required_demand_and_matching_applied_epochs() {
+fn locality_fetch_supports_pure_local_demand_but_requires_matching_applied_epochs() {
     let mut plan = plan();
     let state = state();
     let context = applied_context(&plan, "cluster-a", &state).unwrap();
@@ -85,7 +85,13 @@ fn locality_fetch_requires_required_demand_and_matching_applied_epochs() {
         coordinate.store(old, Ordering::Release);
     }
     plan.snapshot.decisions[0].disposition = EncryptionDisposition::Native;
-    assert!(applied_context(&plan, "cluster-a", &state).is_none());
+    assert_eq!(
+        applied_context(&plan, "cluster-a", &state),
+        Some(context.clone())
+    );
+    let decisions = std::mem::take(&mut plan.snapshot.decisions);
+    assert_eq!(applied_context(&plan, "cluster-a", &state), Some(context));
+    plan.snapshot.decisions = decisions;
     plan.snapshot.decisions[0].disposition = EncryptionDisposition::Required;
     plan.controller_epoch += 1;
     assert!(applied_context(&plan, "cluster-a", &state).is_none());
@@ -105,7 +111,7 @@ fn stream_budget_accepts_exact_bound_and_rejects_before_append() {
 }
 
 #[test]
-fn placement_cache_is_cut_and_plan_bound_and_explicitly_clearable() {
+fn placement_cache_is_full_cut_bound_but_survives_unrelated_plan_churn() {
     let plan = plan();
     let context = applied_context(&plan, "cluster-a", &state()).unwrap();
     let request = EncryptionLocalityRequest::issue(context.clone()).unwrap();
@@ -132,7 +138,7 @@ fn placement_cache_is_cut_and_plan_bound_and_explicitly_clearable() {
         candidate: Some((plan.admitted_digest, verified)),
         ..PlacementCache::default()
     };
-    assert!(cache.matches(&plan, &context));
+    assert!(cache.matches(&context));
     let observed_state = state();
     record_observation(&cache, &observed_state, false);
     let report = status_for(&observed_state);
@@ -147,12 +153,19 @@ fn placement_cache_is_cut_and_plan_bound_and_explicitly_clearable() {
     assert_eq!(stale.observation.phase, PlacementPhase::Replayed);
     let mut changed = plan.clone();
     changed.admitted_digest.0[0] ^= 1;
-    assert!(!cache.matches(&changed, &context));
+    changed.snapshot.generation = changed.snapshot.generation.next();
+    changed.snapshot.policy_revision = changed.snapshot.policy_revision.next();
+    changed.snapshot.service_revision = changed.snapshot.service_revision.next();
+    changed.snapshot.egress_revision = changed.snapshot.egress_revision.next();
+    changed.snapshot.decisions.clear();
+    let unchanged = applied_context(&changed, "cluster-a", &state()).unwrap();
+    assert_eq!(unchanged, context);
+    assert!(cache.matches(&unchanged));
     let mut changed = context.clone();
     changed.routing_revision = changed.routing_revision.next();
-    assert!(!cache.matches(&plan, &changed));
+    assert!(!cache.matches(&changed));
     cache.clear().unwrap();
-    assert!(!cache.matches(&plan, &context));
+    assert!(!cache.matches(&context));
 }
 
 #[tokio::test]
@@ -162,6 +175,7 @@ async fn locality_status_is_observational_and_never_kernel_or_delivery_authority
     let wire = serde_json::to_value(report).unwrap();
     assert_eq!(wire["schemaVersion"], 1);
     assert_eq!(wire["scope"], "localityPlacementCandidate");
+    assert_eq!(wire["acquisition"], "allAdmittedPlans");
     assert_eq!(wire["observation"]["phase"], "absent");
     assert_eq!(wire["kernelAdmitted"], false);
     assert_eq!(wire["observedDelivery"], false);

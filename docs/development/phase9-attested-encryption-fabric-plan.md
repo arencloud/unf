@@ -64,6 +64,10 @@ ADR 0429 adds the real journal-bound bank producer and packaged consumer, with
 original-cut checks, same-coordinate withdrawal detection and mixed-MTU
 observation. Local checks and isolated diagnostics are not production packet
 qualification. Packet/reply composition and L3/L4/L5/Q remain open.
+ADR 0430 makes placement acquisition independent of remote Required decisions
+and preserves it across unrelated key/transport-plan churn, without relaxing
+the full applied cut or real journal/kernel fences. Packet/recovery validation
+and measured stabilization remain pending.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

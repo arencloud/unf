@@ -154,6 +154,11 @@ handoffs, retained single-worker capacity, real dispatch/fence reuse checks and
 per-attachment MTUs. Expanded cl02-before-Kind diagnostics and full runtime
 qualification remain pending. Policy-first packet wiring, pure-local demand,
 restart continuity and L3/L4/L5/Q remain open; live fleets stay `45d85d5`.
+ADR 0430 removes remote-Required-demand dependence and reuses exact placement
+across unrelated transport/key-plan churn. The new runtime's scoped reply gate
+must use `UNF_REQUIRED_REPLY_LOCALITY_ACQUISITION=all-plans`; Native placement
+convergence is distinct from fixture retirement. Actual packet/recovery
+qualification remains open, and this is not an S1 resource measurement.
 
 ## Safety and efficiency boundary
 

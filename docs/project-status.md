@@ -958,6 +958,10 @@ cut fencing, bounded worker lifetime and actual kernel selection checks. Mixed
 MTUs retain one host-table scan. The expanded diagnostics must pass cl02 before
 Kind; actual runtime/packet qualification, pure-local demand, restart continuity
 and L3/L4/L5/Q remain pending. No live runtime or release pin is changed.
+ADR 0430 supports pure-local demand by acquiring placement for all admitted
+plans, with full-cut reuse across unrelated transport/key churn. Native
+qualification now has an explicit all-plans observation mode; fixture retirement
+is checked separately. These code changes do not promote L3/L4/L5/Q or S1.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

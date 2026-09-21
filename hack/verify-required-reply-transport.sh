@@ -15,6 +15,8 @@ diagnostic_hold=${UNF_REQUIRED_REPLY_DIAGNOSTIC_HOLD_SECONDS:-0}
 require_cni_ownership=${UNF_REQUIRED_REPLY_REQUIRE_CNI_OWNERSHIP:-false}
 [[ $require_cni_ownership == true || $require_cni_ownership == false ]]
 require_locality_candidate=${UNF_REQUIRED_REPLY_REQUIRE_LOCALITY_CANDIDATE:-false}
+locality_acquisition=${UNF_REQUIRED_REPLY_LOCALITY_ACQUISITION:-required-only}
+[[ $locality_acquisition == required-only || $locality_acquisition == all-plans ]]
 [[ $require_locality_candidate == true || $require_locality_candidate == false ]]
 require_locality_inventory=${UNF_REQUIRED_REPLY_REQUIRE_LOCALITY_INVENTORY:-false}
 [[ $require_locality_inventory == true || $require_locality_inventory == false ]]
@@ -289,11 +291,13 @@ owned=false
 "${read_api[@]}" get namespaces -o json | jq -e --arg ns "$namespace" 'all(.items[];.metadata.name!=$ns)' >/dev/null
 required_reply_wait_generation native
 if [[ $require_locality_candidate == true ]]; then
-    stage=locality-native-retirement
+    stage=locality-native-convergence
     required_reply_locality_wait native
     jq -n --slurpfile candidate "$directory/locality-required.json" --slurpfile retired "$directory/locality-native.json" \
       --argjson inventory "$require_locality_inventory" \
-      '{scope:"placement-candidate-only",replayedAgents:($candidate[0]|length),retiredAgents:($retired[0]|length),journalInventoryCountsVerified:$inventory,kernelAdmitted:false,observedDelivery:false}' > "$directory/locality-candidate.json"
+      --arg acquisition "$locality_acquisition" \
+      '{scope:"placement-candidate-only",acquisition:$acquisition,replayedAgents:($candidate[0]|length),journalInventoryCountsVerified:$inventory,kernelAdmitted:false,observedDelivery:false}
+        + (if $acquisition=="all-plans" then {nativeConvergedAgents:($retired[0]|length)} else {retiredAgents:($retired[0]|length)} end)' > "$directory/locality-candidate.json"
 else
     printf 'null\n' > "$directory/locality-candidate.json"
 fi

@@ -1,13 +1,13 @@
-//! Ephemeral placement candidate acquisition, not kernel admission. Fetches
-//! only for Required demand and changed applied placement/desired-plan cuts.
+//! Authenticated placement acquisition, separate from transport/key churn.
+//! A placement cut alone is never policy or packet-delivery permission.
 
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use unf_common::Revision;
 use unf_encryption::{
-    AdmittedNodeLocalPlan, AdmittedNodeLocalPlanDigest, EncryptionDisposition,
-    EncryptionLocalityContext, EncryptionLocalityRequest, EncryptionLocalityResponse,
-    MAX_ENCRYPTION_LOCALITY_RESPONSE_BYTES, VerifiedEncryptionLocality,
+    AdmittedNodeLocalPlan, AdmittedNodeLocalPlanDigest, EncryptionLocalityContext,
+    EncryptionLocalityRequest, EncryptionLocalityResponse, MAX_ENCRYPTION_LOCALITY_RESPONSE_BYTES,
+    VerifiedEncryptionLocality,
 };
 
 use super::{
@@ -55,10 +55,10 @@ impl PlacementCache {
         Ok(())
     }
 
-    fn matches(&self, plan: &AdmittedNodeLocalPlan, context: &EncryptionLocalityContext) -> bool {
-        self.candidate.as_ref().is_some_and(|(digest, evidence)| {
-            *digest == plan.admitted_digest && evidence.certificate().context() == context
-        })
+    fn matches(&self, context: &EncryptionLocalityContext) -> bool {
+        self.candidate
+            .as_ref()
+            .is_some_and(|(_, evidence)| evidence.certificate().context() == context)
     }
 }
 
@@ -123,6 +123,7 @@ pub(super) fn record_observation(cache: &PlacementCache, state: &AgentState, fai
 pub(super) struct PlacementStatus {
     schema_version: u16,
     scope: &'static str,
+    acquisition: &'static str,
     observation: PlacementObservation,
     matches_reported_identity_and_routing: bool,
     dataplane_ready: bool,
@@ -164,6 +165,7 @@ fn status_for(state: &AgentState) -> PlacementStatus {
     PlacementStatus {
         schema_version: 1,
         scope: "localityPlacementCandidate",
+        acquisition: "allAdmittedPlans",
         observation,
         matches_reported_identity_and_routing,
         dataplane_ready: state.ready.load(Ordering::Acquire),
@@ -179,13 +181,10 @@ pub(super) fn applied_context(
     cluster_id: &str,
     state: &AgentState,
 ) -> Option<EncryptionLocalityContext> {
-    if plan.snapshot.recipient.node_name != state.node_name
-        || !plan
-            .snapshot
-            .decisions
-            .iter()
-            .any(|decision| decision.disposition == EncryptionDisposition::Required)
-    {
+    // Pure-local Required demand need not create a remote Required transport
+    // decision. Acquire topology for every exact admitted plan, including Native
+    // and quiescent cuts; the policy-first packet path remains authoritative.
+    if plan.snapshot.recipient.node_name != state.node_name {
         return None;
     }
     let identity_epoch = state.applied_identity_epoch.load(Ordering::Acquire);
@@ -256,12 +255,18 @@ async fn synchronize_inner(
         plans.locality.clear()?;
         return Ok(());
     };
-    if plans.locality.matches(plan, &context) {
+    if plans.locality.matches(&context) {
+        // Observational association only. Key rotation, policy or transport
+        // generation changes do not invalidate independently replayed placement.
+        if let Some((digest, _)) = &mut plans.locality.candidate {
+            *digest = plan.admitted_digest;
+        }
         refresh_attachments(&mut plans.locality, state, plan, &context).await?;
         return Ok(());
     }
-    if let Some(pending) = &plans.locality.pending {
-        if pending.context != context || pending.plan_digest != plan.admitted_digest {
+    if let Some(pending) = &mut plans.locality.pending {
+        pending.plan_digest = plan.admitted_digest;
+        if pending.context != context {
             plans.locality.clear()?;
         } else if !pending.task.is_finished() {
             return Ok(());
@@ -297,6 +302,16 @@ async fn synchronize_inner(
     let Ok(work_slot) = plans.locality.work_slot.clone().try_acquire_owned() else {
         return Ok(());
     };
+    let digest = plan.admitted_digest;
+    start_fetch(plans, context, digest, work_slot)
+}
+
+fn start_fetch(
+    plans: &mut EncryptionPlanSynchronizer,
+    context: EncryptionLocalityContext,
+    plan_digest: AdmittedNodeLocalPlanDigest,
+    work_slot: tokio::sync::OwnedSemaphorePermit,
+) -> Result<()> {
     let controller_url = plans
         .controller_url
         .as_deref()
@@ -333,7 +348,7 @@ async fn synchronize_inner(
     });
     plans.locality.pending = Some(PendingPlacement {
         context,
-        plan_digest: plan.admitted_digest,
+        plan_digest,
         task,
     });
     Ok(())
