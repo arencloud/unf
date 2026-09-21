@@ -29,7 +29,8 @@ separately revisioned. The authoritative state remains in
 Current checkpoint: L3 consuming integration remains open. ADRs 0381–0382
 qualify prerequisites only. cl02 now runs `45d85d5`; ADR 0412 verifies scoped
 rotation, configured recovery and the full reply/inventory gate after the
-retained ADR 0410 failure. Kind remains on `6d71a30` pending matching tests.
+retained ADR 0410 failure. ADR 0413 passes matching persistent Kind on identical
+`45d85d5` images, with common activations 163/164 and exact journal preservation.
 Production locality integration and full Phase 9 closure remain open.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;

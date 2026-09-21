@@ -2,8 +2,8 @@
 
 This plan completes the open boundary from ADRs 0293–0294 and 0324. cl02 now runs
 `45d85d5`: ADR 0412 verifies scoped rotation, configured recovery and the complete
-reply/inventory gate after ADR 0410's retained failure. Matching qualification
-on persistent Kind remains next; it still runs `6d71a30`. Both retain
+reply/inventory gate after ADR 0410's retained failure. ADR 0413 passes matching
+persistent Kind on identical `45d85d5` images. Both retain
 the Native baseline. On the preceding `6d71a30` tuple, configured recovery
 and the complete scoped reply/inventory gate pass in ADRs 0395–0396, cl02 first.
 The preceding `8db97bb` gate passes in ADRs 0390–0391 after the retained ADR 0387
@@ -85,6 +85,9 @@ The rebuilt runtime still requires cl02-before-Kind qualification.
 ADR 0412 passes that scoped cl02 qualification on `45d85d5`, including common
 key activations 6480–6483, ciphertext and exact preservation of 116 records.
 Matching Kind is next; production locality integration and full lifecycle stay open.
+ADR 0413 passes matching persistent Kind, including common activations 163/164,
+the full scoped reply/inventory gate and exact journal preservation. Both fleets
+run `45d85d5`; resume production L3 bank/packet consumption, then L4/L5/Q.
 
 ## Safety and efficiency boundary
 

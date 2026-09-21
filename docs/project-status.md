@@ -901,6 +901,11 @@ reply/inventory gate: common activations 6480–6483, 24 allows/eight denials,
 247 WireGuard/zero Required plaintext frames and unchanged 116 CNI records.
 Current/retained logs are reviewed; retry amplification remains an S1 finding.
 Matching Kind is next. Locality packet consumption and Phase 9 remain open.
+ADR 0413 passes matching Kind on identical `45d85d5` images: configured recovery,
+common key activations 163/164, 24 allows/eight denials, 73 WireGuard/zero Required
+plaintext frames and unchanged journals. All logs are reviewed (56 overlapping
+current/retained warnings, no ERROR). Both fleets now run `45d85d5`; production
+L3 bank/packet integration and full L4/L5/Q qualification are next, not verified.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

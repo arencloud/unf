@@ -58,6 +58,11 @@ one rendezvous timeout, bounded-history churn and existing admission findings.
 No activation drain-window recurrence is seen; eventual 16/18-observation
 Required/Native convergence is not a latency or sustained-load qualification.
 Matching Kind, production locality and full lifecycle remain required.
+ADR 0413 passes matching Kind on identical `45d85d5` images with successful
+configured recovery, common activations 163/164, traffic/ciphertext and exact
+journal preservation. Its 56 overlapping current/retained warnings are reviewed;
+there is no ERROR or activation drain-window recurrence. Both narrow key repairs
+are qualified; actual locality integration, full lifecycle and S1–S5 stay open.
 
 Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required
