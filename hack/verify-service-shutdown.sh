@@ -2,6 +2,7 @@
 # Isolated PID-1 signal qualification; never signals a running fabric Pod.
 set -Eeuo pipefail
 umask 077
+project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 : "${KUBECONFIG:?explicit cluster configuration required}"
 : "${UNF_SHUTDOWN_CONTROLLER_IMAGE:?immutable controller image required}"
 : "${UNF_SHUTDOWN_AGENT_IMAGE:?immutable agent image required}"
@@ -90,6 +91,7 @@ for component in controller agent; do
         forward_pid=
         "${kc[@]}" -n "$namespace" get pod "$pod" -o json > "$directory/$pod-before.json"
         jq -e '.status.containerStatuses|length==1 and all(.[];.restartCount==0 and .state.running!=null)' "$directory/$pod-before.json" >/dev/null
+        pod_uid=$(jq -er '.metadata.uid' "$directory/$pod-before.json")
         "${kc[@]}" -n "$namespace" logs "$pod" -f --timestamps > "$directory/$pod.log" 2> "$directory/$pod-log-observer.log" &
         log_pid=$!
         # Exact new fixture process only; no kubectl delete or runtime stop hides exit status.
@@ -97,19 +99,19 @@ for component in controller agent; do
           'test "$(readlink /proc/1/exe)" = /usr/local/bin/unf-component; kill -"$1" 1' sh "$signal" \
           > "$directory/$pod-signal.log" 2>&1
         exited=false
-        for attempt in $(seq 1 10); do
+        for attempt in $(seq 1 30); do
             "${kc[@]}" -n "$namespace" get pod "$pod" -o json > "$directory/$pod-after.json"
-            if jq -e '.status.containerStatuses[0].state.terminated!=null' "$directory/$pod-after.json" >/dev/null; then exited=true; break; fi
+            if jq -L "$project_root/hack" -e --arg uid "$pod_uid" 'include "service-shutdown-gate"; shutdown_fixture_terminal($uid)' "$directory/$pod-after.json" >/dev/null; then exited=true; break; fi
             sleep 1
         done
         if [[ $exited != true ]]; then
             kill "$log_pid" 2>/dev/null || true
             wait "$log_pid" || true
-            echo "$pod failed to terminate within ten observations" >&2
+            echo "$pod failed to reach terminal Pod status within thirty observations" >&2
             exit 1
         fi
         wait "$log_pid"
-        jq -e '.status.phase=="Succeeded" and (.status.containerStatuses|length==1 and all(.[];.restartCount==0 and .state.terminated.exitCode==0 and .state.terminated.reason=="Completed"))' \
+        jq -L "$project_root/hack" -e --arg uid "$pod_uid" 'include "service-shutdown-gate"; shutdown_fixture_succeeded($uid)' \
           "$directory/$pod-after.json" >/dev/null
         rg -q "$component shutdown requested; draining service tasks" "$directory/$pod.log"
         rg -q "$component shutdown complete" "$directory/$pod.log"
