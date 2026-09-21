@@ -815,6 +815,10 @@ candidate/inventory retirement. Existing CNI state is preserved; fresh reports
 converge and all runtime Pods remain Ready with zero restarts. Reviewed logs
 retain 41 warnings and no ERROR. Missing SIGTERM handling is the next recovery
 repair; production locality, L4/L5/Q and full Phase 9 remain open.
+ADR 0392 implements early SIGINT/SIGTERM registration and the existing service
+drain path, with four real-process signal regressions (825 workspace tests,
+26 privileged tests ignored). Strict Clippy passes. Isolated PID-1 and live
+fabric recovery qualification remain pending, cl02 before matching Kind.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -2005,6 +2005,8 @@ async fn main() -> Result<()> {
     if let Some(AgentCommand::Cleanup(cleanup)) = &args.command {
         return run_cleanup(cleanup);
     }
+    let mut shutdown_signals =
+        unf_runtime::ShutdownSignals::register().context("register service shutdown signals")?;
     let state = Arc::new(initial_agent_state(&args));
     let cancellation = CancellationToken::new();
     let mut tasks = JoinSet::new();
@@ -2154,13 +2156,18 @@ async fn main() -> Result<()> {
     }
 
     let service_failure = tokio::select! {
-        result = tokio::signal::ctrl_c() => {
+        result = shutdown_signals.wait() => {
             result.context("listen for shutdown signal")?;
+            info!(target: "unf_agent::lifecycle", "agent shutdown requested; draining service tasks");
             None
         }
         failure = service_failure_rx.recv(), if supervised_service_configured => failure,
     };
-    finish_agent_tasks(cancellation, tasks, service_failure, &state).await
+    let result = finish_agent_tasks(cancellation, tasks, service_failure, &state).await;
+    if result.is_ok() {
+        info!(target: "unf_agent::lifecycle", "agent shutdown complete");
+    }
+    result
 }
 
 async fn bind_agent_api(address: SocketAddr) -> Result<Vec<tokio::net::TcpListener>> {

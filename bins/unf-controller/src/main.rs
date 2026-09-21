@@ -1457,6 +1457,8 @@ async fn main() -> Result<()> {
     install_crypto_provider()?;
     init_tracing();
     let args = Args::parse();
+    let mut shutdown_signals =
+        unf_runtime::ShutdownSignals::register().context("register service shutdown signals")?;
     let client = if args.offline {
         None
     } else {
@@ -1595,15 +1597,18 @@ async fn main() -> Result<()> {
         spawn_internal_api(&args, Arc::clone(&state), cancellation.clone(), &mut tasks).await?;
     }
 
-    tokio::signal::ctrl_c()
+    shutdown_signals
+        .wait()
         .await
         .context("listen for shutdown signal")?;
+    info!("controller shutdown requested; draining service tasks");
     cancellation.cancel();
     while let Some(result) = tasks.join_next().await {
         if let Err(error) = result {
             error!(%error, "controller task failed");
         }
     }
+    info!("controller shutdown complete");
     Ok(())
 }
 

@@ -3373,6 +3373,7 @@ dependencies = [
  "unf-link",
  "unf-loadbalancer",
  "unf-route",
+ "unf-runtime",
  "unf-service",
  "unf-state",
 ]
@@ -3454,6 +3455,7 @@ dependencies = [
  "unf-loadbalancer",
  "unf-policy",
  "unf-route",
+ "unf-runtime",
  "unf-service",
  "unf-state",
  "zstd",
@@ -3585,6 +3587,13 @@ dependencies = [
  "unf-cni-state",
  "unf-ipam",
  "unf-link",
+]
+
+[[package]]
+name = "unf-runtime"
+version = "0.1.0"
+dependencies = [
+ "tokio",
 ]
 
 [[package]]

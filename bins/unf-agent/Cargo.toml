@@ -32,6 +32,7 @@ unf-ipam = { path = "../../crates/unf-ipam" }
 unf-link = { path = "../../crates/unf-link" }
 unf-loadbalancer = { path = "../../crates/unf-loadbalancer" }
 unf-route = { path = "../../crates/unf-route" }
+unf-runtime = { path = "../../crates/unf-runtime" }
 unf-service = { path = "../../crates/unf-service" }
 unf-state = { path = "../../crates/unf-state" }
 

@@ -29,7 +29,7 @@ spec:
             # Counters and authenticated exports remain active independently;
             # avoid turning per-packet INFO events into a node log amplifier.
             - name: RUST_LOG
-              value: unf_agent=warn,unf_agent::encryption_lifecycle=info
+          value: unf_agent=warn,unf_agent::encryption_lifecycle=info,unf_agent::lifecycle=info
           args:
             - --listen
             - 0.0.0.0:9963
