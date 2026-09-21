@@ -51,6 +51,9 @@ ADR 0403 adds the kernel-backed incarnation gate: exact journal registration,
 full-nonce/serial leases, synchronous scoped deletion and no tombstone growth.
 Local regressions pass; real kernel qualification is next on cl02 then Kind.
 The live authenticated bank consumer and restart fencing are still pending.
+ADR 0404 passes the real kernel/journal gate on cl02 with immutable `bbb5a65`
+diagnostics, exact existing-journal preservation and reviewed logs. Matching
+Kind is next; this is not yet production packet consumption.
 
 ## Safety and efficiency boundary
 

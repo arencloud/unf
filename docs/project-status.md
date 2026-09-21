@@ -867,6 +867,9 @@ ADR 0403 adds the kernel-backed full-nonce/serial gate with opaque journal
 registration, scoped revocation and bounded storage without retained tombstones.
 All 849 workspace tests and strict Clippy pass. Its immutable diagnostic must
 pass cl02 before matching Kind; the live packet consumer remains unimplemented.
+ADR 0404 passes that real kernel/journal gate on cl02, with all 116 existing
+CNI records byte-identical, fresh five-agent convergence, 441 reviewed warnings
+and no ERROR. Matching-image Kind is next; L3 packet integration remains open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

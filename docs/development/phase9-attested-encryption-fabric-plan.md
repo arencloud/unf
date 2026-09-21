@@ -231,6 +231,8 @@ Actual bank/gate integration and cl02-before-Kind qualification remain required.
 ADR 0403 implements the bounded kernel incarnation gate and disposable platform
 qualifier. Local tests pass; kernel execution on cl02 then Kind remains pending.
 No production packet admission or Phase 9 closure is claimed.
+ADR 0404 verifies the disposable kernel/journal incarnation gate on cl02.
+Run the identical image on retained Kind before consuming the new gate.
 Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical
 snapshot, candidate or isolated device gate closes full production locality.
