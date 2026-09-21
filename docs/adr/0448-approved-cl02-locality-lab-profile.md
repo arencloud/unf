@@ -1,5 +1,8 @@
 # ADR 0448: Explicit cl02 locality lab capability profile
 
+Superseded by ADR 0449: the operator selected the scoped helper before any live
+capability change. Historical patch approval below is no longer the chosen plan.
+
 ## Decision
 
 The operator selected option two from ADR 0445: add SYS_ADMIN to the cl02 lab

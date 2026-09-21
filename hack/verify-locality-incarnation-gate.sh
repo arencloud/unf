@@ -22,6 +22,12 @@ cpu_limit=1
 deadline_seconds=180
 poll_attempts=100
 case $suite in
+    helper-mount)
+        : "${UNF_LOCALITY_GATE_SOURCE_REVISION:?exact expected compiled source revision}"
+        [[ $UNF_LOCALITY_GATE_SOURCE_REVISION =~ ^[0-9a-f]{40}$ ]]
+        test_command='["env","UNF_LOCALITY_HELPER_ISOLATED=yes","/usr/local/bin/unf-locality-tests","--ignored","--exact","helper::tests::privileged_private_mount_descriptor_survives_helper_exit_and_reclaims_pins","--nocapture","--test-threads=1"]'
+        marker='locality-helper-mount: PASS fd-transfer=true helper-only-sys-admin=true client-three-caps=true client-unshare-denied=true parent-namespace-unchanged=true map-fd-survives=true pin-reclaimed=true production-integration=false$'
+        ;;
     kernel-main-composition)
         : "${UNF_LOCALITY_GATE_SOURCE_REVISION:?exact expected compiled source revision}"
         [[ $UNF_LOCALITY_GATE_SOURCE_REVISION =~ ^[0-9a-f]{40}$ ]]
@@ -85,7 +91,7 @@ case $UNF_LOCALITY_GATE_PLATFORM in
     kind)
         : "${UNF_LOCALITY_GATE_CL02_EVIDENCE:?matching successful cl02 evidence required}"
         jq -e --arg image "$image" --arg suite "$suite" '.result=="passed" and .platform=="cl02" and .image==$image and (.suite // "incarnation")==$suite and .cleanup==true' "$UNF_LOCALITY_GATE_CL02_EVIDENCE" >/dev/null
-        if [[ $suite == kernel-main-bridge || $suite == kernel-main-composition ]]; then
+        if [[ $suite == kernel-main-bridge || $suite == kernel-main-composition || $suite == helper-mount ]]; then
             jq -e --arg source "$UNF_LOCALITY_GATE_SOURCE_REVISION" '.expectedCompiledSourceRevision==$source' "$UNF_LOCALITY_GATE_CL02_EVIDENCE" >/dev/null
         fi
         [[ $KUBE_CONTEXT == kind-unf-p9-20260921 ]]
@@ -113,6 +119,9 @@ cleanup() {
     fi
     if [[ $result == 0 ]]; then
         rg -q "$marker" "$directory/test.log" || result=1
+    fi
+    if [[ $suite == helper-mount ]]; then
+        [[ $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 1 ]] || result=1
     fi
     if [[ $security_profile == cl02-sys-admin-lab ]]; then
         jq -e -L hack 'include "locality-lab-profile"; (.items|length)==1 and all(.items[];locality_lab_pod_valid)' "$directory/pods-after.json" >/dev/null || result=1
@@ -157,7 +166,7 @@ cleanup() {
     fi
     jq -n --arg profile "$security_profile" --argjson code "$result" --argjson removed "$removed" --argjson delivery "$delivery" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" --arg source "${UNF_LOCALITY_GATE_SOURCE_REVISION:-}" \
         '{schemaVersion:2,result:(if $code==0 then "passed" else "failed" end),securityProfile:$profile,platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:$removed,packetDeliveryTested:$delivery}
-          + (if $suite=="kernel-main-bridge" or $suite=="kernel-main-composition" then {expectedCompiledSourceRevision:$source} else {} end)' > "$directory/evidence.json"
+          + (if $suite=="kernel-main-bridge" or $suite=="kernel-main-composition" or $suite=="helper-mount" then {expectedCompiledSourceRevision:$source} else {} end)' > "$directory/evidence.json"
     printf 'Incarnation gate result=%s evidence=%s\n' "$result" "$directory"
     exit "$result"
 }
@@ -169,7 +178,7 @@ if [[ $UNF_LOCALITY_GATE_PLATFORM == cl02 ]]; then
     "${kc[@]}" -n "$namespace" create rolebinding gate-privileged --clusterrole=system:openshift:scc:privileged --serviceaccount="$namespace:default" >/dev/null
 fi
 jq -n --arg ns "$namespace" --arg node "$UNF_LOCALITY_GATE_NODE" --arg image "$image" --argjson command "$test_command" --arg memory "$memory_limit" --arg cpu "$cpu_limit" --argjson deadline "$deadline_seconds" '{apiVersion:"v1",kind:"Pod",metadata:{name:"gate",namespace:$ns},spec:{nodeName:$node,hostNetwork:true,automountServiceAccountToken:false,restartPolicy:"Never",activeDeadlineSeconds:$deadline,containers:[{name:"gate",image:$image,imagePullPolicy:"IfNotPresent",securityContext:{privileged:true,runAsUser:0},resources:{requests:{cpu:"100m",memory:"64Mi"},limits:{cpu:$cpu,memory:$memory}},env:[{name:"UNF_LOCALITY_GATE_ISOLATED_CONTAINER",value:"yes"},{name:"UNF_OBSERVED_BANK_ISOLATED_CONTAINER",value:"yes"}],command:$command}]}}' > "$directory/pod.json"
-if [[ $suite == kernel-main-bridge || $suite == kernel-main-composition ]]; then
+if [[ $suite == kernel-main-bridge || $suite == kernel-main-composition || $suite == helper-mount ]]; then
     jq --arg source "$UNF_LOCALITY_GATE_SOURCE_REVISION" '.spec.containers[0].env += [{name:"UNF_EXPECT_BUILD_REVISION",value:$source}]' "$directory/pod.json" > "$directory/pod-source.json"
     mv "$directory/pod-source.json" "$directory/pod.json"
 fi

@@ -1,5 +1,9 @@
 # cl02 locality lab capability profile
 
+**Superseded by ADR 0449:** the operator selected the scoped helper instead.
+These patches are historical, unapplied lab artifacts. Do not apply them under
+the current authorization; the running agent retains its original capabilities.
+
 Explicitly approved lab-only SYS_ADMIN expansion (ADR 0448). This is not a
 default overlay or a least-privilege production recommendation. No image or
 release pin is changed by these guarded JSON patches. Apply only to the

@@ -376,6 +376,11 @@ SYS_ADMIN for the non-privileged cl02 lab agent, preserving default seccomp,
 NoNewPrivs and enforcing SELinux. Local profile checks and patch dry-runs pass;
 exact-profile kernel/socket gates and production-SCC admission precede rollout.
 Neither live fleet has changed, and this is not Phase 9 closure.
+ADR 0449 supersedes that lab expansion with the operator-selected scoped helper.
+The first boundary uses authenticated single-use detached-bpffs FD transfer;
+production supervision, namespace observations, device seeding and restricted
+runtime integration remain explicit sub-milestones. Do not apply ADR 0448's
+historical patches or mark the fleet/Phase 9 complete from this isolated slice.
 
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate

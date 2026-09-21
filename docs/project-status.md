@@ -1040,6 +1040,12 @@ non-privileged diagnostic profile pass local checks and server-side patch
 dry-runs. Exact-profile kernel/socket qualification and production-SCC Pod
 admission must pass before staged rollout; no live capability/image change has
 occurred. Phase 9, full process recovery and stabilization remain open.
+ADR 0449 supersedes the lab capability expansion: the operator now selects the
+scoped helper. No SYS_ADMIN is added to the running agent. A fixed-purpose,
+credential-bound detached-bpffs FD exchange is implemented; the cl02-first
+kernel gate and separate-process supervisor, observation/seeding, integration
+and recovery gates remain required. This is not a deployed helper or Phase 9
+closure; see ADR 0449's explicit sub-milestone tracker.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

@@ -2,6 +2,7 @@
 //! kernel device/route proof, policy permission or observed packet delivery.
 
 mod admission;
+pub mod helper;
 mod incarnation;
 mod kernel;
 mod observed;
