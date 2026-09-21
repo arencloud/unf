@@ -97,6 +97,10 @@ ADR 0415 passes the complete repaired `b432bec` bank diagnostic on cl02: 28
 native checks, nineteen kernel decisions, exact sealing/publication and nonce
 retirement, with unchanged production journals and full log review. Matching
 Kind follows on the identical image. This does not qualify production delivery.
+ADR 0416 closes that paired isolated bank gate on corrected `fd416df`, cl02
+first then identical-image Kind, including exact cleanup inventories, unchanged
+journals and full log review. Actual socket delivery and production L3
+integration remain next; L4/L5/Q are not promoted.
 
 ## Safety and efficiency boundary
 

@@ -914,6 +914,9 @@ not promoted by this implementation slice.
 ADR 0415 verifies the repaired `b432bec` isolated bank on cl02, with nineteen
 kernel decisions, 28 native checks, unchanged production journals and current/
 retained log review. Matching Kind is next. No live agent or release pin changes;
+ADR 0416 passes the corrected `fd416df` complete bank gate on cl02 then matching
+Kind, including exact private cleanup and journal preservation. Actual socket
+delivery and production L3 integration remain open; no Phase 9 gate is promoted.
 production application delivery and full L3/L4/L5/Q remain unverified.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
