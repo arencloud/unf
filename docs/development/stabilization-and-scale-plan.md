@@ -48,6 +48,9 @@ ADR 0410 preserves the next cl02 failure after the `7fbf7ee` rollout: activation
 rejects a drain interval beyond the predecessor's sealed expiry. Exact current
 and retained CRI logs expose it despite Ready Pods. Repair without extending
 expired authority or resetting keys; Kind stays on its prior runtime.
+ADR 0411 adds a regression-backed drain deadline cap with unchanged complete-cut
+activation and positive retirement checks. It still requires rebuilt cl02-first
+rotation/recovery/traffic qualification; no stability status is promoted yet.
 
 Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required

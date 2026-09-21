@@ -248,3 +248,73 @@ fn expired_shorter_successor_cannot_bypass_floor_or_revoke_a_viable_predecessor(
     assert_eq!(publication(&keys[0]), before);
     assert_eq!(fs::read(&keys[0].state_path).unwrap(), checkpoint);
 }
+
+#[test]
+fn delayed_successor_activation_caps_drain_at_the_predecessors_sealed_expiry() {
+    for lateness in [-500_i64, 0, 1] {
+        let directory = tempdir().unwrap();
+        let (mut keys, members, bootstraps, now) = setup(directory.path());
+        let first = cuts(&members, &keys, now + 1);
+        for (keys, cut) in keys.iter_mut().zip(first) {
+            assert!(keys.bind_attestation_cut(&cut, now + 1).unwrap());
+        }
+        let expiry = publication(&keys[0]).epochs[0].valid_until_unix_ms;
+        for (keys, bootstrap) in keys.iter_mut().zip(&bootstraps) {
+            assert!(prepare_due_encryption_rotation(keys, bootstrap, expiry - 5_000).unwrap());
+        }
+        let second = cuts(&members, &keys, expiry - 4_999);
+        let delayed = expiry.checked_add_signed(lateness).unwrap();
+        assert!(keys[0].bind_attestation_cut(&second[0], delayed).unwrap());
+        let published = publication(&keys[0]);
+        assert_eq!(published.revoked_through_epoch, 0);
+        assert_eq!(published.retired_through_epoch, 0);
+        assert_eq!(published.epochs[0].phase, KeyEpochPhase::Draining);
+        assert_eq!(published.epochs[0].drain_deadline_unix_ms, Some(expiry));
+        assert_eq!(published.epochs[0].valid_until_unix_ms, expiry);
+        assert_eq!(published.epochs[1].phase, KeyEpochPhase::Active);
+        let restored = FileNodeKeyStateStore::new(keys[0].state_path.clone())
+            .restore("cluster-a", "worker-a", "uid-a")
+            .unwrap();
+        assert_eq!(restored.publication().unwrap(), published);
+        assert_eq!(
+            restored
+                .drained_epoch_ready_for_retirement(expiry - 1)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            restored.drained_epoch_ready_for_retirement(expiry).unwrap(),
+            Some(1)
+        );
+        // Expiry makes retirement due, not authorized: live flows or routes
+        // must still prevent removal and leave the durable checkpoint intact.
+        let checkpoint = fs::read(&keys[0].state_path).unwrap();
+        for (flows, routes) in [(1, 0), (0, 1)] {
+            let proof = EpochDrainProof::issue(
+                "uid-a".into(),
+                1,
+                Revision::new(7),
+                expiry + 2,
+                flows,
+                routes,
+            )
+            .unwrap();
+            assert!(
+                keys[0]
+                    .authority
+                    .as_mut()
+                    .unwrap()
+                    .retire_drained_epoch(&proof, expiry + 2)
+                    .is_err()
+            );
+            assert_eq!(publication(&keys[0]), published);
+            assert_eq!(fs::read(&keys[0].state_path).unwrap(), checkpoint);
+        }
+        retire(&mut keys[0], 1, expiry + 2);
+        let retired = publication(&keys[0]);
+        assert_eq!(retired.retired_through_epoch, 1);
+        assert_eq!(retired.revoked_through_epoch, 0);
+        assert_eq!(retired.epochs.len(), 1);
+        assert_eq!(retired.epochs[0].epoch, 2);
+    }
+}

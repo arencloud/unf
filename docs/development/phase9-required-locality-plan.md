@@ -78,6 +78,9 @@ warning causes and actual locality packet integration are not closed by it.
 ADR 0410 deploys `7fbf7ee` on cl02 with successful provenance/CNI/journal checks,
 but retains the newly exposed activation drain-window failure. Kind stays on
 `6d71a30`; repair and repeat cl02 qualification before advancing the candidate.
+ADR 0411 reproduces the activation failure and caps drain at the predecessor's
+sealed expiry without extending authority or skipping zero-state retirement.
+The rebuilt runtime still requires cl02-before-Kind qualification.
 
 ## Safety and efficiency boundary
 

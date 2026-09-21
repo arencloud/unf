@@ -239,6 +239,8 @@ ADR 0404 verifies the disposable kernel/journal incarnation gate on cl02.
 Run the identical image on retained Kind before consuming the new gate.
 ADR 0405 passes matching Kind. Continue the authenticated immutable bank and
 packet-policy-first production consumer; full Phase 9 remains open.
+ADR 0411 adds the regression-backed expiry cap, preserving successor attestation
+and positive retirement. Its rebuilt runtime must pass cl02 before Kind.
 ADR 0410 retains the next cl02 activation failure: a full requested drain interval
 would exceed the predecessor's key expiry. Runtime qualification is not verified;
 repair without lifetime extension/reset, then repeat cl02 before Kind.

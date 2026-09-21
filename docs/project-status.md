@@ -893,6 +893,9 @@ ADR 0410 deploys `7fbf7ee` to cl02 with verified provenance/CNI protocol and
 unchanged journals, but key activation fails at the predecessor drain-window
 boundary. Runtime qualification is not verified; Kind remains on `6d71a30`.
 Repair and repeat cl02 before advancing the runtime. No Phase 9 status is promoted.
+ADR 0411 implements expiry-bounded predecessor drain: a valid attested successor
+can activate without extending an expired key, and removal still requires
+positive zero-flow/zero-route proof. Immutable runtime qualification is pending.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

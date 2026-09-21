@@ -558,6 +558,9 @@ impl NodeKeyAuthority {
     }
 
     /// Activates a mutually attested epoch and places the prior epoch in drain.
+    /// The requested drain is an upper bound: a predecessor's sealed expiry
+    /// may shorten it, including an already-expired drain. Key removal still
+    /// requires positive zero-state proof; activation never extends a lifetime.
     ///
     /// # Errors
     ///
@@ -593,11 +596,12 @@ impl NodeKeyAuthority {
             .ok_or(KeyAuthorityError::InvalidDrainWindow)?;
         for (index, candidate) in self.epochs.iter_mut().enumerate() {
             if candidate.phase == KeyEpochPhase::Active {
-                if index == position || drain_deadline > candidate.valid_until_unix_ms {
+                if index == position {
                     return Err(KeyAuthorityError::InvalidDrainWindow);
                 }
                 candidate.phase = KeyEpochPhase::Draining;
-                candidate.drain_deadline_unix_ms = Some(drain_deadline);
+                candidate.drain_deadline_unix_ms =
+                    Some(drain_deadline.min(candidate.valid_until_unix_ms));
             }
         }
         self.epochs[position].phase = KeyEpochPhase::Active;
@@ -1839,6 +1843,8 @@ fn temporary_path(path: &Path) -> Result<PathBuf, KeyAuthorityError> {
 
 #[cfg(test)]
 mod tests {
+    mod drain;
+
     use std::cell::Cell;
     use std::os::unix::fs::PermissionsExt as _;
 
