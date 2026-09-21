@@ -222,6 +222,7 @@ ADR 0398 passes that cl02 fixture with unchanged live runtime and journals;
 matching persistent Kind is next.
 ADR 0399 records Kind's pre-load attribute-tag rejection and local repair;
 rerun the rebuilt fixture on cl02 first, then Kind.
+ADR 0400 passes the repaired cl02 gate; matching-image Kind remains next.
 Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical
 snapshot, candidate or isolated device gate closes full production locality.

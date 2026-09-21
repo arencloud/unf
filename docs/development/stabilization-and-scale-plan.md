@@ -15,6 +15,11 @@ and controller-replacement retry bursts, not a seamless-recovery claim. The work
 installer mock still fails on its host-socket SELinux permission boundary;
 static package rendering passes, but no full mock pass is claimed. No resource
 savings, sustained-load envelope, L3 consumption or S1–S5 closure is claimed.
+ADRs 0397–0400 add native bounded device-layout discovery and qualify its repaired
+isolated fixture on cl02; matching Kind remains pending. Reviewed cl02 logs
+also expose one operations-persistence retry whose outer-only log message
+omits the underlying cause. Later durable generation/revision progress is proved;
+failure-detail logging and recurring bounded-history warnings remain findings.
 
 Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required

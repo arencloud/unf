@@ -846,6 +846,11 @@ ADR 0399 retains the subsequent Kind pre-BPF layout failure: a documented
 compiler-attribute TYPE_TAG flag was incorrectly rejected. A red regression,
 strict bounded repair and offline metadata replay pass. Full rebuilt-image
 cl02-before-Kind qualification remains required; the live fleet is unchanged.
+ADR 0400 requalifies the repaired `90cb651` fixture on cl02: complete serial,
+movement/publication, layout-parity and cleanup checks pass with unchanged
+116 CNI records. Fresh reports converge; logs retain 447 warnings, no ERROR,
+including one operations-persistence retry with later durable progress proved.
+The identical immutable image's Kind rerun remains next.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

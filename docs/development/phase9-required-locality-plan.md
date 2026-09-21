@@ -37,6 +37,9 @@ persistent Kind remains required; live runtime stays `6d71a30`.
 ADR 0399 retains Kind's pre-BPF rejection of documented compiler-attribute BTF
 tags and adds a regression-backed parser repair. Offline metadata replay is
 not live qualification; the rebuilt fixture must pass cl02 again before Kind.
+ADR 0400 passes the complete repaired `90cb651` fixture on cl02, with exact
+layout parity, traffic accounting, cleanup and journal preservation. The
+same immutable image must now pass persistent Kind.
 
 ## Safety and efficiency boundary
 
