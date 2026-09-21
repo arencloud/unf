@@ -220,6 +220,8 @@ ADR 0397 supplies locally verified native kernel-layout discovery; qualify its
 complete isolated device fixture on cl02 then matching Kind before consuming it.
 ADR 0398 passes that cl02 fixture with unchanged live runtime and journals;
 matching persistent Kind is next.
+ADR 0399 records Kind's pre-load attribute-tag rejection and local repair;
+rerun the rebuilt fixture on cl02 first, then Kind.
 Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical
 snapshot, candidate or isolated device gate closes full production locality.

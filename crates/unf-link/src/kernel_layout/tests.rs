@@ -391,3 +391,36 @@ fn arbitrary_single_bit_mutations_never_panic() {
         }
     }
 }
+
+#[test]
+fn compiler_attribute_tags_keep_their_standard_binary_shape() {
+    let mut base = base();
+    base.structure("veth_priv", 4, 16, &[("peer", 4, 0)]); // 16
+    base.record("address_space(4)", 0x9200_0000, 12, &[]); // 17: flagged TYPE_TAG
+    base.set(4, 2, 17); // actual device pointer traverses the tagged type
+    base.record("preserve_access_index", 0x9100_0000, 12, &[u32::MAX]); // 18: DECL_TAG
+    base.record("address_space(1)", 0x9200_0000, 0, &[]); // unrelated tagged void
+    assert_eq!(
+        KernelDeviceLayout::from_btf(&base.encode(), None)
+            .unwrap()
+            .offsets(),
+        expected()
+    );
+    for (id, word, value) in [
+        (17, 1, 0x9200_0001),
+        (18, 1, 0x9100_0001),
+        (17, 2, 17),
+        (17, 2, 13),
+        (17, 0, 0),
+        (18, 0, 0),
+    ] {
+        let mut bad = base.clone();
+        bad.set(id, word, value);
+        assert!(
+            KernelDeviceLayout::from_btf(&bad.encode(), None).is_err(),
+            "tag {id}/{word}"
+        );
+    }
+    base.records[17].truncate(12);
+    assert!(KernelDeviceLayout::from_btf(&base.encode(), None).is_err());
+}

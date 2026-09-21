@@ -34,6 +34,9 @@ cl02 before Kind. Layout metadata alone grants no packet authority.
 ADR 0398 passes the complete native-offset fixture on cl02, including independent
 layout parity, lifetime/publication checks and unchanged CNI journals. Matching
 persistent Kind remains required; live runtime stays `6d71a30`.
+ADR 0399 retains Kind's pre-BPF rejection of documented compiler-attribute BTF
+tags and adds a regression-backed parser repair. Offline metadata replay is
+not live qualification; the rebuilt fixture must pass cl02 again before Kind.
 
 ## Safety and efficiency boundary
 

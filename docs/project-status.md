@@ -842,6 +842,10 @@ ADR 0398 passes cl02's native-offset fixture: all seventy serial checks and both
 independent layout parity and exact old-map retirement. All 116 CNI records are
 unchanged; five fresh reports converge and current Pods have zero restarts.
 Reviewed logs retain 450 warnings, no ERROR. Matching Kind is next.
+ADR 0399 retains the subsequent Kind pre-BPF layout failure: a documented
+compiler-attribute TYPE_TAG flag was incorrectly rejected. A red regression,
+strict bounded repair and offline metadata replay pass. Full rebuilt-image
+cl02-before-Kind qualification remains required; the live fleet is unchanged.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

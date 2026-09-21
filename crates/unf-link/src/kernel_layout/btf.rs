@@ -79,7 +79,13 @@ impl<'a> Inventory<'a> {
             let kind = (info >> 24) & 0x7f;
             let vlen = (info & 0x00ff_ffff) as usize;
             let flag = info >> 31 != 0;
-            require(!flag || matches!(kind, 4..=7 | 19), "unsupported kind flag")?;
+            // Linux BTF uses kflag=1 on declaration/type tags to encode
+            // compiler attributes. Their record sizes and reference geometry
+            // do not change; attributes are not additional layout authority.
+            require(
+                !flag || matches!(kind, 4..=7 | 17..=19),
+                "unsupported kind flag",
+            )?;
             let extra = match kind {
                 1 | 14 | 17 => {
                     require(vlen == 0, "fixed type vlen")?;
@@ -152,7 +158,19 @@ impl<'a> Btf<'a> {
         let module = module
             .map(|bytes| Inventory::parse(bytes, MAX_TYPES - base.offsets.len(), true))
             .transpose()?;
-        Ok(Self { base, module })
+        let btf = Self { base, module };
+        for inventory in std::iter::once(&btf.base).chain(btf.module.iter()) {
+            for index in 0..inventory.offsets.len() {
+                let item = inventory.item(index)?;
+                if matches!(item.kind(), 17 | 18) {
+                    require(
+                        !btf.string(item.name)?.is_empty(),
+                        "empty attribute/tag name",
+                    )?;
+                }
+            }
+        }
+        Ok(btf)
     }
 
     pub fn item(&self, id: u32) -> Result<Type<'a>> {
