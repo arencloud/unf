@@ -3,23 +3,25 @@
 This completes the open boundary from ADRs 0293–0294 and 0324. cl02 now runs
 `8db97bb` with an unchanged Native baseline; its complete scoped Required reply
 and journal-inventory gate passes in ADR 0390 after the retained ADR 0387 failure.
-The matching persistent Kind gate is next. The historical `f984db9` Kind runtime is unavailable
+ADR 0391 passes the matching persistent Kind gate on identical images. The
+historical `f984db9` Kind runtime is unavailable
 after the workstation reboot. ADR 0388 verifies a separately approved persistent
 Kind bootstrap on the prior cl02-passing `f984db9` Native runtime; current-runtime
-qualification must still pass cl02 first. Neither fresh bootstrap nor a successful
+qualification follows cl02 first. Neither fresh bootstrap nor a successful
 scoped reply gate is full Phase 9 closure.
 
-The latest read-only cl02 checkpoint (ADR 0388) finds all five Native recovery
+The historical read-only cl02 checkpoint (ADR 0388) finds all five Native recovery
 journals settled at generation `1789972093114`, without a state reset. This
 eventual recovery does not repair or requalify ADR 0387's Required failure.
-The WARN-only agent logs lack the successful key-lifecycle timeline; the next
-repair must reproduce the plan-retention/key-retirement boundary explicitly.
+Its WARN-only agent logs lack the successful key-lifecycle timeline.
 ADR 0389 reproduces that retention gap and implements the positive authenticated
 tombstone check, preserving all successor/packet authority barriers. Local
-regressions pass; immutable runtime qualification remains cl02 first, then Kind.
+regressions pass; immutable runtime qualification follows cl02 first, then Kind.
 ADR 0390 verifies that complete cl02 runtime gate, including traffic/ciphertext,
 actual inventory counts, retirement and byte-identical existing journals. The
-matching Kind gate and production locality consumption remain required.
+matching Kind gate passes in ADR 0391; production locality consumption remains
+required. Missing SIGTERM handling observed during image checks remains a
+separate recovery defect, not hidden by the traffic pass.
 
 ## Safety and efficiency boundary
 

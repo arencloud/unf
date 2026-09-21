@@ -29,17 +29,20 @@ separately revisioned. The authoritative state remains in
 Current checkpoint: L3 consuming integration remains open. ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the
-actual agent journal/placement candidate join, locally verified and
-not yet runtime-qualified. These prerequisites do not grant local Required
+actual agent journal/placement candidate join. ADRs 0390–0391 qualify that
+join and the tombstone-aware retention repair on identical `8db97bb` images,
+cl02 before persistent Kind. These prerequisites do not grant local Required
 packet permission. L4/L5 locality/replica matrices and Q full lifecycle remain
 pending; follow the [Required locality closure plan](phase9-required-locality-plan.md).
 ADR 0387 subsequently deploys `d007071` to cl02, preserving all CNI journals,
 but the expanded gate fails at Required admission with missing-key-epoch and
-drain/catch-up warnings. This is the immediate repair priority, not a verified
-inventory runtime. The old retained Kind runtime is unavailable after the workstation
+drain/catch-up warnings. The failure remains recorded; ADR 0389 reproduces and
+repairs a retention gap, without asserting it was the sole historical cause.
+The old retained Kind runtime is unavailable after the workstation
 reboot. ADR 0388 verifies an explicitly approved separate persistent Kind bootstrap
 on the last cl02-passing `f984db9` Native runtime. This is new infrastructure,
-not retained-state continuity or current-runtime Phase 9 qualification.
+not retained-state continuity. ADR 0391 subsequently qualifies the scoped
+current-runtime reply/inventory gate, not the full Phase 9 lifecycle.
 
 Historical repair checkpoint (ADRs 0316–0318): Native expiry/empty-Namespace
 continuity passes cl02 then matching-image retained Kind on runtime `5ea1bd2`.
@@ -200,13 +203,11 @@ require independent architecture and gates.
 
 ## Immediate next slice
 
-Investigate and repair ADR 0387's missing-epoch/pending-generation failure,
-then rerun the complete inventory/Required gate on cl02 before matching Kind.
-ADR 0389 implements a regression-backed tombstone-aware catalog-retention
-repair and targeted lifecycle logging. ADR 0390 verifies the complete expanded
-cl02 reply/inventory gate on immutable `8db97bb`; matching persistent Kind is
-next. This scoped success does not establish that every live failure cause is fixed.
-Preserve the failed run and all authority state. Complete authenticated
+ADRs 0389–0391 close the regression-backed catalog-retention repair and scoped
+reply/inventory qualification on cl02 then matching persistent Kind. Preserve
+the historical failure, retry warnings and all authority state. Address the
+observed missing SIGTERM shutdown handling with regression-backed recovery
+tests, then continue L3 production integration. Complete authenticated
 attachment/route and banked packet consumption before L4/L5/Q. No historical
 snapshot, candidate or isolated device gate closes full production locality.
 

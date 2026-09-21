@@ -809,7 +809,12 @@ eight denials, 312 WireGuard frames, zero Required plaintext/capture loss,
 three CNI retirements and both candidate/inventory retirements. All 116 existing
 CNI records remain byte-identical through guarded rollout and cleanup. The
 startup-socket observation failure and retry/log/shutdown findings are retained.
-Identical-image persistent Kind is next; full locality and Phase 9 remain open.
+ADR 0391 passes identical-image persistent Kind: 24 allows, eight denials,
+175 WireGuard frames, zero Required plaintext/capture loss, exact CNI and
+candidate/inventory retirement. Existing CNI state is preserved; fresh reports
+converge and all runtime Pods remain Ready with zero restarts. Reviewed logs
+retain 41 warnings and no ERROR. Missing SIGTERM handling is the next recovery
+repair; production locality, L4/L5/Q and full Phase 9 remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
