@@ -57,6 +57,13 @@ fn verify_reopen(
     old: &IncarnationLease,
 ) {
     let mut reopened = AttachmentJournal::open(path, provider).unwrap();
+    assert!(reopened.retirement_required() && reopened.cut().is_none());
+    assert!(
+        reopened
+            .apply(request(TransactionOperation::Status))
+            .is_err()
+    );
+    let new_gate = IncarnationGate::install(&mut reopened, 8).unwrap();
     assert!(
         gate.issue(
             &reopened,
@@ -65,7 +72,6 @@ fn verify_reopen(
         )
         .is_err()
     );
-    let new_gate = IncarnationGate::install(&mut reopened, 8).unwrap();
     assert!(!new_gate.is_current(old).unwrap());
     let new = new_gate
         .issue(

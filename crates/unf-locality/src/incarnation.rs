@@ -100,12 +100,15 @@ impl IncarnationGate {
     }
 
     /// Creates an empty, bounded, program-read-only map and installs its callback
-    /// under the caller's journal lock. No nonce becomes live during install.
+    /// under the caller's journal lock, durably requiring retirement-aware
+    /// journal readers before returning. No nonce becomes live during install.
     /// There is intentionally no constructor from a pinned or serialized map.
     ///
     /// # Errors
     /// Rejects invalid capacity, kernel map errors, uncertain journals or a
-    /// journal with another installed hook. Failed installation drops the map.
+    /// journal with another installed hook. If the reader-floor write fails,
+    /// the unpublished map stays owned by the installed callback until journal
+    /// close; no gate or lease is returned. Stop startup on that failure.
     pub fn install(
         journal: &mut AttachmentJournal,
         capacity: u32,
@@ -119,7 +122,8 @@ impl IncarnationGate {
             last_serial: 0,
             issuance_retired: false,
         }));
-        let registration = journal.install_retirement(Box::new(Retirer(Arc::clone(&state))))?;
+        let registration =
+            journal.install_required_retirement(Box::new(Retirer(Arc::clone(&state))))?;
         Ok(Self {
             state,
             registration,

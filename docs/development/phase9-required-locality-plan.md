@@ -117,6 +117,10 @@ ADR 0420 passes the complete coordinated-admission gate on cl02 then matching
 Kind, retaining all native/kernel/socket checks and full log/state review.
 Next close the durable startup/rollback boundary before production writer and
 packet integration. L3/L4/L5/Q remain open; live runtime is still `45d85d5`.
+ADR 0421 adds the durable schema-5 journal reader floor before locality lease
+issuance, preserving records while blocking unhooked reopen/older CNI writers.
+The complete diagnostic adds a frozen-old-agent rejection check; immutable
+cl02-before-Kind qualification and actual startup fencing remain required.
 
 ## Safety and efficiency boundary
 

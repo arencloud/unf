@@ -1,6 +1,8 @@
 # Isolated real kernel bank fixture, never a production agent image.
 ARG RUST_IMAGE=docker.io/library/rust:1.95-bookworm
 ARG TEST_IMAGE=quay.io/arencloud/unf-test-tools-dev@sha256:6ce5d918c67fc5132065a94561d55112556fde5f04a95b96bc89d71cdd27ef0e
+ARG LEGACY_AGENT_IMAGE=quay.io/arencloud/unf-agent-dev@sha256:74f80c81d5a208dcfe8904ca406ca174e35a1bdeccb04ebfcecd856a13938a45
+FROM ${LEGACY_AGENT_IMAGE} AS legacy-agent
 FROM ${RUST_IMAGE} AS builder
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
@@ -13,6 +15,7 @@ FROM ${TEST_IMAGE}
 ARG UNF_SOURCE_REVISION
 LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
 COPY --from=builder /src/target/release/examples/kernel_observed_bank /usr/local/bin/kernel-observed-bank
+COPY --from=legacy-agent /usr/local/bin/unf-component /usr/local/bin/unf-legacy-agent
 COPY .artifacts/unf-locality-bank /usr/local/lib/unf/locality-bank
 COPY .artifacts/unf-locality-fixture /usr/local/lib/unf/locality-fixture
 COPY hack/verify-observed-locality-bank.sh /usr/local/bin/verify-observed-locality-bank

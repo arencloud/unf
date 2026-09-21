@@ -41,6 +41,113 @@ fn observer(path: &Path) -> (Observer, Calls, Arc<AtomicBool>) {
     )
 }
 
+#[test]
+fn required_hook_persists_reader_floor_and_preserves_all_attachment_bytes() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attachments.json");
+    let mut journal = AttachmentJournal::open(&path, provider()).unwrap();
+    ready(&mut journal, "bound");
+    journal
+        .apply(request(TransactionOperation::Prepare {
+            attachment: spec("legacy"),
+        }))
+        .unwrap();
+    let old_cut = journal.cut().unwrap();
+    let records = journal.records();
+    let before: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let (hook, calls, _) = observer(&path);
+    let registration = journal.install_required_retirement(Box::new(hook)).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let after: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(after["schemaVersion"], 5);
+    assert_eq!(after["attachments"], before["attachments"]);
+    assert_eq!(after["provider"], before["provider"]);
+    assert_eq!(journal.records(), records);
+    assert!(journal.retirement_required());
+    assert!(calls.lock().unwrap().is_empty());
+    assert!(!journal.is_current(&old_cut));
+    assert!(journal.retirement_matches(&registration));
+    let installed_cut = journal.cut().unwrap();
+    drop(journal);
+    let mut reopened = AttachmentJournal::open(&path, provider()).unwrap();
+    assert!(reopened.retirement_required());
+    assert!(reopened.cut().is_none());
+    assert!(!reopened.is_current(&installed_cut));
+    assert!(!reopened.retirement_matches(&registration));
+    for operation in [
+        TransactionOperation::Status,
+        TransactionOperation::Prepare {
+            attachment: bound_spec("new"),
+        },
+        TransactionOperation::BeginDelete { key: key("bound") },
+    ] {
+        assert!(reopened.apply(request(operation)).is_err());
+        assert_eq!(reopened.records(), records);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+    let (hook, calls, _) = observer(&path);
+    let new_registration = reopened
+        .install_required_retirement(Box::new(hook))
+        .unwrap();
+    assert!(reopened.cut().is_some());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(reopened.retirement_matches(&new_registration));
+    assert!(!reopened.retirement_matches(&registration));
+    reopened
+        .apply(request(TransactionOperation::BeginDelete {
+            key: key("bound"),
+        }))
+        .unwrap();
+    assert_eq!(calls.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn required_reader_floor_survives_empty_inventory_and_unbound_records() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attachments.json");
+    let mut journal = AttachmentJournal::open(&path, provider()).unwrap();
+    let (hook, _, _) = observer(&path);
+    journal.install_required_retirement(Box::new(hook)).unwrap();
+    for operation in [
+        TransactionOperation::Prepare {
+            attachment: spec("legacy"),
+        },
+        TransactionOperation::BeginAbort { key: key("legacy") },
+        TransactionOperation::CompleteAbort { key: key("legacy") },
+    ] {
+        journal.apply(request(operation)).unwrap();
+        let document: JournalDocument = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            document.schema_version,
+            REQUIRED_RETIREMENT_JOURNAL_SCHEMA_VERSION
+        );
+    }
+    assert!(journal.is_empty());
+    drop(journal);
+    let reopened = AttachmentJournal::open(&path, provider()).unwrap();
+    assert!(reopened.retirement_required() && reopened.cut().is_none());
+}
+
+#[test]
+fn failed_required_upgrade_exposes_no_registration_or_current_cut() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("attachments.json");
+    let mut journal = AttachmentJournal::open(&path, provider()).unwrap();
+    ready(&mut journal, "bound");
+    let before = fs::read(&path).unwrap();
+    let records = journal.records();
+    let cut = journal.cut().unwrap();
+    fs::create_dir(temporary_path(&path)).unwrap();
+    let (hook, _, _) = observer(&path);
+    assert!(journal.install_required_retirement(Box::new(hook)).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(journal.records(), records);
+    assert!(journal.retirement_required());
+    assert!(journal.cut().is_none() && !journal.is_current(&cut));
+    let (hook, _, _) = observer(&path);
+    assert!(journal.install_required_retirement(Box::new(hook)).is_err());
+}
+
 fn bound_spec(name: &str) -> AttachmentSpec {
     let mut attachment = spec(name);
     attachment.workload_uid = Some(name.into());

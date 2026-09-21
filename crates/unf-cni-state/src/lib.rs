@@ -16,6 +16,9 @@ pub const MAX_TRANSACTION_MESSAGE_BYTES: usize = 65_536;
 pub const MAX_ATTACHMENT_LIST_RECORDS: u16 = 8;
 
 const ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 4;
+// A v5 reader must install a fresh retirement hook before serving transactions.
+// Older agents reject this version before they can mutate a live locality lease.
+const REQUIRED_RETIREMENT_JOURNAL_SCHEMA_VERSION: u16 = 5;
 const UID_ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 3;
 const UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 2;
 const LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION: u16 = 1;
@@ -368,6 +371,14 @@ pub struct AttachmentJournal {
     instance: Option<Arc<()>>,
     revision: u64,
     retirement: Option<RetirementHook>,
+    retirement_required: bool,
+}
+
+#[derive(Default)]
+struct LoadedJournal {
+    attachments: BTreeMap<AttachmentKey, AttachmentRecord>,
+    migrated: bool,
+    retirement_required: bool,
 }
 
 struct RetirementHook {
@@ -469,7 +480,7 @@ impl AttachmentJournal {
         reject_symlink_components(&path)?;
         remove_stale_temporary(&path)?;
 
-        let (attachments, migrated) = if path.exists() {
+        let loaded = if path.exists() {
             let metadata = fs::metadata(&path)?;
             if !metadata.file_type().is_file() {
                 return Err(JournalError::Invalid(
@@ -478,17 +489,18 @@ impl AttachmentJournal {
             }
             load_document(&path, provider)?
         } else {
-            (BTreeMap::new(), false)
+            LoadedJournal::default()
         };
         let journal = Self {
             path,
             provider,
-            attachments,
+            attachments: loaded.attachments,
             instance: Some(Arc::new(())),
             revision: 0,
             retirement: None,
+            retirement_required: loaded.retirement_required,
         };
-        if migrated {
+        if loaded.migrated {
             journal.persist()?;
         } else if journal.path.exists() {
             fs::set_permissions(&journal.path, fs::Permissions::from_mode(0o600))?;
@@ -526,9 +538,13 @@ impl AttachmentJournal {
 
     /// Returns no locality fence after any persistence failure. Only a later
     /// successful durable mutation or a freshly validated reopen restores one;
+    /// a required-retirement reopen additionally needs its fresh installed hook.
     /// read-only operations and no-op replays cannot repair uncertain durability.
     #[must_use]
     pub fn cut(&self) -> Option<AttachmentJournalCut> {
+        if self.retirement_required && self.retirement.is_none() {
+            return None;
+        }
         Some(AttachmentJournalCut {
             instance: Arc::clone(self.instance.as_ref()?),
             revision: self.revision,
@@ -540,9 +556,11 @@ impl AttachmentJournal {
     /// This does not detect writes bypassing this journal's exclusive owner.
     #[must_use]
     pub fn is_current(&self, cut: &AttachmentJournalCut) -> bool {
-        self.instance
-            .as_ref()
-            .is_some_and(|instance| Arc::ptr_eq(instance, &cut.instance))
+        (!self.retirement_required || self.retirement.is_some())
+            && self
+                .instance
+                .as_ref()
+                .is_some_and(|instance| Arc::ptr_eq(instance, &cut.instance))
             && self.revision == cut.revision
     }
 
@@ -553,7 +571,8 @@ impl AttachmentJournal {
     ///
     /// Reopen never restores this process-local hook or packet permission. The
     /// publisher must first fence any previous runtime bank before serving CNI.
-    /// No hook is necessary for callers that never publish locality permission.
+    /// No hook is necessary for callers that never publish locality permission,
+    /// unless this journal already durably requires retirement-aware readers.
     ///
     /// # Errors
     /// Rejects replacement or uncertain journal durability. A hook cannot be
@@ -577,6 +596,39 @@ impl AttachmentJournal {
         Ok(AttachmentRetirementRegistration { owner })
     }
 
+    /// Install a fresh hook AND durably require retirement-aware readers before
+    /// any locality lease may be issued. Existing records/nonces are preserved;
+    /// an empty journal keeps this barrier too. Reopen restores the requirement,
+    /// never the hook or packet authority. Old readers reject journal schema 5.
+    ///
+    /// Caller must first fence every previous runtime, before opening/serving
+    /// CNI or mutating routes. This marker cannot withdraw old kernel programs.
+    ///
+    /// # Errors
+    /// Rejects another installed hook or uncertain durability. A failed upgrade
+    /// leaves the instance cut invalid and the hook installed but returns no
+    /// registration; stop startup instead of issuing leases or retrying install.
+    pub fn install_required_retirement(
+        &mut self,
+        retirement: Box<dyn AttachmentRetirement>,
+    ) -> Result<AttachmentRetirementRegistration, JournalError> {
+        let registration = self.install_retirement(retirement)?;
+        if !self.retirement_required {
+            self.retirement_required = true;
+            if let Err(error) = self.persist() {
+                self.instance = None;
+                return Err(error);
+            }
+        }
+        Ok(registration)
+    }
+
+    /// Durable reader floor, not evidence of a live hook or kernel admission.
+    #[must_use]
+    pub const fn retirement_required(&self) -> bool {
+        self.retirement_required
+    }
+
     /// Checks installation identity, independently of a changing inventory cut.
     /// A publisher must additionally check its exact current cut under this
     /// journal's transaction lock before issuing a kernel lease.
@@ -597,6 +649,11 @@ impl AttachmentJournal {
         &mut self,
         request: TransactionRequest,
     ) -> Result<TransactionResponse, JournalError> {
+        if self.retirement_required && self.retirement.is_none() {
+            return Err(JournalError::InvalidTransition(
+                "journal requires a fresh retirement hook before serving CNI".into(),
+            ));
+        }
         let schema_version = request.schema_version();
         if !matches!(
             schema_version,
@@ -989,7 +1046,9 @@ impl AttachmentJournal {
         let document = JournalDocument {
             // Preserve schema-2 recovery while every attachment is unbound.
             // A document carrying any Pod incarnation requires a v3 reader.
-            schema_version: if self
+            schema_version: if self.retirement_required {
+                REQUIRED_RETIREMENT_JOURNAL_SCHEMA_VERSION
+            } else if self
                 .attachments
                 .values()
                 .any(|record| record.creation_token.is_some())
@@ -1029,10 +1088,7 @@ impl AttachmentJournal {
     }
 }
 
-fn load_document(
-    path: &Path,
-    provider: NodeBlockProvider,
-) -> Result<(BTreeMap<AttachmentKey, AttachmentRecord>, bool), JournalError> {
+fn load_document(path: &Path, provider: NodeBlockProvider) -> Result<LoadedJournal, JournalError> {
     let bytes = fs::read(path)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
     let actual = value
@@ -1041,7 +1097,8 @@ fn load_document(
         .and_then(|version| u16::try_from(version).ok())
         .ok_or_else(|| JournalError::Invalid("journal schemaVersion is missing".to_owned()))?;
     match actual {
-        ATTACHMENT_JOURNAL_SCHEMA_VERSION
+        REQUIRED_RETIREMENT_JOURNAL_SCHEMA_VERSION
+        | ATTACHMENT_JOURNAL_SCHEMA_VERSION
         | UID_ATTACHMENT_JOURNAL_SCHEMA_VERSION
         | UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION => {
             let document: JournalDocument = serde_json::from_value(value)?;
@@ -1051,15 +1108,23 @@ fn load_document(
                     document.provider
                 )));
             }
-            Ok((validate_document(document, provider)?, false))
+            Ok(LoadedJournal {
+                attachments: validate_document(document, provider)?,
+                migrated: false,
+                retirement_required: actual == REQUIRED_RETIREMENT_JOURNAL_SCHEMA_VERSION,
+            })
         }
         LEGACY_ATTACHMENT_JOURNAL_SCHEMA_VERSION => {
             let document: LegacyJournalDocument = serde_json::from_value(value)?;
-            Ok((migrate_legacy_document(document, provider)?, true))
+            Ok(LoadedJournal {
+                attachments: migrate_legacy_document(document, provider)?,
+                migrated: true,
+                retirement_required: false,
+            })
         }
         _ => Err(JournalError::IncompatibleSchema {
             actual,
-            expected: ATTACHMENT_JOURNAL_SCHEMA_VERSION,
+            expected: REQUIRED_RETIREMENT_JOURNAL_SCHEMA_VERSION,
         }),
     }
 }
@@ -1070,13 +1135,14 @@ fn validate_document(
 ) -> Result<BTreeMap<AttachmentKey, AttachmentRecord>, JournalError> {
     if !matches!(
         document.schema_version,
-        ATTACHMENT_JOURNAL_SCHEMA_VERSION
+        REQUIRED_RETIREMENT_JOURNAL_SCHEMA_VERSION
+            | ATTACHMENT_JOURNAL_SCHEMA_VERSION
             | UID_ATTACHMENT_JOURNAL_SCHEMA_VERSION
             | UNBOUND_ATTACHMENT_JOURNAL_SCHEMA_VERSION
     ) {
         return Err(JournalError::IncompatibleSchema {
             actual: document.schema_version,
-            expected: ATTACHMENT_JOURNAL_SCHEMA_VERSION,
+            expected: REQUIRED_RETIREMENT_JOURNAL_SCHEMA_VERSION,
         });
     }
     let mut attachments = BTreeMap::new();
@@ -1086,8 +1152,10 @@ fn validate_document(
     let mut creation_tokens = BTreeSet::new();
     for record in document.attachments {
         if let Some(token) = record.creation_token
-            && (document.schema_version != ATTACHMENT_JOURNAL_SCHEMA_VERSION
-                || record.spec.workload_uid.is_none()
+            && (!matches!(
+                document.schema_version,
+                ATTACHMENT_JOURNAL_SCHEMA_VERSION | REQUIRED_RETIREMENT_JOURNAL_SCHEMA_VERSION
+            ) || record.spec.workload_uid.is_none()
                 || token == [0; 32]
                 || !creation_tokens.insert(token))
         {
@@ -1611,7 +1679,7 @@ mod tests {
     fn incompatible_malformed_unsorted_and_symlinked_journals_are_rejected() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let incompatible = directory.path().join("incompatible.json");
-        fs::write(&incompatible, r#"{"schemaVersion":5}"#).expect("write incompatible state");
+        fs::write(&incompatible, r#"{"schemaVersion":6}"#).expect("write incompatible state");
         assert!(matches!(
             AttachmentJournal::open(incompatible, provider()),
             Err(JournalError::IncompatibleSchema { .. })

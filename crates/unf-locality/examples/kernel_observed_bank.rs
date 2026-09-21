@@ -17,6 +17,8 @@ use unf_link::VethPlan;
 use unf_locality::{IncarnationGate, LocalityObservationWorker, ObservedLocalityBank};
 use unf_route::{NativeRoutePlan, NativeRoutingProvider, RoutingProvider};
 
+#[path = "support/journal_floor.rs"]
+mod journal_floor;
 #[path = "support/kernel_bank.rs"]
 mod kernel_bank;
 
@@ -194,6 +196,16 @@ async fn main() {
     let records = journal.records();
     let (evidence, context) = evidence(&records);
     let gate = IncarnationGate::install(&mut journal, 8).unwrap();
+    if std::env::var("UNF_LOCALITY_JOURNAL_FLOOR_TEST").as_deref() == Ok("yes") {
+        journal_floor::verify(
+            &directory.path().join("journal.json"),
+            NodeBlockProvider::new(
+                "10.244.45.0/24".parse().unwrap(),
+                "fd45::/120".parse().unwrap(),
+            ),
+        )
+        .unwrap();
+    }
     let cut = journal.cut().unwrap();
     let mut bank = prepare(provider, &records, &evidence, &context).await;
     assert_eq!(bank.endpoints().unwrap().len(), 2);
