@@ -3,7 +3,10 @@
 This completes the open boundary from ADRs 0293–0294 and 0324. cl02 now runs
 `d007071` with an unchanged Native baseline; its expanded Required admission
 gate failed (ADR 0387). The historical `f984db9` Kind runtime is unavailable
-after the workstation reboot. A successful scoped reply gate is not full Phase 9 closure.
+after the workstation reboot. ADR 0388 verifies a separately approved persistent
+Kind bootstrap on the prior cl02-passing `f984db9` Native runtime; current-runtime
+qualification must still pass cl02 first. Neither fresh bootstrap nor a successful
+scoped reply gate is full Phase 9 closure.
 
 ## Safety and efficiency boundary
 

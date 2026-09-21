@@ -36,7 +36,10 @@ pending; follow the [Required locality closure plan](phase9-required-locality-pl
 ADR 0387 subsequently deploys `d007071` to cl02, preserving all CNI journals,
 but the expanded gate fails at Required admission with missing-key-epoch and
 drain/catch-up warnings. This is the immediate repair priority, not a verified
-inventory runtime. The retained Kind runtime is unavailable after the workstation reboot.
+inventory runtime. The old retained Kind runtime is unavailable after the workstation
+reboot. ADR 0388 verifies an explicitly approved separate persistent Kind bootstrap
+on the last cl02-passing `f984db9` Native runtime. This is new infrastructure,
+not retained-state continuity or current-runtime Phase 9 qualification.
 
 Historical repair checkpoint (ADRs 0316–0318): Native expiry/empty-Namespace
 continuity passes cl02 then matching-image retained Kind on runtime `5ea1bd2`.

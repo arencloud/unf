@@ -793,6 +793,12 @@ at selective admission**, with unknown epoch 6117 and deferred key catch-up.
 Fixture resources retire, but four encryption generations remain pending;
 ordinary Ready/converged reports do not close that recovery boundary. Repair
 and complete cl02 requalification precede Kind or any verified promotion.
+ADR 0388 verifies an explicitly approved separate persistent three-Node dual-stack
+Kind bootstrap using the previously cl02-passing `f984db9` Native runtime. All
+Nodes/UNF Pods are Ready, reports fresh/converged, CNI hashes exact, and all seven
+bootstrap log streams reviewed. This does not preserve the old Node identities
+or close restart, Required, locality or Phase 9 lifecycle qualification. See
+`docs/development/phase9-persistent-kind.md` for exact-store operations.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
