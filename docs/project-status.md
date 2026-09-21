@@ -923,6 +923,10 @@ cl02 then identical-image Kind: TCP/UDP dual-stack, eight allowed and sixteen
 denied cases per platform, unchanged production journals and reviewed logs.
 Synthetic policy input/native replies are explicit; production composition,
 mixed replicas, restart continuity and L3/L4/L5/Q remain open.
+ADRs 0419–0420 add and qualify coordinated identity/routing admission on cl02
+then identical-image Kind. Cancelled/failed writers cannot be masked by another
+writer's success; all prior socket and kernel gates remain green. Actual agent
+hooks, durable startup/rollback fencing and packet composition remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

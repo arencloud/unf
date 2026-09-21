@@ -113,6 +113,10 @@ ADR 0419 implements the shared applied-writer admission coordinator with
 cancel/failure-safe guards and O(1) publication locking. Its expanded kernel
 and socket fixture requires cl02 then identical-image Kind. Actual production
 writer hooks and packet wiring remain open, not inferred from library tests.
+ADR 0420 passes the complete coordinated-admission gate on cl02 then matching
+Kind, retaining all native/kernel/socket checks and full log/state review.
+Next close the durable startup/rollback boundary before production writer and
+packet integration. L3/L4/L5/Q remain open; live runtime is still `45d85d5`.
 
 ## Safety and efficiency boundary
 
