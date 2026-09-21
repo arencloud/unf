@@ -141,23 +141,16 @@ pub(crate) async fn prepare(
         .try_into()?;
     seed.unload().context("destroy locality seed capability")?;
     ensure!(seed.fd().is_err(), "seed capability remains loaded");
-    for name in [
-        "UL_CONFIG_V1",
-        "UL_ADDRESS_V1",
-        "UL_ENDPOINT_V1",
-        "UL_DEVICE_V1",
-        "UL_POINTER_V1",
-        "UL_SEEDED_V1",
-    ] {
-        control.check()?;
-        sys::freeze(data(&object, name)?.fd().as_fd())
-            .with_context(|| format!("seal locality map {name}"))?;
-    }
+    // Load privately BEFORE freeze. Linux 5.14's verifier attempts a direct
+    // constant read from a frozen RDONLY_PROG multi-entry array, whose direct
+    // value callback only supports one entry (ENOTSUPP). This order preserves
+    // program-read-only enforcement and all sealing requirements at publication.
+    // No consumer FD, pin, link or dispatch escapes during this transition.
     let consumer: &mut SchedClassifier = object
         .program_mut("unf_locality_bank")
         .context("missing consumer")?
         .try_into()?;
-    consumer.load().context("load sealed locality consumer")?;
+    consumer.load().context("load private locality consumer")?;
     check_program_maps(
         &object,
         "unf_locality_bank",
@@ -174,6 +167,18 @@ pub(crate) async fn prepare(
             "UL_COUNTER_V1",
         ],
     )?;
+    for name in [
+        "UL_CONFIG_V1",
+        "UL_ADDRESS_V1",
+        "UL_ENDPOINT_V1",
+        "UL_DEVICE_V1",
+        "UL_POINTER_V1",
+        "UL_SEEDED_V1",
+    ] {
+        control.check()?;
+        sys::freeze(data(&object, name)?.fd().as_fd())
+            .with_context(|| format!("seal locality map {name}"))?;
+    }
     control.check()?;
     leased.recheck().await?;
     control.check()?;

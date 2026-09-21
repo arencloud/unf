@@ -134,3 +134,13 @@ used for indexing. Keep that bounded word argument u64 throughout the callee,
 matching the previously qualified device fixture. Do not mask an invalid index
 into range or remove the bound. This second verifier rejection remains in
 `.artifacts/p9-kernel-bank-257c596-cl02`; the bank has still not loaded/published.
+
+The `2601c4c` attempt passes real seed loading, exact map binding, both endpoint
+seeds, seed destruction and sealing, then the consumer verifier returns
+`ENOTSUPP` reading a frozen multi-entry endpoint array. Linux 5.14's
+[verifier constant-read path](https://raw.githubusercontent.com/torvalds/linux/v5.14/kernel/bpf/verifier.c)
+calls the array direct-value callback, which supports only one entry. Load the
+unpublished consumer before freezing, still destroying the seed first and
+requiring every freeze/readback and final observation before any publication.
+No program-read-only flag or seal is removed. Complete failure/cleanup evidence
+is `.artifacts/p9-kernel-bank-2601c4c-cl02`; repeat cl02 before Kind.
