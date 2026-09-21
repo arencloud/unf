@@ -15,6 +15,7 @@ ebpf/unf-ebpf-tc/target/
 docs/
 hack/*
 !hack/verify-main-locality-bridge.sh
+!hack/verify-main-locality-composition.sh
 !hack/verify-cni-workload-ownership.sh
 !hack/verify-local-delivery-device-lifetime.sh
 !hack/local-delivery-device-gate.jq

@@ -182,6 +182,10 @@ ADR 0436 retains that cl02 gate's failure and corrects its revision-equality
 expectation to ADR 0070's existing live established-flow contract. Explicit
 expiry/absent-policy negatives are added. Corrected cl02 rerun is required;
 the failed image is not advanced to Kind and no live permission is weakened.
+ADR 0437 adds actual publisher/main-hook socket composition in private namespaces:
+sixteen positive and twenty negative dual-stack TCP/UDP cases, including Service
+translation, writer withdrawal, policy denial and live-link journal retirement.
+Local checks pass; platform execution is pending after corrected reply checks.
 
 ## Safety and efficiency boundary
 

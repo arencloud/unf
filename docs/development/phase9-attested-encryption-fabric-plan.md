@@ -87,6 +87,9 @@ ADR 0436 retains the first expanded cl02 gate failure: its revision-equality
 assertion contradicted ADR 0070. Explicit expiry/absent-policy negatives replace
 that mistaken expectation, while preserving established-flow continuity.
 Corrected cl02-first qualification remains required; Kind has not advanced.
+ADR 0437 implements the actual journal-bound publisher/main-hook socket gate
+with bounded private namespace resources and exact cleanup. Local checks pass;
+cl02-first execution and full live controller/recovery integration remain open.
 ADRs 0381–0382
 qualify the isolated joint attachment/route observation on cl02 then Kind;
 ADR 0383 verifies stale-safe journal cuts locally. ADR 0384 implements the

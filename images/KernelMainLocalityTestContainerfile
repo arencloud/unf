@@ -19,3 +19,7 @@ LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
 COPY --from=builder /tmp/unf-main-tests /usr/local/bin/unf-main-tests
 COPY .artifacts/unf-main-locality-test /usr/local/lib/unf/main-locality-test
 COPY hack/verify-main-locality-bridge.sh /usr/local/bin/verify-main-locality-bridge
+COPY hack/verify-main-locality-composition.sh /usr/local/bin/verify-main-locality-composition
+# The sealed bank is the exact previously qualified immutable TEST_IMAGE bank.
+# Place it beside the main ELF as required by the production startup loader.
+RUN install -m 0644 /usr/local/lib/unf/locality-bank /usr/local/lib/unf/unf-ebpf-locality

@@ -58,6 +58,14 @@ impl OriginalCut {
 }
 
 impl BankPublisher {
+    #[cfg(test)]
+    pub(super) fn selected_for_test(&self, context: &EncryptionLocalityContext) -> Result<bool> {
+        match (&self.active, &self.admission) {
+            (Some((_, bank)), Some(admission)) => admission.is_published(bank, context),
+            _ => Ok(false),
+        }
+    }
+
     pub(super) fn clear(&mut self) -> Result<()> {
         // Retain active ownership if withdrawal fails; the runtime health
         // supervisor treats that uncertain kernel fence as fatal.

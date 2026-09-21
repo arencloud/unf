@@ -17,6 +17,16 @@ cpu_limit=1
 deadline_seconds=180
 poll_attempts=100
 case $suite in
+    kernel-main-composition)
+        : "${UNF_LOCALITY_GATE_SOURCE_REVISION:?exact expected compiled source revision}"
+        [[ $UNF_LOCALITY_GATE_SOURCE_REVISION =~ ^[0-9a-f]{40}$ ]]
+        test_command='["env","UNF_MAIN_COMPOSITION_ISOLATED=yes","bash","/usr/local/bin/verify-main-locality-composition"]'
+        marker='main-composition-suite: PASS tests=2 allowed=16 denied=20 exact-cleanup=true controller-admission=false$'
+        memory_limit=2Gi
+        cpu_limit=2
+        deadline_seconds=300
+        poll_attempts=160
+        ;;
     kernel-main-bridge)
         : "${UNF_LOCALITY_GATE_SOURCE_REVISION:?exact expected compiled source revision}"
         [[ $UNF_LOCALITY_GATE_SOURCE_REVISION =~ ^[0-9a-f]{40}$ ]]
@@ -70,6 +80,9 @@ case $UNF_LOCALITY_GATE_PLATFORM in
     kind)
         : "${UNF_LOCALITY_GATE_CL02_EVIDENCE:?matching successful cl02 evidence required}"
         jq -e --arg image "$image" --arg suite "$suite" '.result=="passed" and .platform=="cl02" and .image==$image and (.suite // "incarnation")==$suite and .cleanup==true' "$UNF_LOCALITY_GATE_CL02_EVIDENCE" >/dev/null
+        if [[ $suite == kernel-main-bridge || $suite == kernel-main-composition ]]; then
+            jq -e --arg source "$UNF_LOCALITY_GATE_SOURCE_REVISION" '.expectedCompiledSourceRevision==$source' "$UNF_LOCALITY_GATE_CL02_EVIDENCE" >/dev/null
+        fi
         [[ $KUBE_CONTEXT == kind-unf-p9-20260921 ]]
         ;;
     *) exit 2;;
@@ -100,6 +113,15 @@ cleanup() {
         [[ $(rg -c 'main-locality-check: name=.* passed=true$' "$directory/test.log") == 7 ]] || result=1
         [[ $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 7 ]] || result=1
     fi
+    if [[ $suite == kernel-main-composition ]]; then
+        if [[ $(rg -c 'main-publisher-socket: case=.* allowed=true ' "$directory/test.log") == 16 &&
+              $(rg -c 'main-publisher-socket: case=.* allowed=false ' "$directory/test.log") == 20 &&
+              $(rg -c 'test result: ok\. 1 passed; 0 failed; 0 ignored;' "$directory/test.log") == 2 ]] &&
+           rg -q 'main-publisher-composition: PASS actual-publisher=true actual-main=true synthetic-packet-input=false controller-admission-tested=false$' "$directory/test.log" &&
+           rg -q 'main-composition-cleanup: exit=0 namespaces=3$' "$directory/test.log"; then
+            delivery=true
+        else result=1; fi
+    fi
     if [[ $suite == kernel-delivery || $suite == kernel-admission || $suite == kernel-journal-floor || $suite == kernel-runtime-owner || $suite == kernel-agent-startup ]]; then
         if rg -q 'kernel-locality-delivery: PASS allowed=8 denied=16 protocols=tcp,udp families=4,6 request-bank=true reply-native=true production-policy=false$' "$directory/test.log" &&
             [[ $(rg -c 'kernel-locality-delivery: name=.* delivered=true ' "$directory/test.log") == 8 &&
@@ -123,7 +145,7 @@ cleanup() {
     fi
     jq -n --argjson code "$result" --argjson removed "$removed" --argjson delivery "$delivery" --arg platform "$UNF_LOCALITY_GATE_PLATFORM" --arg suite "$suite" --arg image "$image" --arg node "$UNF_LOCALITY_GATE_NODE" --arg uid "$UNF_LOCALITY_GATE_NODE_UID" --arg ns "$namespace" --arg nsuid "$namespace_uid" --arg source "${UNF_LOCALITY_GATE_SOURCE_REVISION:-}" \
         '{schemaVersion:2,result:(if $code==0 then "passed" else "failed" end),platform:$platform,suite:$suite,image:$image,node:$node,nodeUid:$uid,namespace:$ns,namespaceUid:$nsuid,cleanup:$removed,packetDeliveryTested:$delivery}
-          + (if $suite=="kernel-main-bridge" then {expectedCompiledSourceRevision:$source} else {} end)' > "$directory/evidence.json"
+          + (if $suite=="kernel-main-bridge" or $suite=="kernel-main-composition" then {expectedCompiledSourceRevision:$source} else {} end)' > "$directory/evidence.json"
     printf 'Incarnation gate result=%s evidence=%s\n' "$result" "$directory"
     exit "$result"
 }
@@ -135,7 +157,7 @@ if [[ $UNF_LOCALITY_GATE_PLATFORM == cl02 ]]; then
     "${kc[@]}" -n "$namespace" create rolebinding gate-privileged --clusterrole=system:openshift:scc:privileged --serviceaccount="$namespace:default" >/dev/null
 fi
 jq -n --arg ns "$namespace" --arg node "$UNF_LOCALITY_GATE_NODE" --arg image "$image" --argjson command "$test_command" --arg memory "$memory_limit" --arg cpu "$cpu_limit" --argjson deadline "$deadline_seconds" '{apiVersion:"v1",kind:"Pod",metadata:{name:"gate",namespace:$ns},spec:{nodeName:$node,hostNetwork:true,automountServiceAccountToken:false,restartPolicy:"Never",activeDeadlineSeconds:$deadline,containers:[{name:"gate",image:$image,imagePullPolicy:"IfNotPresent",securityContext:{privileged:true,runAsUser:0},resources:{requests:{cpu:"100m",memory:"64Mi"},limits:{cpu:$cpu,memory:$memory}},env:[{name:"UNF_LOCALITY_GATE_ISOLATED_CONTAINER",value:"yes"},{name:"UNF_OBSERVED_BANK_ISOLATED_CONTAINER",value:"yes"}],command:$command}]}}' > "$directory/pod.json"
-if [[ $suite == kernel-main-bridge ]]; then
+if [[ $suite == kernel-main-bridge || $suite == kernel-main-composition ]]; then
     jq --arg source "$UNF_LOCALITY_GATE_SOURCE_REVISION" '.spec.containers[0].env += [{name:"UNF_EXPECT_BUILD_REVISION",value:$source}]' "$directory/pod.json" > "$directory/pod-source.json"
     mv "$directory/pod-source.json" "$directory/pod.json"
 fi
