@@ -1007,6 +1007,10 @@ ADR 0441 extends the actual socket fixture to local DSR LoadBalancer delivery,
 reversible replies and withdrawal/republication: 24 positive/24 negative cases
 are required. Local workspace tests and strict Clippy pass; live qualification
 is pending cl02 first. No fleet image or Phase 9 status is promoted.
+ADR 0442 qualifies `a6eeb4c` private-filesystem/offline-worker recovery on cl02
+then identical Kind, along with all seven main checks and sixteen positive/
+twenty negative socket cases. All logs reviewed, journals preserved, production
+unchanged. Full restart and fleet qualification remain open.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

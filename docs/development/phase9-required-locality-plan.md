@@ -236,7 +236,7 @@ Current closure checklist (historical evidence follows):
 | Actual publisher + main classifier + PodIP/Service sockets | Verified cl02 then identical Kind in private networks, ADR 0439 |
 | Established Service reply provenance/transport | Paired actual-main checks verified, ADRs 0436/0438; revision churn preserved, protocol expiry enforced |
 | Full authenticated controller and real reconciliation loops | Pending new-runtime fleet validation; fixture-provided placement is not that proof |
-| Offline restart, crash-stage resource cleanup and fresh re-observation | Pending; never restore serialized bank/device authority |
+| Offline restart, crash-stage resource cleanup and fresh re-observation | Private source filesystem/offline worker verified cl02 then Kind (ADR 0442); full restart traffic and crash-stage cleanup pending; never restore serialized bank/device authority |
 | DSR sockets, workload replacement, mixed replicas and remote Required ciphertext | Pending complete L4/L5 matrix |
 | Kernel admission/status/explanation | Candidate status still explicitly separates placement from admission/delivery; finish consuming status integration |
 | Q lifecycle and S1–S5 resource/load stability | Open; retain warnings/loss and measure actual supported envelopes |

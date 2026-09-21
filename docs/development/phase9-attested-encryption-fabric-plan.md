@@ -357,6 +357,10 @@ instrument the packet path before proceeding to Kind or claiming closure.
 ADR 0440 implements private placement-source replay without restoring kernel
 authority. Local checks pass; cl02-first root-filesystem/offline-worker and
 full restart packet qualification remain pending. Phase 9 stays open.
+ADR 0442 subsequently passes the identical-image private filesystem/offline
+worker gate on cl02 then Kind, including the existing publisher/socket matrix,
+preserved production journals and full log review. Full restart/fleet closure
+remains pending; this paired slice grants no additional runtime permission.
 
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
