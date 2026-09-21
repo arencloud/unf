@@ -44,6 +44,10 @@ ADR 0409 adds a deterministic two-member reproduction and narrow progress
 repair for a viable transition behind an issuance floor. No key reset or
 activation bypass is introduced. Live rotation and traffic qualification remain
 required before treating that repair as verified; S1–S5 stay open.
+ADR 0410 preserves the next cl02 failure after the `7fbf7ee` rollout: activation
+rejects a drain interval beyond the predecessor's sealed expiry. Exact current
+and retained CRI logs expose it despite Ready Pods. Repair without extending
+expired authority or resetting keys; Kind stays on its prior runtime.
 
 Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required

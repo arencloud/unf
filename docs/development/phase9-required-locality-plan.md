@@ -1,7 +1,9 @@
 # Phase 9 Required locality and replica closure
 
-This completes the open boundary from ADRs 0293–0294 and 0324. cl02 and persistent
-Kind now run `6d71a30` with an unchanged Native baseline; configured recovery
+This plan completes the open boundary from ADRs 0293–0294 and 0324. cl02 now runs
+`7fbf7ee`, but ADR 0410 retains a key-activation drain-window failure; its runtime
+qualification is not verified. Persistent Kind remains on `6d71a30`. Both retain
+the Native baseline. On the preceding `6d71a30` tuple, configured recovery
 and the complete scoped reply/inventory gate pass in ADRs 0395–0396, cl02 first.
 The preceding `8db97bb` gate passes in ADRs 0390–0391 after the retained ADR 0387
 failure. The
@@ -26,7 +28,7 @@ separate recovery defect, not hidden by the traffic pass. ADRs 0392–0394 repai
 signal handling and qualify isolated PID-1 shutdown on cl02 then Kind; configured
 fabric rollout/recovery passes on cl02 in ADR 0395 with the complete scoped
 traffic gate; ADR 0396 passes matching configured recovery and expanded traffic
-on persistent Kind. Both fleets now run `6d71a30`. These slices do not close L3.
+on persistent Kind. Both fleets then ran `6d71a30`. These slices do not close L3.
 ADR 0397 implements bounded native base/split BTF layout discovery, removing
 the future consumer's dependence on diagnostic bpftool/jq subprocesses. Its
 local mutation tests pass; the complete native-offset device fixture must pass
@@ -73,6 +75,9 @@ ADR 0409 reproduces and repairs a viable-key-transition progress stall behind
 a faster member's issuance floor, preserving complete-cut and drain barriers.
 Current-runtime cl02-before-Kind requalification remains required; other
 warning causes and actual locality packet integration are not closed by it.
+ADR 0410 deploys `7fbf7ee` on cl02 with successful provenance/CNI/journal checks,
+but retains the newly exposed activation drain-window failure. Kind stays on
+`6d71a30`; repair and repeat cl02 qualification before advancing the candidate.
 
 ## Safety and efficiency boundary
 
