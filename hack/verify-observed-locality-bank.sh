@@ -49,7 +49,11 @@ if [[ ${UNF_KERNEL_BANK_ISOLATED_CONTAINER:-} == yes ]]; then
     mkdir "$UNF_KERNEL_BANK_BPFFS"
     mount -t bpf bpf "$UNF_KERNEL_BANK_BPFFS"
     # Only the private fabric namespace changes forwarding, never host sysctls.
-    ip netns exec "$fabric" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1
+    ip netns exec "$fabric" bash -ec '
+        printf "1\n" > /proc/sys/net/ipv4/ip_forward
+        printf "1\n" > /proc/sys/net/ipv6/conf/all/forwarding
+        [[ $(< /proc/sys/net/ipv4/ip_forward) == 1 && $(< /proc/sys/net/ipv6/conf/all/forwarding) == 1 ]]
+    '
 fi
 host_cookie=$(ip netns exec "$fabric" kernel-netns-cookie)
 peer_a_cookie=$(ip netns exec "$peer_a" kernel-netns-cookie)

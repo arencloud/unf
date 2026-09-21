@@ -108,3 +108,10 @@ exact-UID Namespace were deleted and absence checked; the old harness's
 `cleanup:false` is its combined failure flag, not a claim that the Namespace
 survived. Complete corrected-image cl02 qualification remains mandatory before
 Kind. Evidence: `.artifacts/p9-kernel-bank-c9c75dc-cl02`.
+
+The `29afce0` retry successfully created the private mount but stopped before
+bank loading because the inherited diagnostic image does not contain `sysctl`.
+The fixture now uses its existing Bash inside the exact private fabric netns
+to write/read back the two forwarding controls. No package or host sysctl is
+changed. Its complete failed log and Namespace cleanup are retained under
+`.artifacts/p9-kernel-bank-29afce0-cl02`; this is not a consumer pass.
