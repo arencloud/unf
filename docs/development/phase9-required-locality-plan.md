@@ -236,7 +236,7 @@ Current closure checklist (historical evidence follows):
 | Actual publisher + main classifier + PodIP/Service sockets | Verified cl02 then identical Kind in private networks, ADR 0439 |
 | Established Service reply provenance/transport | Paired actual-main checks verified, ADRs 0436/0438; revision churn preserved, protocol expiry enforced |
 | Full authenticated controller and real reconciliation loops | Fleet rollout held on explicit privilege decision (ADR 0445): cl02 agent/SCC omit SYS_ADMIN required by namespace operations. Fixture-provided placement/privileged diagnostics are not restricted-runtime proof |
-| Offline restart, crash-stage resource cleanup and fresh re-observation | Private source filesystem/offline worker verified cl02 then Kind (ADR 0442); full restart traffic and crash-stage cleanup pending; never restore serialized bank/device authority |
+| Offline restart, crash-stage resource cleanup and fresh re-observation | Private source filesystem/offline worker verified (ADR 0442); private bank-loader pin lifetime including SIGKILL verified cl02 then Kind (ADR 0446). Full agent restart traffic and restricted-runtime privilege boundary remain open; never restore serialized bank/device authority |
 | DSR sockets, workload replacement, mixed replicas and remote Required ciphertext | Local DSR publisher/main-hook sockets verified cl02 then Kind (ADR 0444); replacement/mixed/remote Required and complete fleet L4/L5 matrix pending |
 | Kernel admission/status/explanation | Candidate status still explicitly separates placement from admission/delivery; finish consuming status integration |
 | Q lifecycle and S1–S5 resource/load stability | Open; retain warnings/loss and measure actual supported envelopes |

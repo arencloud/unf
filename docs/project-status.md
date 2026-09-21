@@ -1025,6 +1025,11 @@ and SCC omit SYS_ADMIN, required by namespace-bound observation/seeding and
 the private-mount loader. Fleet deployment is held pending an explicit choice
 of scoped privileged helper or approved lab capability expansion. Production
 stays `45d85d5`; privileged diagnostics do not establish restricted deployability.
+ADR 0446 qualifies private loader-pin lifetime on cl02 then identical Kind,
+including real map reclamation after error/panic/SIGKILL and the actual
+24-positive/24-negative socket matrix. Complete logs/cleanup and unchanged
+journals pass. The fleet privilege decision in ADR 0445 remains unresolved;
+Phase 9 and stabilization are not marked complete.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

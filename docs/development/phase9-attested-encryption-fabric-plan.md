@@ -368,6 +368,9 @@ ADR 0445 holds fleet rollout before schema-5 migration: cl02's restricted agent
 and SCC lack the namespace operations' SYS_ADMIN capability. A scoped helper or
 explicitly approved lab privilege expansion must be selected and qualified;
 privileged diagnostic success alone cannot close this deployment boundary.
+ADR 0446 qualifies private bank-loader pin reclamation after success/error/panic/
+SIGKILL on cl02 then identical Kind, plus the full 24-positive/24-negative socket
+matrix. Restricted-runtime deployment and complete agent restart remain open.
 
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate
