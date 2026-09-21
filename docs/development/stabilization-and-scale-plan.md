@@ -33,6 +33,10 @@ observed-bank preparation with selected-key streaming route scans and work
 permits retained through actual namespace-worker completion. These are bounded
 structural changes, not measured resource savings or S1–S5 closure; the combined
 kernel fixture and live consumer still require qualification.
+ADR 0407 passes that disposable fixture on cl02, but its log audit records
+recurring key-floor/witness failures and an incomplete attestation cut on the
+unchanged runtime. Preserve the finding for lifecycle repair and requalification;
+neither Ready Pods nor the isolated bank test close encryption health or S1.
 
 Historical resume: ADRs 0384–0387 add bounded real-journal candidate selection,
 verify local tests and guarded cl02 rollout, but preserve a failed Required

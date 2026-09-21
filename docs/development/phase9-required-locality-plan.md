@@ -62,6 +62,10 @@ batched route scans, same-socket namespace coordinates and cancellation-safe
 bounded work. Local regressions pass; the combined real-kernel fixture must
 pass cl02 then Kind. Frozen device maps, packet publication and agent consumption
 remain pending; this preparation does not admit packets.
+ADR 0407 passes the complete observed-bank fixture on cl02, preserving all
+116 existing records. Matching Kind follows. The log audit separately finds
+recurring key-floor/witness failures and an incomplete attestation cut; this
+encryption-health finding requires repair/requalification, not a state reset.
 
 ## Safety and efficiency boundary
 

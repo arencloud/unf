@@ -879,6 +879,10 @@ single host-table scans for a cohort, same-socket namespace-cookie readback and
 bounded cancellation-safe observation work. All 863 workspace tests and strict
 Clippy pass. The combined kernel fixture is pending cl02 then Kind; live agent
 consumption, frozen-bank publication and Phase 9 closure remain unimplemented.
+ADR 0407 passes the combined cl02 observed-bank fixture and preserves all
+116 existing CNI records. Matching Kind is next. Reviewed logs also expose
+recurring key-floor/witness failures and an incomplete attestation cut;
+five-agent policy/Service convergence is not encryption-health qualification.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5
