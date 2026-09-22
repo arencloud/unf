@@ -12,6 +12,7 @@ aya.workspace = true
 aya-obj = "0.3.0"
 rustix = { workspace = true, features = ["mount", "net", "process"] }
 getrandom.workspace = true
+sha2.workspace = true
 tempfile = "3.27.0"
 thiserror.workspace = true
 tokio.workspace = true

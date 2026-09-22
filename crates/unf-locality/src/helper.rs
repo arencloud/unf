@@ -21,6 +21,7 @@ use rustix::net::{
 };
 
 mod mount;
+pub mod process;
 #[cfg(test)]
 mod tests;
 

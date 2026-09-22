@@ -387,6 +387,11 @@ unchanged production journals. Full workspace tests pass (921); log warnings
 remain visible. Next is trusted separate-process supervision, then namespace
 observations/device seeding and final restricted-runtime integration. This does
 not deploy the helper, promote L3/L4/L5/Q or complete Phase 9/stabilization.
+ADR 0451 implements owned separate-process supervision with a sealed packaged
+executable, exact kernel peer credentials, pidfd cancellation and single-slot
+reaping. Local checks pass; isolated process gates await cl02 then matching Kind.
+This is a privileged-bootstrap primitive, not agent privilege expansion or final
+Pod/helper deployment. Namespace observations, seeding and recovery remain open.
 
 Follow the committed
 [stabilization and scale plan](stabilization-and-scale-plan.md), with a separate

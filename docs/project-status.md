@@ -1061,6 +1061,12 @@ preserved journals. Workspace passes 921 tests; complete current/retained logs
 retain known warnings with no ERROR. Separate-process supervisor, observation,
 seeding and final restricted-runtime integration remain next; no live privilege
 or image changes occur and Phase 9/S1–S5 remain open.
+ADR 0451 adds a fixed-purpose separate helper process and sealed-executable
+supervisor: exact peer credentials, pidfd cancellation, one retained slot,
+SYS_ADMIN-only worker hardening and positive reaping before release. Local
+checks pass; isolated cl02-first/Kind process qualification is pending. This
+requires privileged bootstrap and does not add capabilities to the agent or
+complete production endpoint delivery, namespace observation/seeding or Phase 9.
 ADR 0338 closes the staging guard's init-container failure/restart gap before
 the matching Kind rollout; no live image changes occur in that metadata slice.
 Required locality/replica coverage, full lifecycle requalification and S1–S5

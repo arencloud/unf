@@ -3570,6 +3570,7 @@ dependencies = [
  "aya-obj",
  "getrandom 0.4.3",
  "rustix",
+ "sha2",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

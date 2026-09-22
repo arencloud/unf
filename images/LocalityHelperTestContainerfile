@@ -11,9 +11,12 @@ COPY ebpf/unf-ebpf-common ./ebpf/unf-ebpf-common
 RUN export UNF_BUILD_REVISION="${UNF_SOURCE_REVISION}" \
     && cargo test --locked --release --package unf-locality --lib --no-run \
     && test "$(find target/release/deps -maxdepth 1 -type f -executable -name 'unf_locality-*' | wc -l)" = 1 \
-    && find target/release/deps -maxdepth 1 -type f -executable -name 'unf_locality-*' -exec cp '{}' /tmp/unf-locality-tests ';'
+    && find target/release/deps -maxdepth 1 -type f -executable -name 'unf_locality-*' -exec cp '{}' /tmp/unf-locality-tests ';' \
+    && cargo build --locked --release --package unf-locality --bin unf-locality-helper \
+    && cp target/release/unf-locality-helper /tmp/unf-locality-helper
 
 FROM ${TEST_IMAGE}
 ARG UNF_SOURCE_REVISION
 LABEL org.opencontainers.image.revision=${UNF_SOURCE_REVISION}
 COPY --from=builder /tmp/unf-locality-tests /usr/local/bin/unf-locality-tests
+COPY --from=builder /tmp/unf-locality-helper /usr/local/bin/unf-locality-helper

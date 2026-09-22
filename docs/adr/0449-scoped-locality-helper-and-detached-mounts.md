@@ -54,7 +54,7 @@ yet separate production containers or full process-crash qualification.
 | Slice | State / closure requirement |
 | --- | --- |
 | Detached-mount protocol and ownership | **Verified isolated boundary**: source `c929d55` passes cl02 then identical Kind; 921 workspace tests pass. ADR 0450 records limits and complete evidence; this is not production-process integration |
-| Production supervisor and endpoint authentication | Pending: private socket delivery, process/Pod identity, single persistent worker slot, bounded cancellation and child reaping; no UID-only public service |
+| Production supervisor and endpoint authentication | ADR 0451 implements sealed-executable owned-child supervision, credential-bound rendezvous, pidfd cancellation and a retained single slot; isolated cl02/Kind process gates pending. Production Pod/bootstrap delivery and parent-death/crash matrix remain separate; no UID-only public service |
 | Descriptor-bound namespace observations | Pending: link/route/cookie readbacks and fresh recheck, no caller pathname lookup or policy authority |
 | Restricted device seeding | Pending: exact program/map provenance, fixed non-transmitting operation, no general BPF execution API |
 | Loader/publisher integration and recovery | Pending: use helper without adding SYS_ADMIN to agent; process crash/disconnect/replay, foreign-state preservation and all existing publication fences |
